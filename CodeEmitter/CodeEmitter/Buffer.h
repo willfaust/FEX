@@ -22,10 +22,21 @@ public:
     Size = BaseSize;
   }
 
+#ifdef __APPLE__
+  // iOS dual-mapping support: BufferBase/CurrentOffset are RX (executable) addresses.
+  // Actual writes go to (address + WriteOffset) which points to the RW mirror.
+  // On non-Apple platforms this is always 0 and optimizes away.
+  void SetWriteOffset(int64_t Offset) { WriteOffset = Offset; }
+  int64_t GetWriteOffset() const { return WriteOffset; }
+#else
+  void SetWriteOffset(int64_t) {}
+  static constexpr int64_t GetWriteOffset() { return 0; }
+#endif
+
   template<typename T>
   requires (std::is_trivially_copyable_v<T>)
   void dcn(const T& Data) {
-    std::memcpy(CurrentOffset, &Data, sizeof(Data));
+    std::memcpy(WritePtr(CurrentOffset), &Data, sizeof(Data));
     CurrentOffset += sizeof(Data);
   }
   void dc8(uint8_t Data) {
@@ -43,7 +54,7 @@ public:
 
   void EmitString(const char* String) {
     const auto StringLength = strlen(String);
-    memcpy(CurrentOffset, String, StringLength);
+    memcpy(WritePtr(CurrentOffset), String, StringLength);
     CurrentOffset += StringLength;
   }
 
@@ -53,7 +64,7 @@ public:
     if (!CurrentAlignment) {
       return;
     }
-    std::memset(CurrentOffset, 0, Size - CurrentAlignment);
+    std::memset(WritePtr(CurrentOffset), 0, Size - CurrentAlignment);
     CurrentOffset += Size - CurrentAlignment;
   }
 
@@ -92,9 +103,21 @@ public:
   }
 
 protected:
+  // Convert an RX (executable) address to the RW (writable) address for memory writes.
+  // On non-Apple platforms, WriteOffset is 0 and this is identity.
+  uint8_t* WritePtr(uint8_t* RXAddr) const {
+#ifdef __APPLE__
+    return RXAddr + WriteOffset;
+#else
+    return RXAddr;
+#endif
+  }
 
   uint8_t* BufferBase;
   uint8_t* CurrentOffset;
   uint64_t Size;
+#ifdef __APPLE__
+  int64_t WriteOffset = 0;
+#endif
 };
 } // namespace ARMEmitter

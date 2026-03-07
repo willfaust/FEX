@@ -359,7 +359,7 @@ struct OpHandlers<IR::OP_F64SINCOS> {
   FEXCORE_PRESERVE_ALL_ATTR static VectorScalarF64Pair handle(double src, FEXCore::Core::CpuStateFrame* Frame) {
     FEXCORE_PROFILE_INSTANT_INCREMENT(Frame->Thread, AccumulatedFloatFallbackCount, 1);
     double sin, cos;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     sin = ::sin(src);
     cos = ::cos(src);
 #else

@@ -303,7 +303,7 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
   char Zero[64] {};
   auto Off = lseek(fd, 0, SEEK_CUR);
   while (Off != AlignUp(Off, Utils::FEX_PAGE_SIZE)) {
-    auto BytesToWrite = std::min(AlignUp(Off, Utils::FEX_PAGE_SIZE) - Off, sizeof(Zero));
+    auto BytesToWrite = std::min(static_cast<size_t>(AlignUp(Off, Utils::FEX_PAGE_SIZE) - Off), sizeof(Zero));
     ::write(fd, Zero, BytesToWrite);
     Off += BytesToWrite;
   }

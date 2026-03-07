@@ -20,9 +20,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <fcntl.h>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <sys/mman.h>
 #include <sys/user.h>
+#elif defined(__APPLE__)
+#include <sys/mman.h>
+#include <mach/vm_page_size.h>
 #endif
 
 namespace fextl::pmr {
@@ -32,7 +35,7 @@ std::pmr::memory_resource* get_default_resource() {
 }
 } // namespace fextl::pmr
 
-#ifndef _WIN32
+#if defined(__linux__)
 namespace FEXCore::Allocator {
 MMAP_Hook mmap {::mmap};
 MUNMAP_Hook munmap {::munmap};
@@ -304,5 +307,58 @@ void UnlockAfterFork(FEXCore::Core::InternalThreadState* Thread, bool Child) {
     Alloc64->UnlockAfterFork(Thread, Child);
   }
 }
+} // namespace FEXCore::Allocator
+#elif defined(__APPLE__)
+namespace FEXCore::DualMap {
+int64_t WriteOffset = 0;
+} // namespace FEXCore::DualMap
+
+namespace FEXCore::Allocator {
+MMAP_Hook mmap {::mmap};
+MUNMAP_Hook munmap {::munmap};
+
+uint64_t HostVASize {};
+
+void VirtualName(const char* Name, void* Ptr, size_t Size) {
+  // No-op on Apple (no PR_SET_VMA equivalent)
+}
+
+void SetupHooks(size_t PageSize) {
+  // No custom allocator hooks on Apple
+}
+
+void ClearHooks() {
+  FEXCore::Allocator::mmap = ::mmap;
+  FEXCore::Allocator::munmap = ::munmap;
+}
+
+FEX_DEFAULT_VISIBILITY size_t DetermineVASize() {
+  if (HostVASize) {
+    return HostVASize;
+  }
+  // Apple arm64 typically has 36-bit or 39-bit VA for userspace
+  // Return 39 as a reasonable default
+  HostVASize = 39;
+  return HostVASize;
+}
+
+fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
+  // Not supported on Apple
+  return {};
+}
+
+fextl::vector<MemoryRegion> Setup48BitAllocatorIfExists(size_t PageSize) {
+  return {};
+}
+
+void ReclaimMemoryRegion(const fextl::vector<MemoryRegion>& Regions) {
+  for (const auto& Region : Regions) {
+    ::munmap(Region.Ptr, Region.Size);
+  }
+}
+
+void LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {}
+void UnlockAfterFork(FEXCore::Core::InternalThreadState* Thread, bool Child) {}
+
 } // namespace FEXCore::Allocator
 #endif

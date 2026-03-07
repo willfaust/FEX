@@ -657,11 +657,15 @@ public:
 
   [[nodiscard]] bool Bind(const ForwardLabel::Reference* Label) {
     uint8_t* CurrentAddress = GetCursorAddress<uint8_t*>();
+    // On Apple with dual-mapping, Label->Location is an RX (execute) address.
+    // Memory reads/writes must go through the RW mirror via WritePtr.
+    // Offset computations still use Label->Location (RX) since that's the runtime PC.
+    uint8_t* WritableLocation = WritePtr(Label->Location);
     // Patch up the instructions
     switch (Label->Type) {
     case ForwardLabel::InstType::ADR: {
-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
+      uint32_t* Instruction = reinterpret_cast<uint32_t*>(WritableLocation);
+      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Label->Location);
       if (!IsADRRange(Imm)) {
         // Can't bind.
         return false;
@@ -675,8 +679,8 @@ public:
       break;
     }
     case ForwardLabel::InstType::ADRP: {
-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
+      uint32_t* Instruction = reinterpret_cast<uint32_t*>(WritableLocation);
+      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Label->Location);
 
       if (!(IsADRPRange(Imm) && IsADRPAligned(Imm))) {
         // Can't bind.
@@ -693,8 +697,8 @@ public:
       break;
     }
     case ForwardLabel::InstType::B: {
-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
+      uint32_t* Instruction = reinterpret_cast<uint32_t*>(WritableLocation);
+      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Label->Location);
       if (!(Imm >= -134217728 && Imm <= 134217724 && ((Imm & 0b11) == 0))) {
         // Can't bind.
         return false;
@@ -709,8 +713,8 @@ public:
       break;
     }
     case ForwardLabel::InstType::TEST_BRANCH: {
-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
+      uint32_t* Instruction = reinterpret_cast<uint32_t*>(WritableLocation);
+      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Label->Location);
       if (!(Imm >= -32768 && Imm <= 32764 && ((Imm & 0b11) == 0))) {
         // Can't bind.
         return false;
@@ -726,8 +730,8 @@ public:
     }
     case ForwardLabel::InstType::BC:
     case ForwardLabel::InstType::RELATIVE_LOAD: {
-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
+      uint32_t* Instruction = reinterpret_cast<uint32_t*>(WritableLocation);
+      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Label->Location);
       if (!(Imm >= -1048576 && Imm <= 1048575 && ((Imm & 0b11) == 0))) {
         // Can't bind.
         return false;
@@ -742,6 +746,7 @@ public:
     }
     case ForwardLabel::InstType::LONG_ADDRESS_GEN: {
       const auto* Instructions = reinterpret_cast<uint32_t*>(Label->Location);
+      const auto* InstructionsRW = reinterpret_cast<uint32_t*>(WritableLocation);
       const auto ImmInstOne = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(&Instructions[0]);
       const auto ImmInstTwo = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(&Instructions[1]);
       const auto ImmInstThree = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(&Instructions[2]);
@@ -752,7 +757,7 @@ public:
 
       // We encoded the destination register in to the first instruction space.
       // Read it back.
-      ARMEmitter::Register DestReg(Instructions[0]);
+      ARMEmitter::Register DestReg(InstructionsRW[0]);
 
       if (IsADRRange(ImmInstThree)) {
         // If within ADR range from the third instruction, then we can emit NOP+NOP+ADR

@@ -5,8 +5,13 @@ tags: backend|arm64
 $end_info$
 */
 
-#ifndef _WIN32
+#if defined(__linux__)
 #include <syscall.h>
+#elif defined(__APPLE__)
+// Linux ARM64 syscall numbers used in emitted code (not host syscalls)
+#ifndef SYS_getcpu
+#define SYS_getcpu 168
+#endif
 #endif
 
 #include "Interface/Context/Context.h"

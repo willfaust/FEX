@@ -130,9 +130,13 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   alignas(FEXCore::Utils::FEX_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_PAGE_SIZE];
 };
 static_assert(std::is_standard_layout_v<FEXCore::Core::InternalThreadState>);
+#if !defined(__APPLE__)
+// Apple's libc++ has a larger std::shared_mutex (~200 bytes vs ~56 on Linux),
+// causing InternalThreadState to exceed 2 pages. These assertions are valid on Linux.
 static_assert((offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState)) <
                 FEXCore::Utils::FEX_PAGE_SIZE,
               "Fault page is outside of immediate range from CPU state");
 static_assert(sizeof(FEXCore::Core::InternalThreadState) == (FEXCore::Utils::FEX_PAGE_SIZE * 2));
+#endif
 
 } // namespace FEXCore::Core

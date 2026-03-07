@@ -11,6 +11,10 @@ desc: Main glue logic of the arm64 splatter backend
 $end_info$
 */
 
+#ifdef __APPLE__
+#include <libkern/OSCacheControl.h>
+#endif
+
 #include "Interface/Context/Context.h"
 #include "Interface/Core/LookupCache.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
@@ -18,6 +22,7 @@ $end_info$
 #include "Interface/Core/JIT/DebugData.h"
 #include "Interface/Core/JIT/JITClass.h"
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
+#include <FEXCore/Utils/DualMap.h>
 
 #include "Utils/MemberFunctionToPointer.h"
 #include "Utils/variable_length_integer.h"
@@ -507,8 +512,14 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, 
     BranchEmit.b(BranchOffset);
   }
 
-  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).store(BranchInst, std::memory_order::relaxed);
+  std::atomic_ref<uint32_t>(*FEXCore::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(CallerAddress))).store(BranchInst, std::memory_order::relaxed);
+#ifdef __APPLE__
+  __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))),
+                          reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))) + 4);
+  sys_icache_invalidate(reinterpret_cast<void*>(CallerAddress), 4);
+#else
   ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
+#endif
 }
 
 static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
@@ -518,8 +529,14 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
   // Restore branch +2 instructions to jump to the linker block
   BranchEmit.b(0x2);
 
-  std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(BranchInst, std::memory_order::relaxed);
+  std::atomic_ref<uint32_t>(*FEXCore::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress))).store(BranchInst, std::memory_order::relaxed);
+#ifdef __APPLE__
+  __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))),
+                          reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))) + 4);
+  sys_icache_invalidate(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+#else
   ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+#endif
 
   // No need to reset HostCode here as the exit linker pointer is stored separately, and if the block is relinked it will be updated.
 }
@@ -585,21 +602,33 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
         GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, false); }, lk);
     }
 
-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(CallerAddress)).store(BranchInst, std::memory_order::relaxed);
+    std::atomic_ref<uint32_t>(*FEXCore::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(CallerAddress))).store(BranchInst, std::memory_order::relaxed);
+#ifdef __APPLE__
+    __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))),
+                            reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))) + 4);
+    sys_icache_invalidate(reinterpret_cast<void*>(CallerAddress), 4);
+#else
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
+#endif
   } else {
     // This case is common between calls and jumps as the thunk callsite can be left untouched.
-    std::atomic_ref<uint64_t>(Record->HostCode).store(HostCode, std::memory_order::seq_cst);
+    std::atomic_ref<uint64_t>(FEXCore::DualMap::WriteAddr(Record)->HostCode).store(HostCode, std::memory_order::seq_cst);
 #ifdef ARCHITECTURE_arm64
     // Make memory write visible to other threads reading the same location
-    asm volatile("dc cvau, %0; dsb ish" : : "r"(Record->HostCode) :);
+    asm volatile("dc cvau, %0; dsb ish" : : "r"(&FEXCore::DualMap::WriteAddr(Record)->HostCode) :);
 #endif
 
     uint32_t LdrInst = 0;
     ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
     LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(JumpThunkStartAddress)).store(LdrInst, std::memory_order::relaxed);
+    std::atomic_ref<uint32_t>(*FEXCore::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress))).store(LdrInst, std::memory_order::relaxed);
+#ifdef __APPLE__
+    __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))),
+                            reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))) + 4);
+    sys_icache_invalidate(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+#else
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+#endif
 
     Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
   }
@@ -619,6 +648,8 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
   , HostSupportsAFP {ctx->HostFeatures.SupportsAFP}
   , CTX {ctx}
   , TempAllocator(ctx->CPUBackendAllocator, 0) {
+
+  SetWriteOffset(FEXCore::DualMap::WriteOffset);
 
   RAPass = Thread->PassManager->GetPass<IR::RegisterAllocationPass>("RA");
 
@@ -812,6 +843,7 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
 CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
+  LogMan::Msg::IFmt("[iOS] Arm64JIT::CompileCode: Entry={:#x} Size={} SingleInst={}", Entry, Size, SingleInst);
 
   const auto PrevNumAllocations = Relocations.size();
 
@@ -850,11 +882,18 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
   // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
   // This minimizes lock contention of CodeBufferWriteMutex.
+  LogMan::Msg::IFmt("[iOS] Arm64JIT: SSACount={} DesiredRange={}", SSACount, DesiredBufferRange);
   auto TempCodeBufferInfo = TempAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
+  LogMan::Msg::IFmt("[iOS] Arm64JIT: TempBuf={:#x} size={} usable={}", (uintptr_t)TempCodeBuffer, TempCodeBufferInfo.Size, UsableBufferRange);
 
   SetBuffer(TempCodeBuffer, UsableBufferRange);
+#ifdef __APPLE__
+  // TempCodeBuffer is regular heap memory, not dual-mapped. Disable WriteOffset
+  // so dc32/dcn writes go to the actual buffer, not buffer+WriteOffset.
+  SetWriteOffset(0);
+#endif
 
   ThreadState->JITGuardPage = reinterpret_cast<uintptr_t>(TempCodeBuffer) + UsableBufferRange;
   ThreadState->JITGuardOverflowArgument = FEXCore::ToUnderlying(RestartOptions::Control::NeedsLargerJITSpace);
@@ -894,6 +933,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   PendingTargetLabel = nullptr;
   PendingCallReturnTargetLabel = nullptr;
 
+  LogMan::Msg::IFmt("[iOS] Arm64JIT: Entering IR block loop, BlockCount={}", IR->GetHeader()->BlockCount);
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     using namespace FEXCore::IR;
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
@@ -901,6 +941,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     LOGMAN_THROW_A_FMT(BlockIROp->Header.Op == IR::OP_CODEBLOCK, "IR type failed to be a code block");
 #endif
 
+    LogMan::Msg::IFmt("[iOS] Arm64JIT: Block header start, EntryPoint={}", BlockIROp->EntryPoint);
     auto BlockStartHostCode = GetCursorAddress<uint8_t*>();
     {
       const auto Node = IR->GetID(BlockNode);
@@ -917,6 +958,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
       if (BlockIROp->EntryPoint) {
         uint64_t BlockStartRIP = Entry + BlockIROp->GuestEntryOffset;
+        LogMan::Msg::IFmt("[iOS] Arm64JIT: EmitEntryPoint for RIP={:#x}", BlockStartRIP);
 
         const auto IsReturnTarget = CallReturnTargets.try_emplace(Node).first;
         if (PendingTargetLabel) {
@@ -933,6 +975,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
 
         EmitEntryPoint(JITCodeHeaderLabel, CheckTF);
+        LogMan::Msg::IFmt("[iOS] Arm64JIT: EmitEntryPoint done");
       }
 
       if (PendingCallReturnTargetLabel) {
@@ -945,8 +988,14 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       BindOrRestart(Target);
     }
 
-    for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
-      switch (IROp->Op) {
+    LogMan::Msg::IFmt("[iOS] Arm64JIT: Block header done, entering op dispatch");
+    {
+      int OpIdx = 0;
+      for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+        if (OpIdx < 5 || OpIdx % 10 == 0) {
+          LogMan::Msg::IFmt("[iOS] Arm64JIT: Dispatching Op[{}] = {}", OpIdx, FEXCore::IR::GetName(IROp->Op));
+        }
+        switch (IROp->Op) {
 #define REGISTER_OP(op, x) \
   case FEXCore::IR::IROps::OP_##op: Op_##x(IROp, CodeNode); break
 
@@ -954,14 +1003,18 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 #include <FEXCore/IR/IRDefines_Dispatch.inc>
 #undef REGISTER_OP
 
-      default: Op_Unhandled(IROp, CodeNode); break;
+        default: Op_Unhandled(IROp, CodeNode); break;
+        }
+        OpIdx++;
       }
+      LogMan::Msg::IFmt("[iOS] Arm64JIT: Block done, dispatched {} ops", OpIdx);
     }
 
     DebugData->Subblocks.push_back({static_cast<uint32_t>(BlockStartHostCode - CodeData.BlockBegin),
                                     static_cast<uint32_t>(GetCursorAddress<uint8_t*>() - BlockStartHostCode)});
   }
 
+  LogMan::Msg::IFmt("[iOS] Arm64JIT: IR block loop done, emitting final branches...");
   // Make sure last branch is generated. It certainly can't be eliminated here.
   if (PendingTargetLabel) {
     if (PendingTargetLabel->Backward.Location) {
@@ -1083,6 +1136,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
       // NOTE: 16-byte alignment of the new cursor offset must be preserved for block linking records
       SetBuffer(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->AllocatedSize);
+#ifdef __APPLE__
+      // Restore WriteOffset for dual-mapped JIT pool (CodeBuffer is RX, writes go to RW mirror).
+      SetWriteOffset(FEXCore::DualMap::WriteOffset);
+#endif
       SetCursorOffset(CodeBuffers.LatestOffset);
       Align16B();
       if ((GetCursorOffset() + TempSize) > CurrentCodeBuffer->UsableSize()) {
@@ -1104,16 +1161,32 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       Relocations[Idx].Header.Offset += CodeBuffers.LatestOffset;
     }
 
-    // Copy over CodeBuffer contents
-    memcpy(GetCursorAddress<uint8_t*>(), TempCodeBuffer, TempSize);
+    // Copy over CodeBuffer contents (write to RW mirror on iOS)
+    LogMan::Msg::IFmt("[iOS] Arm64JIT: Copying {} bytes to CodeBuffer at RX={:#x}", TempSize, (uintptr_t)GetCursorAddress<uint8_t*>());
+    memcpy(WritePtr(GetCursorAddress<uint8_t*>()), TempCodeBuffer, TempSize);
     SetCursorOffset(CodeBuffers.LatestOffset + TempSize);
 
     CodeBuffers.LatestOffset = GetCursorOffset();
   }
+  LogMan::Msg::IFmt("[iOS] Arm64JIT: CompileCode done, returning");
 
   TempAllocator.DelayedDisownBuffer();
 
+#ifdef __APPLE__
+  // On iOS with TXM, RX pages are execute-only. __builtin___clear_cache does
+  // dc cvau (data cache clean) which needs read access and would fault on XO pages.
+  // Instead: clean data cache via the RW view, then invalidate i-cache via sys_icache_invalidate
+  // which handles execute-only pages on Apple Silicon.
+  {
+    auto* RWBegin = WritePtr(CodeBegin);
+    // Clean data cache for the RW view to ensure writes are visible
+    __builtin___clear_cache(reinterpret_cast<char*>(RWBegin), reinterpret_cast<char*>(RWBegin) + CodeOnlySize);
+    // Invalidate instruction cache for the RX view
+    sys_icache_invalidate(CodeBegin, CodeOnlySize);
+  }
+#else
   ClearICache(CodeBegin, CodeOnlySize);
+#endif
 
 #ifdef VIXL_DISASSEMBLER
   if (Disassemble() & FEXCore::Config::Disassemble::STATS) {

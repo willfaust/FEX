@@ -61,9 +61,9 @@ if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Unsupported pointer size ${CMAKE_SIZEOF_VOID_P}."
     " FEX only supports 64-bit (8-byte pointer) systems."
     " If you believe this is in error, file an issue.")
-elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS"))
   message(FATAL_ERROR "Unsupported system type ${CMAKE_SYSTEM_NAME}."
-    " FEX only supports Linux and Windows."
+    " FEX only supports Linux, Windows, and Darwin/iOS."
     " If you believe this is in error, file an issue.")
 endif()
 
@@ -259,7 +259,11 @@ if (ENABLE_COMPILE_TIME_TRACE)
   link_libraries(-ftime-trace)
 endif()
 
-set(PTHREAD_LIB pthread)
+if (APPLE)
+  set(PTHREAD_LIB "")
+else()
+  set(PTHREAD_LIB pthread)
+endif()
 
 if (USE_LINKER)
   message(STATUS "Overriding linker to: ${USE_LINKER}")
@@ -306,7 +310,12 @@ if (ENABLE_COVERAGE)
   link_libraries(-fprofile-instr-generate -fcoverage-mapping)
 endif()
 
-if (ENABLE_JEMALLOC_GLIBC_ALLOC)
+if (APPLE)
+  # Disable Linux-specific allocators on Apple platforms
+  set(ENABLE_JEMALLOC_GLIBC_ALLOC FALSE)
+  set(ENABLE_FEX_ALLOCATOR FALSE)
+  message(STATUS "Apple platform detected — disabling jemalloc and rpmalloc")
+elseif (ENABLE_JEMALLOC_GLIBC_ALLOC)
   # The glibc jemalloc subproject which hooks the glibc allocator.
   # Required for thunks to work.
   # All host native libraries will use this allocator, while *most* other FEX internal allocations will use the other jemalloc allocator.
@@ -322,7 +331,7 @@ endif()
 if (ENABLE_FEX_ALLOCATOR)
   # The rpmalloc subproject that all FEXCore fextl objects allocate through.
   add_subdirectory(External/rpmalloc/)
-elseif (NOT MINGW)
+elseif (NOT MINGW AND NOT APPLE)
   message (STATUS
     " FEX allocator is disabled!\n"
     " This is not a recommended configuration!\n"
@@ -580,15 +589,17 @@ add_subdirectory(FEXHeaderUtils/)
 add_subdirectory(CodeEmitter/)
 add_subdirectory(FEXCore/)
 
-if (ARCHITECTURE_arm64 AND NOT MINGW AND NOT BUILD_STEAM_SUPPORT)
-  # Binfmt_misc files must be installed prior to Source/ installs
-  add_subdirectory(Data/binfmts/)
-endif()
+if (NOT APPLE)
+  if (ARCHITECTURE_arm64 AND NOT MINGW AND NOT BUILD_STEAM_SUPPORT)
+    # Binfmt_misc files must be installed prior to Source/ installs
+    add_subdirectory(Data/binfmts/)
+  endif()
 
-add_subdirectory(Source/)
+  add_subdirectory(Source/)
 
-if (NOT BUILD_STEAM_SUPPORT)
-  add_subdirectory(Data/AppConfig/)
+  if (NOT BUILD_STEAM_SUPPORT)
+    add_subdirectory(Data/AppConfig/)
+  endif()
 endif()
 
 # Install the ThunksDB file

@@ -9,9 +9,12 @@
 #include <fcntl.h>
 #include <memory_resource>
 #include <string_view>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <linux/limits.h>
 #include <sys/sendfile.h>
+#elif defined(__APPLE__)
+#include <limits.h>
+#include <copyfile.h>
 #else
 #include <filesystem>
 #endif
@@ -56,7 +59,7 @@ inline std::error_code RenameFile(const fextl::string& From, const fextl::string
   return rename(From.c_str(), To.c_str()) == 0 ? std::error_code {} : std::make_error_code(std::errc::io_error);
 }
 
-#ifndef _WIN32
+#if !defined(_WIN32)
 inline bool ExistsAt(int FD, const fextl::string& Path) {
   return faccessat(FD, Path.c_str(), F_OK, 0) == 0;
 }
@@ -216,7 +219,11 @@ inline bool CopyFile(const fextl::string& From, const fextl::string& To, CopyOpt
       close(SourceFD);
       return false;
     }
+#if defined(__APPLE__)
+    bool Result = fcopyfile(SourceFD, DestinationFD, 0, COPYFILE_ALL) == 0;
+#else
     bool Result = sendfile(DestinationFD, SourceFD, nullptr, buf.st_size) == buf.st_size;
+#endif
     close(DestinationFD);
     close(SourceFD);
     return Result;
