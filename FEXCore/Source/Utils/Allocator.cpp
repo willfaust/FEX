@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
 #include "Utils/Allocator/HostAllocator.h"
-#include "Utils/Allocator.h"
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/LogManager.h>
@@ -21,9 +20,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <fcntl.h>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <sys/mman.h>
 #include <sys/user.h>
+#elif defined(__APPLE__)
+#include <sys/mman.h>
+#include <mach/vm_page_size.h>
 #endif
 
 namespace fextl::pmr {
@@ -33,8 +35,8 @@ std::pmr::memory_resource* get_default_resource() {
 }
 } // namespace fextl::pmr
 
+#if defined(__linux__)
 namespace FEXCore::Allocator {
-#ifndef _WIN32
 MMAP_Hook mmap {::mmap};
 MUNMAP_Hook munmap {::munmap};
 
@@ -114,17 +116,27 @@ FEX_DEFAULT_VISIBILITY size_t DetermineVASize() {
   };
 
   for (auto Bits : TLBSizes) {
+    uintptr_t Size = 1ULL << Bits;
+    // Just try allocating
+    // We can't actually determine VA size on ARM safely
+    auto Find = [](uintptr_t Size) -> bool {
+      for (int i = 0; i < 64; ++i) {
+        // Try grabbing a some of the top pages of the range
+        // x86 allocates some high pages in the top end
+        void* Ptr = ::mmap(reinterpret_cast<void*>(Size - FEXCore::Utils::FEX_PAGE_SIZE * i), FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE,
+                           MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (Ptr != (void*)~0ULL) {
+          ::munmap(Ptr, FEXCore::Utils::FEX_PAGE_SIZE);
+          if (Ptr == (void*)(Size - FEXCore::Utils::FEX_PAGE_SIZE * i)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
 
-    // We can't actually determine VA size on ARM safely.
-    // Instead, try allocating the page at the top of the range.
-    // If this succeeds OR the page is reported as already existing,
-    // we know we're in valid VA space. Otherwise, we must go lower.
-    void* Addr = reinterpret_cast<void*>((1ULL << Bits) - FEXCore::Utils::FEX_PAGE_SIZE);
-    void* Ptr = ::mmap(Addr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_NONE, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (Ptr != (void*)~0ULL) {
-      ::munmap(Ptr, FEXCore::Utils::FEX_PAGE_SIZE);
-    }
-    if (Ptr != (void*)~0ULL || errno == EEXIST) {
+    if (Find(Size)) {
+      HostVASize = Bits;
       return Bits;
     }
   }
@@ -252,18 +264,8 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
   }
 
   // Block remaining memory gaps
-  bool SupportsDontDump = true;
   for (auto RegionIt = Regions.begin(); RegionIt != Regions.end(); ++RegionIt) {
     auto Alloc = ::mmap(RegionIt->Ptr, RegionIt->Size, PROT_NONE, MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
-
-    if (SupportsDontDump) {
-      // Mark these regions as don't dump so that coredump doesn't try dumping large unmapped regions.
-      // Ideally coredump would be smart enough to only dump resident pages, but here we are.
-      auto Result = madvise(RegionIt->Ptr, RegionIt->Size, MADV_DONTDUMP);
-      if (Result == -1) {
-        SupportsDontDump = false;
-      }
-    }
 
     LogMan::Throw::AFmt(Alloc != MAP_FAILED, "StealMemoryRegion: mmap({}, {:x}) failed: {}", fmt::ptr(RegionIt->Ptr), RegionIt->Size, errno);
     LogMan::Throw::AFmt(Alloc == RegionIt->Ptr, "mmap returned {} instead of {}", Alloc, fmt::ptr(RegionIt->Ptr));
@@ -305,18 +307,58 @@ void UnlockAfterFork(FEXCore::Core::InternalThreadState* Thread, bool Child) {
     Alloc64->UnlockAfterFork(Thread, Child);
   }
 }
-#else
+} // namespace FEXCore::Allocator
+#elif defined(__APPLE__)
+namespace FEXCore::DualMap {
+int64_t WriteOffset = 0;
+} // namespace FEXCore::DualMap
 
-void VirtualNameNOP(const char*, const void*, size_t) {}
-void VirtualTHPNOP(const void* Ptr, size_t Size, THPControl Control) {}
+namespace FEXCore::Allocator {
+MMAP_Hook mmap {::mmap};
+MUNMAP_Hook munmap {::munmap};
 
-VirtualNamePtr VirtualName {VirtualNameNOP};
-VirtualTHPPtr VirtualTHPControl {VirtualTHPNOP};
+uint64_t HostVASize {};
 
-void SetupHooks(size_t PageSize, HookPtrs Ptrs) {
-  VirtualName = Ptrs.VirtualName;
-  VirtualTHPControl = Ptrs.VirtualTHPControl;
+void VirtualName(const char* Name, void* Ptr, size_t Size) {
+  // No-op on Apple (no PR_SET_VMA equivalent)
 }
 
-#endif
+void SetupHooks(size_t PageSize) {
+  // No custom allocator hooks on Apple
+}
+
+void ClearHooks() {
+  FEXCore::Allocator::mmap = ::mmap;
+  FEXCore::Allocator::munmap = ::munmap;
+}
+
+FEX_DEFAULT_VISIBILITY size_t DetermineVASize() {
+  if (HostVASize) {
+    return HostVASize;
+  }
+  // Apple arm64 typically has 36-bit or 39-bit VA for userspace
+  // Return 39 as a reasonable default
+  HostVASize = 39;
+  return HostVASize;
+}
+
+fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
+  // Not supported on Apple
+  return {};
+}
+
+fextl::vector<MemoryRegion> Setup48BitAllocatorIfExists(size_t PageSize) {
+  return {};
+}
+
+void ReclaimMemoryRegion(const fextl::vector<MemoryRegion>& Regions) {
+  for (const auto& Region : Regions) {
+    ::munmap(Region.Ptr, Region.Size);
+  }
+}
+
+void LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {}
+void UnlockAfterFork(FEXCore::Core::InternalThreadState* Thread, bool Child) {}
+
 } // namespace FEXCore::Allocator
+#endif

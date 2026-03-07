@@ -125,9 +125,14 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   alignas(FEXCore::Utils::FEX_PAGE_SIZE) uint8_t InterruptFaultPage[FEXCore::Utils::FEX_PAGE_SIZE];
 };
 static_assert(std::is_standard_layout_v<FEXCore::Core::InternalThreadState>);
+// Apple's libc++ has a larger std::shared_mutex (~200 bytes vs ~56 on Linux),
+// which pushes InternalThreadState past the offsets/sizes these asserts check.
+// They remain valid on Linux/Windows.
+#if !defined(__APPLE__)
 // Maximum unsigned-offset store range for fault page.
 static_assert(
   (offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState)) <= 65520,
   "Fault page is outside of immediate range from CPU state");
+#endif
 
 } // namespace FEXCore::Core

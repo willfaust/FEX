@@ -11,7 +11,12 @@
 #endif
 
 #include <cstdint>
+#ifdef __APPLE__
+#include <stdlib.h>
+#include <malloc/malloc.h>
+#else
 #include <malloc.h>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -188,12 +193,29 @@ void* calloc(size_t n, size_t size) {
   return ::calloc(n, size);
 }
 void* memalign(size_t align, size_t s) {
+#ifdef __APPLE__
+  // posix_memalign requires alignment >= sizeof(void*) and power of 2
+  if (align < sizeof(void*)) align = sizeof(void*);
+  void* ptr = nullptr;
+  ::posix_memalign(&ptr, align, s);
+  return ptr;
+#else
   return ::memalign(align, s);
+#endif
 }
 void* valloc(size_t size) {
+#ifdef __APPLE__
+  void* ptr = nullptr;
+  ::posix_memalign(&ptr, 4096, size);
+  return ptr;
+#else
   return ::valloc(size);
+#endif
 }
 int posix_memalign(void** r, size_t a, size_t s) {
+#ifdef __APPLE__
+  if (a < sizeof(void*)) a = sizeof(void*);
+#endif
   return ::posix_memalign(r, a, s);
 }
 void* realloc(void* ptr, size_t size) {
@@ -203,10 +225,22 @@ void free(void* ptr) {
   return ::free(ptr);
 }
 size_t malloc_usable_size(void* ptr) {
+#ifdef __APPLE__
+  return ::malloc_size(ptr);
+#else
   return ::malloc_usable_size(ptr);
+#endif
 }
 void* aligned_alloc(size_t a, size_t s) {
+#ifdef __APPLE__
+  // posix_memalign requires alignment >= sizeof(void*) and power of 2
+  if (a < sizeof(void*)) a = sizeof(void*);
+  void* ptr = nullptr;
+  ::posix_memalign(&ptr, a, s);
+  return ptr;
+#else
   return ::aligned_alloc(a, s);
+#endif
 }
 void aligned_free(void* ptr) {
   return ::free(ptr);

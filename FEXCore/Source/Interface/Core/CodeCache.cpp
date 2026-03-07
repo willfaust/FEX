@@ -344,11 +344,24 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
   ::write(fd, Relocations.data(), Relocations.size() * sizeof(Relocations[0]));
 
   // Pad to next page in file so that the CodeBuffer can be mmap'ed into process on load
+#if defined(__APPLE__)
+  // iOS: ftruncate-extend can leave the tail pages unbacked in the app sandbox,
+  // so the later mmap of this region faults. Write zeros explicitly to force
+  // real backing store for the padding.
+  char Zero[64] {};
+  auto Off = lseek(fd, 0, SEEK_CUR);
+  while (Off != AlignUp(Off, Utils::FEX_PAGE_SIZE)) {
+    auto BytesToWrite = std::min(static_cast<size_t>(AlignUp(Off, Utils::FEX_PAGE_SIZE) - Off), sizeof(Zero));
+    ::write(fd, Zero, BytesToWrite);
+    Off += BytesToWrite;
+  }
+#else
   {
     auto AlignedSize = AlignUp(lseek(fd, 0, SEEK_CUR), Utils::FEX_PAGE_SIZE);
     ::ftruncate(fd, AlignedSize);
     lseek(fd, AlignedSize, SEEK_SET);
   }
+#endif
 
   // Dump the host code (relocated for position-independent serialization)
   std::span CodeBufferData(reinterpret_cast<std::byte*>(CodeBuffer->Ptr), reinterpret_cast<std::byte*>(CodeBuffer->Ptr) + CTX.LatestOffset);

@@ -9,7 +9,7 @@ set(FEXCORE_BASE_SRCS
   Utils/SpinWaitLock.cpp
   Utils/WildcardMatcher.cpp)
 
-if (NOT MINGW)
+if (NOT MINGW AND NOT APPLE)
   list(APPEND FEXCORE_BASE_SRCS
     Utils/Allocator/64BitAllocator.cpp)
 endif()
@@ -115,7 +115,9 @@ if (ENABLE_ZYDIS)
   list(APPEND LIBS Zydis::Zydis)
 endif()
 
-if (NOT MINGW)
+if (APPLE)
+  list(APPEND LIBS dl)
+elseif (NOT MINGW)
   list(APPEND LIBS dl)
 else()
   list(APPEND LIBS synchronization)
@@ -288,7 +290,7 @@ AddObject(${PROJECT_NAME}_object)
 AddLibrary(${PROJECT_NAME} STATIC)
 AddLibrary(${PROJECT_NAME}_shared SHARED)
 
-if (NOT MINGW AND NOT BUILD_STEAM_SUPPORT)
+if (NOT MINGW AND NOT APPLE AND NOT BUILD_STEAM_SUPPORT)
   install(TARGETS ${PROJECT_NAME}_shared LIBRARY
     DESTINATION ${CMAKE_INSTALL_LIBDIR}
     COMPONENT Libraries)
@@ -306,7 +308,7 @@ if (ENABLE_JEMALLOC_GLIBC_ALLOC)
   target_link_libraries(JemallocLibs INTERFACE FEX_jemalloc_glibc)
 endif()
 
-if (NOT MINGW)
+if (NOT MINGW AND NOT APPLE)
   # Dummy project to use for host tools.
   # This overrides use of jemalloc in FEXCore with the normal glibc allocator.
   add_library(JemallocDummy STATIC Utils/AllocatorHooks.cpp)

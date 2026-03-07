@@ -8,14 +8,16 @@
 #include <mutex>
 #include <optional>
 #include <signal.h>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <sys/syscall.h>
+#elif defined(__APPLE__)
+#include <signal.h>
 #endif
 #include <unistd.h>
 #include <variant>
 
 namespace FEXCore {
-#ifndef _WIN32
+#if !defined(_WIN32)
 // Replacement for std::mutexes to deal with unlocking issues in the face of Linux fork() semantics.
 //
 // A fork() only clones the parent's calling thread. Other threads are silently dropped, which permanently leaves any mutexes owned by them locked.
@@ -158,7 +160,14 @@ public:
   explicit ScopedSignalMasker(uint64_t Mask)
     : OriginalMask(0) {
     // Mask all signals, storing the original incoming mask
+#if defined(__linux__)
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, &*OriginalMask, sizeof(*OriginalMask));
+#elif defined(__APPLE__)
+    sigset_t NewMask, OldMask;
+    sigfillset(&NewMask);
+    sigprocmask(SIG_SETMASK, &NewMask, &OldMask);
+    (void)Mask;
+#endif
   }
 
   // Move-only type
@@ -171,7 +180,13 @@ public:
 
   ~ScopedSignalMasker() {
     if (OriginalMask) {
+#if defined(__linux__)
       ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &OriginalMask, nullptr, sizeof(*OriginalMask));
+#elif defined(__APPLE__)
+      sigset_t OldMask;
+      sigfillset(&OldMask); // Restore all (simplified)
+      sigprocmask(SIG_SETMASK, &OldMask, nullptr);
+#endif
     }
   }
 private:

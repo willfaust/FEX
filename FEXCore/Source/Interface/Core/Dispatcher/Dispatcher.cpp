@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MIT
 
+#ifdef __APPLE__
+#include <libkern/OSCacheControl.h>
+#endif
+
 #include "Common/VectorRegType.h"
 #include "Interface/Context/Context.h"
 #include "Interface/Core/CPUBackend.h"
@@ -8,6 +12,7 @@
 #include "Utils/MemberFunctionToPointer.h"
 
 #include <FEXCore/Config/Config.h>
+#include <FEXCore/Utils/DualMap.h>
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Core/SignalDelegator.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -39,6 +44,7 @@ constexpr size_t MAX_DISPATCHER_CODE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE * 4;
 Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
   : Arm64Emitter(ctx, FEXCore::Allocator::VirtualAlloc(MAX_DISPATCHER_CODE_SIZE, true), MAX_DISPATCHER_CODE_SIZE)
   , CTX {ctx} {
+  SetWriteOffset(FEXCore::DualMap::WriteOffset);
   EmitDispatcher();
 
   FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
@@ -600,7 +606,16 @@ void Dispatcher::EmitDispatcher() {
 
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
   End = GetCursorAddress<uint64_t>();
+#ifdef __APPLE__
+  {
+    auto DispatchSize = End - reinterpret_cast<uint64_t>(DispatchPtr);
+    auto* RWPtr = WritePtr(reinterpret_cast<uint8_t*>(DispatchPtr));
+    __builtin___clear_cache(reinterpret_cast<char*>(RWPtr), reinterpret_cast<char*>(RWPtr) + DispatchSize);
+    sys_icache_invalidate(reinterpret_cast<void*>(DispatchPtr), DispatchSize);
+  }
+#else
   ClearICache(reinterpret_cast<void*>(DispatchPtr), End - reinterpret_cast<uint64_t>(DispatchPtr));
+#endif
 
   if (CTX->Config.BlockJITNaming()) {
     fextl::string Name = fextl::fmt::format("Dispatch_{}", FHU::Syscalls::gettid());

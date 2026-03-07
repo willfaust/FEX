@@ -4,11 +4,19 @@
 #include <FEXCore/Utils/EnumOperators.h>
 #include <FEXCore/Utils/LogManager.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+// Windows
+#elif defined(__APPLE__)
+#include <stdlib.h>
+#include <sys/mman.h>
+#else
+// Linux
 #include <stdlib.h>
 #include <malloc.h>
 #include <sys/mman.h>
-#else
+#endif
+
+#ifdef _WIN32
 #define NTDDI_VERSION 0x0A000005
 #include <memoryapi.h>
 #endif

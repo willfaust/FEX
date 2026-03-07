@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <cstdint>
 #include <fcntl.h>
-#ifndef _WIN32
+#if defined(__linux__)
 #include <linux/magic.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>

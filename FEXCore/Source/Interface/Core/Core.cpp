@@ -541,13 +541,21 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     const uint8_t* GuestCode {};
     GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
+    LogMan::Msg::IFmt("[iOS] GenerateIR: GuestCode={} first bytes: {:02x} {:02x} {:02x} {:02x} {:02x}",
+                      fmt::ptr(GuestCode), GuestCode[0], GuestCode[1], GuestCode[2], GuestCode[3], GuestCode[4]);
+
     bool HadDispatchError {false};
     bool HadInvalidInst {false};
 
+    LogMan::Msg::IFmt("[iOS] GenerateIR: Calling DecodeInstructionsAtEntry...");
     Thread->FrontendDecoder->DecodeInstructionsAtEntry(Thread, GuestCode, GuestRIP, MaxInst);
+    LogMan::Msg::IFmt("[iOS] GenerateIR: DecodeInstructionsAtEntry returned");
 
     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     auto CodeBlocks = &BlockInfo->Blocks;
+
+    LogMan::Msg::IFmt("[iOS] GenerateIR: Blocks={} TotalInsts={} Is64Bit={}",
+                      CodeBlocks->size(), BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode);
 
     Thread->OpDispatcher->BeginFunction(GuestRIP, CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode,
                                         AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP);
@@ -778,6 +786,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 }
 
 ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst) {
+  LogMan::Msg::IFmt("[iOS] CompileCode: RIP={:#x}", GuestRIP);
+
   if (SourcecodeResolver && Config.GDBSymbols()) {
     auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
     if (MappedSection) {
@@ -787,8 +797,10 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   }
 
   // Generate IR + Meta Info
+  LogMan::Msg::IFmt("[iOS] CompileCode: Calling GenerateIR...");
   auto [IRView, TotalInstructions, TotalInstructionsLength, StartAddr, Length, NeedsAddGuestCodeRanges] =
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
+  LogMan::Msg::IFmt("[iOS] CompileCode: GenerateIR returned, TotalInsts={} Length={}", TotalInstructions, Length);
   if (!IRView) {
     // OpDispatcher IR already released in this case.
     return {{}, nullptr, 0, 0, false};
@@ -816,7 +828,9 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   // If the trap flag is set we generate single instruction blocks that each check to generate a single step exception.
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
 
+  LogMan::Msg::IFmt("[iOS] CompileCode: Calling CPUBackend->CompileCode...");
   auto CompiledCode = Thread->CPUBackend->CompileCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
+  LogMan::Msg::IFmt("[iOS] CompileCode: CPUBackend->CompileCode returned");
 
   // Release the IR
   Thread->OpDispatcher->DelayedDisownBuffer();
@@ -846,21 +860,28 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
 
+  LogMan::Msg::IFmt("[iOS] CompileBlock: RIP={:#x} MaxInst={}", GuestRIP, MaxInst);
+
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+  LogMan::Msg::IFmt("[iOS] CompileBlock: PreCompile done");
 
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
+  LogMan::Msg::IFmt("[iOS] CompileBlock: Lock acquired");
 
   // Is the code in the cache?
   // The backends only check L1 and L2, not L3
   if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+    LogMan::Msg::IFmt("[iOS] CompileBlock: Found in cache at {:#x}", HostCode);
     return HostCode;
   }
+  LogMan::Msg::IFmt("[iOS] CompileBlock: Not in cache, compiling...");
 
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+  LogMan::Msg::IFmt("[iOS] CompileBlock: CompileCode returned, Length={}", Length);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   if (CodePtr == nullptr) {
     return 0;
