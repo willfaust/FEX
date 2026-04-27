@@ -339,7 +339,15 @@ DEF_OP(MonoBackpatcherWrite) {
   }
 
 #ifdef ARCHITECTURE_arm64ec
+#ifdef FEX_IOS_HOST
+  // iOS x18 quirk: TEB read via TPIDRRO_EL0+TSD slot 275.
+  mrs(TMP2, ARMEmitter::SystemRegister::TPIDRRO_EL0);
+  and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, ~7ULL);
+  ldr(TMP2, TMP2, IOS_TEB_TSD_OFFSET);
+  ldr(TMP2, TMP2, TEB_CPU_AREA_OFFSET);
+#else
   ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
+#endif
   LoadConstant(ARMEmitter::Size::i32Bit, TMP1, 1);
   strb(TMP1.W(), TMP2, CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET);
 #endif

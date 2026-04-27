@@ -73,7 +73,7 @@ namespace x64 {
     ARMEmitter::Reg::r8, ARMEmitter::Reg::r16, ARMEmitter::Reg::r17,
   };
 
-#ifdef __APPLE__
+#ifdef FEX_IOS_HOST
   // On Apple platforms, x18 is reserved for platform TLS. Do not use it.
   constexpr std::array<ARMEmitter::Register, 6> RA = {
     // All these callee saved
@@ -824,7 +824,15 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
 
 #ifdef ARCHITECTURE_arm64ec
   // Load STATE in from the CPU area as x28 is not callee saved in the ARM64EC ABI.
+#ifdef FEX_IOS_HOST
+  // iOS clobbers x18 — read TEB from TPIDRRO_EL0+TSD slot 275 instead.
+  mrs(TmpReg.X(), ARMEmitter::SystemRegister::TPIDRRO_EL0);
+  and_(ARMEmitter::Size::i64Bit, TmpReg.X(), TmpReg.X(), ~7ULL);
+  ldr(TmpReg.X(), TmpReg.X(), IOS_TEB_TSD_OFFSET);
+  ldr(TmpReg.X(), TmpReg.X(), TEB_CPU_AREA_OFFSET);
+#else
   ldr(TmpReg.X(), ARMEmitter::Reg::r18, TEB_CPU_AREA_OFFSET);
+#endif
   ldr(STATE, TmpReg, CPU_AREA_EMULATOR_DATA_OFFSET);
 #endif
 

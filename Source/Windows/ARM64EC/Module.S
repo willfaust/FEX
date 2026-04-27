@@ -1,6 +1,19 @@
 .text
 .balign 16
 
+// iOS clobbers x18 on context switches. Read TEB from TPIDRRO_EL0+TSD slot 275
+// (set up by our Wine ntdll-unix x18 patcher) instead of trusting x18 directly.
+// TPIDRRO_EL0 is preserved by iOS across context switches, and the AND #~7 +
+// ldr at TSD slot 275 (offset 0x898) is the canonical pthread TLS pattern.
+// Must match IOS_TEB_TSD_OFFSET in Arm64Emitter.h.
+#ifdef FEX_IOS_HOST
+.macro IOS_LOAD_TEB reg
+  mrs \reg, TPIDRRO_EL0
+  and \reg, \reg, #~7
+  ldr \reg, [\reg, #0x898]
+.endm
+#endif
+
   // __os_arm64x_x64_jump in ARM64EC docs
   // Expects target code address in x9
 .globl DispatchJump
@@ -16,7 +29,12 @@ RetToEntryThunk:
 
 check_target_ec:
   // Check if target is in fact x86 code
+#ifdef FEX_IOS_HOST
+  IOS_LOAD_TEB x16
+  ldr x16, [x16, #0x60] // TEB->PEB
+#else
   ldr x16, [x18, #0x60] // TEB->PEB
+#endif
   ldr x16, [x16, #0x368] // PEB->EcCodeBitMap
   lsr x17, x9, #18
   ldr x16, [x16, x17, lsl #3]
@@ -32,7 +50,12 @@ ExitToX64:
   str lr, [sp, #-8]! // Push return address to stack, this will be popped by the x86 RET instr.
 
 enter_jit:
+#ifdef FEX_IOS_HOST
+  IOS_LOAD_TEB x17
+  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#else
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#endif
   mov w16, #1
   strb w16, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
   ldr x16, [x17, #0x40] // ChpeV2CpuAreaInfo->EmulatorData[2] - DispatcherLoopTopEnterEC
@@ -41,12 +64,27 @@ enter_jit:
   // Invoked by KiUserEmulationDispatcher after e.g. an NtContinue to x86 code
 .global BeginSimulation
 BeginSimulation:
+#ifdef FEX_IOS_HOST
+  IOS_LOAD_TEB x17
+  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#else
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#endif
   ldr x16, [x17, #0x8] // ChpeV2CpuAreaInfo->EmulatorStackBase
   mov sp, x16
   ldr x0, [x17, #0x18] // ChpeV2CpuAreaInfo->ContextAmd64
+#ifdef FEX_IOS_HOST
+  // llvm-mingw arm64ec emits extern "C" funcs as plain (unprefixed) symbols.
+  bl SyncThreadContext
+#else
   bl "#SyncThreadContext"
+#endif
+#ifdef FEX_IOS_HOST
+  IOS_LOAD_TEB x17
+  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#else
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#endif
   ldr x16, [x17, #0x48] // ChpeV2CpuAreaInfo->EmulatorData[3] - DispatcherLoopTopEnterECFillSRA
   mov x11, #0 // Zero ENTRY_FILL_SRA_SINGLE_INST_REG to avoid single step
   br x16 // DispatcherLoopTopEnterECFillSRA(SingleInst:x10, CPUArea:x17)
@@ -59,7 +97,12 @@ ExitFunctionEC:
   mrs x17, fpcr
   and x17, x17, #~6 // NEP + AH
   msr fpcr, x17
+#ifdef FEX_IOS_HOST
+  IOS_LOAD_TEB x17
+  ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#else
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
+#endif
   strb wzr, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
   ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
   ldr w17, [x17]
@@ -120,12 +163,27 @@ ExitFunctionSuspendPoint:
 
   // Allows for continuing from a full native context, as the NTDLL NtContinue export takes in an x64 context with EC and
   // the conversion to that loses the ARM64EC ABI-disallowed registers that FEX uses.
+#ifdef FEX_IOS_HOST
+// llvm-mingw arm64ec emits unprefixed references from C code (`NtContinueNative`)
+// but the macro defines `#NtContinueNative` only. Add unprefixed aliases pointing
+// to the same code so the link resolves cleanly without linker-synthesized thunks.
+.global NtContinueNative
+NtContinueNative:
+#endif
 DIRECT_SYSCALL_WRAPPER("#NtContinueNative", WineNtContinueSyscallId, 0x43)
 
   // Both of these are wrapped as FEX needs them to setup its call checker at startup time and their NTDLL thunks could
   // already be patched by then (and because the call checker isn't installed, their patched x86 versions would be invoked
   // when called by FEX).
+#ifdef FEX_IOS_HOST
+.global NtAllocateVirtualMemoryNative
+NtAllocateVirtualMemoryNative:
+#endif
 DIRECT_SYSCALL_WRAPPER("#NtAllocateVirtualMemoryNative", WineNtAllocateVirtualMemorySyscallId, 0x18)
+#ifdef FEX_IOS_HOST
+.global NtProtectVirtualMemoryNative
+NtProtectVirtualMemoryNative:
+#endif
 DIRECT_SYSCALL_WRAPPER("#NtProtectVirtualMemoryNative", WineNtProtectVirtualMemorySyscallId, 0x50)
 
   // A replacement for the standard ARM64EC call checker that ignores any FFS patches and always redirects to a function's
@@ -149,6 +207,10 @@ end:
   ret
 
   // Expects target address in x0, and the SP to set in x1
+#ifdef FEX_IOS_HOST
+.global JumpSetStack
+JumpSetStack:
+#endif
 .global "#JumpSetStack"
 "#JumpSetStack":
   mov sp, x1

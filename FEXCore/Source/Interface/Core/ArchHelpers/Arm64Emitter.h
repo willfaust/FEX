@@ -86,6 +86,20 @@ constexpr size_t CPU_AREA_IN_SYSCALL_CALLBACK_OFFSET = 0x1;
 constexpr size_t CPU_AREA_EMULATOR_STACK_BASE_OFFSET = 0x8;
 constexpr size_t CPU_AREA_EMULATOR_DATA_OFFSET = 0x30;
 
+#ifdef FEX_IOS_HOST
+// iOS clobbers x18 on context switches, so any `[x18, OFFSET]` read can SEGV
+// if the OS preempts between a refresh and the read. The Wine ntdll-unix port
+// stores the TEB in pthread TSD slot 275 (offset 0x898 from TPIDRRO_EL0 & ~7);
+// TPIDRRO_EL0 IS preserved by iOS across context switches. Use this as the
+// canonical TEB-pointer source and emit a 3-instruction read at every site
+// that would otherwise touch x18.
+//
+// Must match TSD_TEB_SLOT_OFFSET in our Wine ntdll-unix x18 patcher. Defined
+// at build time via -DFEX_IOS_HOST=1 since we cross-compile to a Windows PE
+// (so __APPLE__ is not defined even though the host OS is iOS).
+constexpr size_t IOS_TEB_TSD_OFFSET = 0x898;
+#endif
+
 constexpr uint64_t EC_CODE_BITMAP_MAX_ADDRESS = 1ULL << 47;
 #endif
 
