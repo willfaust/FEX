@@ -919,6 +919,23 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
 }
 
 NTSTATUS ThreadInit() {
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic diagnostic: log entry to thread-init so we can confirm Wine
+   * is calling BTCpu64ThreadInit for the main x86_64 thread before the
+   * dispatcher is invoked. Without this, EmulatorData[0] is garbage and
+   * the dispatcher BLR's into uninitialized memory. */
+  {
+    HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
+        ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
+              NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
+        : nullptr;
+    if (stderr_h) {
+      const char *msg = "[FEX-iOS] ThreadInit() entered\n";
+      ULONG written = 0;
+      WriteFile(stderr_h, msg, 32, &written, nullptr);
+    }
+  }
+#endif
   std::scoped_lock Lock(ThreadCreationMutex);
   FEX::Windows::InitCRTThread();
   const auto CPUArea = GetCPUArea();
@@ -984,6 +1001,30 @@ NTSTATUS ThreadInit() {
 
   CPUArea.ThreadState() = Thread;
   CPUArea.Area->SuspendDoorbell = reinterpret_cast<ULONG*>(&Thread->CurrentFrame->SuspendDoorbell);
+#ifdef FEX_IOS_HOST
+  {
+    HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
+        ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
+              NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
+        : nullptr;
+    if (stderr_h) {
+      char buf[256];
+      const char *hexd = "0123456789abcdef";
+      const char *prefix = "[FEX-iOS] ThreadInit() done: EmulatorData[0]=0x";
+      int i = 0;
+      while (prefix[i]) { buf[i] = prefix[i]; i++; }
+      unsigned long long ed0 = (unsigned long long)CPUArea.Area->EmulatorData[0];
+      for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(ed0 >> j) & 0xf];
+      const char *p2 = " EnterEC=0x";
+      for (int k = 0; p2[k]; ++k) buf[i++] = p2[k];
+      unsigned long long enter_ec = (unsigned long long)CPUArea.DispatcherLoopTopEnterEC();
+      for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(enter_ec >> j) & 0xf];
+      buf[i++] = '\n';
+      ULONG written = 0;
+      WriteFile(stderr_h, buf, i, &written, nullptr);
+    }
+  }
+#endif
   return STATUS_SUCCESS;
 }
 
