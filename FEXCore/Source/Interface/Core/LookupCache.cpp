@@ -38,7 +38,16 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   // Allocate a region of memory that we can use to back our block pointers
   // We need one pointer per page of virtual memory
   // At 64GB of virtual memory this will allocate 128MB of virtual memory space
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic: commit upfront. The auto-commit-on-access-violation path
+   * (OvercommitTracker.HandleAccessViolation) doesn't take effect cleanly
+   * on iOS — pages stay faulting after VirtualAlloc(MEM_COMMIT) returns.
+   * Pre-commit the whole region; physical pages are still demand-faulted
+   * by the kernel. */
+  PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, true));
+#else
   PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
+#endif
   LOGMAN_THROW_A_FMT(PagePointer != -1ULL, "Failed to allocate PagePointer");
 
   FEXCore::Allocator::VirtualName("FEXMem_Lookup", reinterpret_cast<void*>(PagePointer),
