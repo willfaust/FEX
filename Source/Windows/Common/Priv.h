@@ -56,10 +56,18 @@ public:
 };
 
 
-#define UNIMPLEMENTED()                        \
-  do {                                         \
-    NtTerminateProcess(NtCurrentProcess(), 0); \
-    __fastfail(0);                             \
+/* Encode the stub's source location in the exit status so we can identify
+ * which UNIMPLEMENTED was hit. The 16 LSBs of __LINE__ go into bits 0-15;
+ * the next 8 bits hash the basename (mostly first letter for disambiguation
+ * between IO.cpp/String.cpp/Misc.cpp); 0xFE marks "FEX UNIMPLEMENTED" exits. */
+#define UNIMPLEMENTED()                                                       \
+  do {                                                                        \
+    /* Use __FILE__'s last byte before the extension as a discriminator. */   \
+    unsigned _file_tag = (unsigned char)(__FILE__[sizeof(__FILE__) - 6]);     \
+    NtTerminateProcess(NtCurrentProcess(),                                    \
+        (NTSTATUS)(0xFE000000u | ((_file_tag & 0xFFu) << 16) |                \
+                   (__LINE__ & 0xFFFFu)));                                    \
+    __fastfail(0);                                                            \
   } while (0)
 
 #define DLLEXPORT_FUNC(Ret, Name, Args) \

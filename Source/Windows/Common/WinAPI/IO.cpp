@@ -252,11 +252,15 @@ DLLEXPORT_FUNC(WINBOOL, SetEndOfFile, (HANDLE hFile)) {
 }
 
 DLLEXPORT_FUNC(DWORD, GetFileAttributesA, (LPCSTR lpFileName)) {
-  UNIMPLEMENTED();
+  /* iOS-Mythic stub: pretend the file doesn't exist so FEX's config-file
+   * lookups (FEX::Config::LoadConfig etc.) skip cleanly. */
+  SetLastError(ERROR_FILE_NOT_FOUND);
+  return INVALID_FILE_ATTRIBUTES;
 }
 
 DLLEXPORT_FUNC(DWORD, GetFileAttributesW, (LPCWSTR lpFileName)) {
-  UNIMPLEMENTED();
+  SetLastError(ERROR_FILE_NOT_FOUND);
+  return INVALID_FILE_ATTRIBUTES;
 }
 
 DLLEXPORT_FUNC(WINBOOL, SetFileAttributesA, (LPCSTR lpFileName, DWORD dwFileAttributes)) {
