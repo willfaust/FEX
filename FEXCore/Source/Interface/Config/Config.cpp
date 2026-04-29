@@ -247,19 +247,11 @@ extern "C" __declspec(dllimport) long __stdcall NtTerminateProcess(void *hProces
 #define INIT_TAG_EXIT(id) NtTerminateProcess((void*)-1, (long)(0xCC700000 | (id)))
 
 void Initialize() {
-  /* Step 1: try plain new instead of fextl::make_unique to isolate
-   * whether the allocator (rpmalloc + fextl) is what's faulting. */
-  MetaLayer *raw = nullptr;
-  raw = new MetaLayer(FEXCore::Config::LayerType::LAYER_TOP);
-  if (!raw) INIT_TAG_EXIT(0x0030);  /* plain new returned null */
-  /* If we got here, allocator works for std::operator new. Now try wrapping
-   * in fextl::unique_ptr (which wraps + transfers ownership). */
-  fextl::unique_ptr<Layer> layer(raw);
-  if (!layer) INIT_TAG_EXIT(0x0031);
-  AddLayer(std::move(layer));
-  if (ConfigLayers.empty()) INIT_TAG_EXIT(0x0032);
+  AddLayer(fextl::make_unique<MetaLayer>(FEXCore::Config::LayerType::LAYER_TOP));
+  /* iOS-Mythic: avoid dynamic_cast — RTTI for cross-DLL types under
+   * arm64ec-w64-mingw32 returns NULL. We just inserted MetaLayer above
+   * so static_cast is safe. */
   Meta = static_cast<MetaLayer*>(ConfigLayers.begin()->second.get());
-  /* Initialize success — let it return cleanly. */
   if (ConfigLayers.empty()) INIT_TAG_EXIT(0x0012);
   auto it = ConfigLayers.begin();
   if (it == ConfigLayers.end()) INIT_TAG_EXIT(0x0013);
