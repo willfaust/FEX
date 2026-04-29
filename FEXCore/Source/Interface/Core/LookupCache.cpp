@@ -13,6 +13,10 @@ $end_info$
 #include "Interface/Context/Context.h"
 #include "Interface/Core/LookupCache.h"
 
+#ifdef FEX_IOS_HOST
+#include <cstring>
+#endif
+
 namespace FEXCore {
 GuestToHostMap::GuestToHostMap()
   : BlockLinks_mbr {"FEXMem_BlockLinks"} {
@@ -74,6 +78,18 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
     // Start at maximum instead.
     L1PointerMask = MAX_L1_ENTRIES - 1;
   }
+
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic: explicitly memset PageMemory (L2) and L1 to 0. iOS demand-faults
+   * fresh pages with a 0x69 byte at the start of every iOS page (a kernel quirk
+   * we observed during JIT-pool dumps). If FEX's L2/L1 lookup hits one of those
+   * bytes via the page-shift arithmetic, cbz fails to fire and the dispatcher
+   * BRs to a nonzero stale pointer (= empty pool space → SIGILL). The memset
+   * touches every iOS page so we end up with zero-filled, fully-committed L2/L1. */
+  std::memset(reinterpret_cast<void*>(PageMemory),
+              0, ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8);
+  std::memset(reinterpret_cast<void*>(L1Pointer), 0, MAX_L1_SIZE);
+#endif
 }
 
 LookupCache::~LookupCache() {
