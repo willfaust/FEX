@@ -114,6 +114,39 @@ DLLEXPORT_FUNC(WINBOOL, WriteFile,
   if (lpOverlapped) {
     UNIMPLEMENTED();
   }
+  /* iOS-Mythic: also dprintf to stderr (= mythic-log.txt) so we can SEE
+   * what x86_64 PE writes regardless of where hFile actually points. */
+  {
+    char dbg[8 + 64 + 16];
+    const char *hexd = "0123456789abcdef";
+    int i = 0;
+    const char *p = "[WriteFile h=0x";
+    while (p[i]) { dbg[i] = p[i]; i++; }
+    unsigned long long h = (unsigned long long)hFile;
+    for (int j = 60; j >= 0; j -= 4) dbg[i++] = hexd[(h >> j) & 0xf];
+    dbg[i++] = ' ';
+    dbg[i++] = 'b';
+    dbg[i++] = 'y';
+    dbg[i++] = 't';
+    dbg[i++] = 'e';
+    dbg[i++] = 's';
+    dbg[i++] = '=';
+    unsigned long n = nNumberOfBytesToWrite > 64 ? 64 : nNumberOfBytesToWrite;
+    for (unsigned long k = 0; k < n; ++k) {
+      unsigned char c = ((const unsigned char*)lpBuffer)[k];
+      if (c >= 0x20 && c < 0x7f) dbg[i++] = (char)c;
+      else if (c == '\n') { dbg[i++] = '\\'; dbg[i++] = 'n'; }
+      else { dbg[i++] = '?'; }
+    }
+    dbg[i++] = '\n';
+    HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
+                          ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
+                          : nullptr;
+    if (stderr_h && stderr_h != hFile) {
+      IO_STATUS_BLOCK sb;
+      NtWriteFile(stderr_h, nullptr, nullptr, nullptr, &sb, dbg, (ULONG)i, nullptr, nullptr);
+    }
+  }
   NTSTATUS Status = NtWriteFile(hFile, nullptr, nullptr, nullptr, &IOSB, lpBuffer, nNumberOfBytesToWrite, nullptr, nullptr);
   if (lpNumberOfBytesWritten) {
     *lpNumberOfBytesWritten = static_cast<DWORD>(IOSB.Information);
@@ -122,17 +155,49 @@ DLLEXPORT_FUNC(WINBOOL, WriteFile,
 }
 
 DLLEXPORT_FUNC(HANDLE, GetStdHandle, (DWORD nStdHandle)) {
-  UNIMPLEMENTED();
+  auto* Params = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters);
+  switch (nStdHandle) {
+  case STD_INPUT_HANDLE: return reinterpret_cast<HANDLE>(Params->hStdInput);
+  case STD_OUTPUT_HANDLE: return reinterpret_cast<HANDLE>(Params->hStdOutput);
+  case STD_ERROR_HANDLE: return reinterpret_cast<HANDLE>(Params->hStdError);
+  default:
+    SetLastError(ERROR_INVALID_HANDLE);
+    return INVALID_HANDLE_VALUE;
+  }
 }
 
 DLLEXPORT_FUNC(WINBOOL, WriteConsoleA,
                (HANDLE hConsoleOutput, CONST void* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, void* lpReserved)) {
-  UNIMPLEMENTED();
+  IO_STATUS_BLOCK IOSB;
+  NTSTATUS Status = NtWriteFile(hConsoleOutput, nullptr, nullptr, nullptr, &IOSB, lpBuffer, nNumberOfCharsToWrite, nullptr, nullptr);
+  if (lpNumberOfCharsWritten) {
+    *lpNumberOfCharsWritten = static_cast<DWORD>(IOSB.Information);
+  }
+  return WinAPIReturn(Status);
 }
+
+extern "C" NTSTATUS NTAPI RtlUnicodeToUTF8N(char* dst, ULONG dstlen, ULONG* reslen, const WCHAR* src, ULONG srclen);
 
 DLLEXPORT_FUNC(WINBOOL, WriteConsoleW,
                (HANDLE hConsoleOutput, CONST void* lpBuffer, DWORD nNumberOfCharsToWrite, LPDWORD lpNumberOfCharsWritten, void* lpReserved)) {
-  UNIMPLEMENTED();
+  ULONG utf8_len = 0;
+  RtlUnicodeToUTF8N(nullptr, 0, &utf8_len, static_cast<const WCHAR*>(lpBuffer), nNumberOfCharsToWrite * sizeof(WCHAR));
+  if (utf8_len == 0) {
+    if (lpNumberOfCharsWritten) *lpNumberOfCharsWritten = 0;
+    return TRUE;
+  }
+  auto* utf8 = static_cast<char*>(RtlAllocateHeap(GetProcessHeap(), 0, utf8_len));
+  if (!utf8) return FALSE;
+  ULONG written = 0;
+  RtlUnicodeToUTF8N(utf8, utf8_len, &written, static_cast<const WCHAR*>(lpBuffer), nNumberOfCharsToWrite * sizeof(WCHAR));
+
+  IO_STATUS_BLOCK IOSB;
+  NTSTATUS Status = NtWriteFile(hConsoleOutput, nullptr, nullptr, nullptr, &IOSB, utf8, written, nullptr, nullptr);
+  RtlFreeHeap(GetProcessHeap(), 0, utf8);
+  if (lpNumberOfCharsWritten) {
+    *lpNumberOfCharsWritten = nNumberOfCharsToWrite;
+  }
+  return WinAPIReturn(Status);
 }
 
 DLLEXPORT_FUNC(WINBOOL, SetFilePointerEx, (HANDLE hFile, LARGE_INTEGER liDistanceToMove, PLARGE_INTEGER lpNewFilePointer, DWORD dwMoveMethod)) {
