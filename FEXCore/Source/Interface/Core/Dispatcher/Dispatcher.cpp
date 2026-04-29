@@ -135,6 +135,15 @@ void Dispatcher::EmitDispatcher() {
 
   FillSpecialRegs(TMP1, TMP2, false, true);
 
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic: skip the opportunistic call-ret-stack return on iOS. The
+   * call-ret stack is zero-initialized via memset (CallRetStack.h iOS branch),
+   * so the LDP loads (0,0) and cbnz takes us to LoopTop anyway. But if the
+   * memset somehow misses (iOS demand-fault quirks on the previously-NOACCESS
+   * region), the `ret x11` would jump to garbage. Force unconditional branch
+   * to LoopTop. */
+  (void)b(&LoopTop);
+#else
   // As ARM64EC uses this as an entrypoint for both guest calls and host returns, opportunistically try to return
   // using the call-ret stack to avoid unbalancing it.
   ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, REG_CALLRET_SP);
@@ -145,6 +154,7 @@ void Dispatcher::EmitDispatcher() {
   // If the entry at the TOS is for the target address, pop it and return to the JIT code
   add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x10);
   ret(TMP2);
+#endif
 
   // Enter JIT
 #endif

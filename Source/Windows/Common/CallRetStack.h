@@ -33,6 +33,14 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
   Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CallRetStackAlloc) + FEXCore::Utils::FEX_PAGE_SIZE);
   ::VirtualAlloc(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, MEM_COMMIT, PAGE_READWRITE);
 
+  /* iOS-Mythic: VirtualAlloc(MEM_COMMIT) on a previously-MEM_RESERVE'd
+   * PAGE_NOACCESS region might not zero-initialize the pages on iOS. The
+   * dispatcher uses callret_sp to BLR via stored values; uninit content
+   * (e.g. 0x55 poison from prior wine activity) would BLR to garbage. */
+#ifdef FEX_IOS_HOST
+  memset(Thread->CallRetStackBase, 0, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+#endif
+
   Thread->CurrentFrame->State.callret_sp = GetInfoThread(Thread).DefaultLocation;
 }
 
