@@ -57,6 +57,28 @@ public:
 };
 
 FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostFeatures::HostTypeEnum HostType) {
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic: registry has nothing useful here (Hardware\... reg keys
+   * aren't populated). Synthesize a minimal HostFeatures manually with
+   * baseline ARMv8.2 features that Apple Silicon supports. */
+  FEXCore::HostFeatures HostFeatures = {};
+  HostFeatures.DCacheLineSize = 64;
+  HostFeatures.ICacheLineSize = 64;
+  HostFeatures.SupportsCacheMaintenanceOps = !IsWine;
+  HostFeatures.SupportsAES = true;
+  HostFeatures.SupportsCRC = true;
+  HostFeatures.SupportsAtomics = true;
+  HostFeatures.SupportsRCPC = true;
+  HostFeatures.SupportsSHA = true;
+  HostFeatures.SupportsPMULL_128Bit = true;
+  HostFeatures.SupportsFCMA = true;
+  HostFeatures.SupportsFlagM = true;
+  HostFeatures.SupportsFlagM2 = true;
+  HostFeatures.SupportsAFP = true;
+  HostFeatures.CPUMIDRs.push_back(0u);
+  HostFeatures.HostType = HostType;
+  return HostFeatures;
+#else
   HKEY Key = OpenProcessorKey(0);
   if (!Key) {
     ERROR_AND_DIE_FMT("Couldn't detect CPU features");
@@ -90,6 +112,7 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
     HostFeatures.SupportsAVX = false;
   }
   return HostFeatures;
+#endif
 }
 
 CPUFeatures::CPUFeatures(FEXCore::Context::Context& CTX) {
