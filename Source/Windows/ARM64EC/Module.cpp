@@ -144,9 +144,21 @@ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
-std::recursive_mutex ThreadCreationMutex;
-// Map of TIDs to their FEX thread state, `ThreadCreationMutex` must be locked when accessing
-std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Threads;
+// iOS-Mythic: arm64ec-mingw doesn't reliably run global C++ ctors, so the
+// recursive_mutex / unordered_map below would be zero-init'd and any lock()
+// would hang in NtWaitForAlertByThreadId. Wrap as Meyers singletons so they
+// construct on first use regardless of the broken static-init chain.
+inline std::recursive_mutex& GetThreadCreationMutex() {
+  static std::recursive_mutex Mutex;
+  return Mutex;
+}
+#define ThreadCreationMutex GetThreadCreationMutex()
+
+inline std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& GetThreadsMap() {
+  static std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*> Map;
+  return Map;
+}
+#define Threads GetThreadsMap()
 
 std::pair<NTSTATUS, ThreadCPUArea> GetThreadCPUArea(HANDLE Thread) {
   THREAD_BASIC_INFORMATION Info;
