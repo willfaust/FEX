@@ -790,19 +790,29 @@ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestConte
   return STATUS_SUCCESS;
 }
 
+/* iOS-port note: previously this took ThreadCreationMutex on the BEFORE
+ * call and released it on the AFTER call, holding the lock across the
+ * actual memory operation. On Wine-on-iOS that creates an AB-BA deadlock:
+ * Wine's RtlAllocateHeap (heap mutex) may grow its arena via
+ * NtAllocateVirtualMemory, which calls NotifyMemoryAlloc(BEFORE) → wants
+ * ThreadCreationMutex; meanwhile a worker thread holds ThreadCreationMutex
+ * (taken in its own NotifyMemoryAlloc(BEFORE)) and needs heap for an
+ * InvalidationTracker allocation.
+ *
+ * The InvalidationTracker has its own internal locking (IntervalsLock,
+ * CodeInvalidationMutex), so external serialization isn't strictly
+ * required for its correctness. Drop the BEFORE/AFTER mutex entirely
+ * and just call into the tracker directly on AFTER. */
 void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL After, NTSTATUS Status) {
   if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
     return;
   }
 
-  if (!After) {
-    ThreadCreationMutex.lock();
-  } else {
+  if (After) {
     // MEM_RESET(_UNDO) ignores the passed permissions
     if (!Status && !(Type & (MEM_RESET | MEM_RESET_UNDO))) {
       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), Prot);
     }
-    ThreadCreationMutex.unlock();
   }
 }
 
@@ -811,13 +821,10 @@ void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NT
     return;
   }
 
-  if (!After) {
-    ThreadCreationMutex.lock();
-  } else {
+  if (After) {
     if (!Status) {
       InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), true);
     }
-    ThreadCreationMutex.unlock();
   }
 }
 
@@ -826,13 +833,10 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
     return;
   }
 
-  if (!After) {
-    ThreadCreationMutex.lock();
-  } else {
+  if (After) {
     if (!Status) {
       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
     }
-    ThreadCreationMutex.unlock();
   }
 }
 
@@ -1007,7 +1011,6 @@ NTSTATUS ThreadInit() {
       0x168,  // ExitFunctionLink path SpillStaticRegs's pair-1 onwards
       0x268,  // NoBlock path SpillStaticRegs's pair-1 onwards
     };
-    constexpr uintptr_t kPoolSize = 0x8000000;  // 128MB
 
     HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
         ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
@@ -1028,8 +1031,12 @@ NTSTATUS ThreadInit() {
 
     log_hex("[FEX-iOS] DispatcherPatch: EnterEC=", EnterEC);
     for (auto patch_off : kPatchOffsets) {
+      /* Write directly to RX address. iOS doesn't allow RX writes — but the
+       * ntdll-unix Mach STR emulator catches the resulting page fault and
+       * redirects each store to the correct RW alias (which iOS placed at
+       * a runtime-chosen address, NOT a fixed +128MB offset). This is the
+       * same path FEX itself uses for its compile-time block emit. */
       uint32_t* patch_rx = reinterpret_cast<uint32_t*>(EnterEC + patch_off);
-      uint32_t* patch_rw = reinterpret_cast<uint32_t*>(EnterEC + patch_off + kPoolSize);
 
       bool already_ok = true;
       for (int i = 0; i < 7; i++) {
@@ -1039,11 +1046,8 @@ NTSTATUS ThreadInit() {
       if (!already_ok) {
         log_hex("[FEX-iOS]   site offset=", patch_off);
         for (int i = 0; i < 7; i++) {
-          patch_rw[i] = expected[i];
+          patch_rx[i] = expected[i];  // faults → STR emulator → real RW alias
         }
-        /* Use NtFlushInstructionCache instead of __builtin___clear_cache.
-         * The latter emits `dc cvau` instructions which fault on iOS JIT-pool
-         * RX pages. NtFlushInstructionCache uses the iOS-aware syscall path. */
         NtFlushInstructionCache(NtCurrentProcess(), patch_rx, sizeof(expected));
       } else {
         log_hex("[FEX-iOS]   already OK at offset=", patch_off);
