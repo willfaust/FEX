@@ -860,6 +860,16 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
 
+  /* iOS-Mythic: refuse to compile obviously-invalid guest RIPs. After a
+   * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
+   * lands at RIP=0x8, which then loops compiling thousands of garbage
+   * blocks before SEH unwinds. Returning 0 here raises C0000005 to the
+   * guest immediately so the first AV is the only AV. */
+  if (GuestRIP < 0x10000) {
+    LogMan::Msg::IFmt("[iOS] CompileBlock: REFUSING low/invalid RIP={:#x}", GuestRIP);
+    return 0;
+  }
+
   LogMan::Msg::IFmt("[iOS] CompileBlock: RIP={:#x} MaxInst={}", GuestRIP, MaxInst);
 
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
