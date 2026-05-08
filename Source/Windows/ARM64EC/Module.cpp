@@ -988,7 +988,10 @@ NTSTATUS ThreadInit() {
    * faults at 0xfffffffffffffff0.
    *
    * Workaround: write the correct stp encodings over the broken slots at
-   * BOTH sites, via the RW alias. iOS dual-map: RW = RX + 128MB.            */
+   * BOTH sites. The writes go to the RX address; iOS denies RW on RX pages
+   * but the ntdll-unix Mach STR emulator catches each fault and redirects
+   * the store to the JIT pool's RW alias (located at a runtime-chosen
+   * address, NOT a fixed offset from RX).                                   */
   {
     /* Expected stp instructions for pairs 1..7 of SpillStaticRegs.
      * ARM64EC SRA: RAX=x8 (pair0=RAX,RCX), RDX=x1, RBX=x27 (pair1),
@@ -1005,11 +1008,28 @@ NTSTATUS ThreadInit() {
       0xa9095b95,  // stp x21, x22, [x28, #0x90]
     };
 
-    /* Two SpillStaticRegs sites in the dispatcher emit. Both have the same
-     * bug, both at the same offsets relative to the SpillStaticRegs start. */
-    static constexpr uintptr_t kPatchOffsets[] = {
-      0x168,  // ExitFunctionLink path SpillStaticRegs's pair-1 onwards
-      0x268,  // NoBlock path SpillStaticRegs's pair-1 onwards
+    /* Two SpillStaticRegs sites in the dispatcher emit, with DIFFERENT
+     * shapes:
+     *  - First site (ExitFunctionLink path) at EnterEC+0x160: emitter places
+     *    pair-0 at +0x160, then a SPURIOUS invalid word at +0x164, then
+     *    pair-1..pair-7 at +0x168..+0x180. Net 9 instructions for 8 spills.
+     *  - Second site (NoBlock path) at EnterEC+0x264: emitter places pair-0
+     *    at +0x264 (legit, no spurious), then pair-1..pair-7 at +0x268..+0x280.
+     *
+     * Fix: at the FIRST site, shift pair-1..pair-7 LEFT by 4 bytes so they
+     * land at +0x164..+0x17C — overwriting the spurious slot, with NOP at
+     * +0x180 (was the displaced pair-7). The dispatcher then executes 8 stp
+     * pairs at consecutive offsets +0x160..+0x17C, falls through the NOP at
+     * +0x180, and resumes at the existing FP-save base setup at +0x184. At
+     * the SECOND site, layout is already correct: pair-0 stays at +0x264,
+     * pair-1..pair-7 patched at +0x268..+0x280 as before. */
+    struct PatchSite {
+      uintptr_t pair1_offset;   // where pair-1 should land
+      bool      nop_after_pair7; // need a NOP just past pair-7?
+    };
+    static constexpr PatchSite kSites[] = {
+      { 0x164, true  },  // first site: shift left, NOP at +0x180
+      { 0x268, false },  // second site: layout already correct
     };
 
     HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
@@ -1030,27 +1050,38 @@ NTSTATUS ThreadInit() {
     };
 
     log_hex("[FEX-iOS] DispatcherPatch: EnterEC=", EnterEC);
-    for (auto patch_off : kPatchOffsets) {
+
+    static constexpr uint32_t kNopInstr = 0xd503201f;  // nop
+
+    for (auto site : kSites) {
       /* Write directly to RX address. iOS doesn't allow RX writes — but the
        * ntdll-unix Mach STR emulator catches the resulting page fault and
        * redirects each store to the correct RW alias (which iOS placed at
        * a runtime-chosen address, NOT a fixed +128MB offset). This is the
        * same path FEX itself uses for its compile-time block emit. */
-      uint32_t* patch_rx = reinterpret_cast<uint32_t*>(EnterEC + patch_off);
+      uint32_t* patch_rx = reinterpret_cast<uint32_t*>(EnterEC + site.pair1_offset);
 
       bool already_ok = true;
       for (int i = 0; i < 7; i++) {
         if (patch_rx[i] != expected[i]) { already_ok = false; break; }
       }
+      if (already_ok && site.nop_after_pair7 && patch_rx[7] != kNopInstr) {
+        already_ok = false;
+      }
 
       if (!already_ok) {
-        log_hex("[FEX-iOS]   site offset=", patch_off);
+        log_hex("[FEX-iOS]   site pair-1 offset=", site.pair1_offset);
         for (int i = 0; i < 7; i++) {
           patch_rx[i] = expected[i];  // faults → STR emulator → real RW alias
         }
-        NtFlushInstructionCache(NtCurrentProcess(), patch_rx, sizeof(expected));
+        size_t flush_size = sizeof(expected);
+        if (site.nop_after_pair7) {
+          patch_rx[7] = kNopInstr;
+          flush_size += sizeof(kNopInstr);
+        }
+        NtFlushInstructionCache(NtCurrentProcess(), patch_rx, flush_size);
       } else {
-        log_hex("[FEX-iOS]   already OK at offset=", patch_off);
+        log_hex("[FEX-iOS]   already OK at pair-1 offset=", site.pair1_offset);
       }
     }
     log_hex("[FEX-iOS] DispatcherPatch DONE.", 0);
