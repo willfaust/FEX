@@ -969,6 +969,22 @@ NTSTATUS ThreadInit() {
   Frame->State.cs_idx = FEXCore::Core::CPUState::DEFAULT_USER_CS << 3;
   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
 
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic: set up GS base for x86_64 TLS access. On Windows x64 the
+   * convention is GS-base = TEB pointer, and MSVC-emitted code uses
+   * `mov rax, gs:[0x58]` to reach TEB->ThreadLocalStoragePointer.
+   * LoadStateFromECContext() at the EC->x86 transition sets this, but for
+   * the path where x86 code starts running before any CONTEXT-load happens
+   * (e.g. Thumper's startup invoking thread-local guards before its first
+   * exception-driven context restore), gs_cached stays 0 and gs:[N] hits
+   * SEGV at addr=N.                                                       */
+  {
+    const uint64_t TEB = reinterpret_cast<uint64_t>(NtCurrentTeb());
+    Frame->State.gs_cached = TEB;
+    Frame->State.fs_cached = 0;
+  }
+#endif
+
   FEX::Windows::CallRetStack::InitializeThread(Thread);
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
   CPUArea.StateFrame() = Thread->CurrentFrame;
@@ -1134,6 +1150,10 @@ NTSTATUS ThreadInit() {
       for (int k = 0; p2[k]; ++k) buf[i++] = p2[k];
       unsigned long long enter_ec = (unsigned long long)CPUArea.DispatcherLoopTopEnterEC();
       for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(enter_ec >> j) & 0xf];
+      const char *p3 = " gs_cached=0x";
+      for (int k = 0; p3[k]; ++k) buf[i++] = p3[k];
+      unsigned long long gs = (unsigned long long)Frame->State.gs_cached;
+      for (int j = 60; j >= 0; j -= 4) buf[i++] = hexd[(gs >> j) & 0xf];
       buf[i++] = '\n';
       ULONG written = 0;
       WriteFile(stderr_h, buf, i, &written, nullptr);
