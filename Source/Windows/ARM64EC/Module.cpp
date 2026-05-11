@@ -1045,7 +1045,12 @@ NTSTATUS ThreadInit() {
     };
     static constexpr PatchSite kSites[] = {
       { 0x164, true  },  // first site: shift left, NOP at +0x180
-      { 0x268, false },  // second site: layout already correct
+      // All other sites are scanned/patched dynamically below — the FEX
+      // emitter produces the same broken 7-word pattern at MANY offsets
+      // (24+ sites in Thumper, growing with each new code path). Iterating
+      // a hardcoded list was whack-a-mole; we now scan the whole dispatcher
+      // region for `stp x8,x0,[x28,#0x20]` immediately followed by the
+      // canonical 7-invalid-words sequence, and rewrite them in-place.
     };
 
     HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
@@ -1087,12 +1092,25 @@ NTSTATUS ThreadInit() {
 
       if (!already_ok) {
         log_hex("[FEX-iOS]   site pair-1 offset=", site.pair1_offset);
+        /* Write to RW alias directly. The iOS JIT pool is dual-mapped:
+         * RX at the runtime-chosen base, RW at RX + 256MB. Writing to RX
+         * triggers a Mach exception that our STR emulator handles, but
+         * empirically that path has been silently dropping a specific store
+         * per site (e.g. pair-5) without faulting — possibly an iOS
+         * page-protection quirk where ThreadInit's STRs to RX from xtajit64.dll
+         * neither succeed natively nor trap.
+         *
+         * Bypass entirely by writing to the RW alias. RX→RW offset is the
+         * fixed 256MB pool size — same convention used everywhere else in
+         * the iOS JIT pool code. */
+        constexpr uintptr_t kRwOffset = 0x10000000;  // 256MB JIT pool size
+        uint32_t* patch_rw = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(patch_rx) + kRwOffset);
         for (int i = 0; i < 7; i++) {
-          patch_rx[i] = expected[i];  // faults → STR emulator → real RW alias
+          patch_rw[i] = expected[i];
         }
         size_t flush_size = sizeof(expected);
         if (site.nop_after_pair7) {
-          patch_rx[7] = kNopInstr;
+          patch_rw[7] = kNopInstr;
           flush_size += sizeof(kNopInstr);
         }
         NtFlushInstructionCache(NtCurrentProcess(), patch_rx, flush_size);
@@ -1100,6 +1118,59 @@ NTSTATUS ThreadInit() {
         log_hex("[FEX-iOS]   already OK at pair-1 offset=", site.pair1_offset);
       }
     }
+
+    /* Generic scan: many SpillStaticRegs sites in the dispatcher exhibit the
+     * same broken-pattern (pair-0 stp at offset N, then 7 invalid words at
+     * N+4..N+0x1c). Rather than hardcoding each offset, walk the dispatcher
+     * region and rewrite every occurrence in-place. The 7-word signature is
+     * specific enough that there are no false positives in the FEX
+     * dispatcher (the canonical broken first-word `0x1ccfef95` doesn't
+     * decode to anything used in normal emit). */
+    {
+      static constexpr size_t kScanBytes = 0x2000;
+      static constexpr uint32_t kStpPair0 = 0xa9020388;  /* stp x8,x0,[x28,#0x20] */
+      /* Detect broken sites by UNIFORMITY: the FEX emitter's bug produces 7
+       * garbage instructions where pair-1..pair-7 stps should go. The exact
+       * encoding class varies per build (FCSEL 0x1c..0x1d, MADD/MSUB
+       * 0x1a..0x1b, observed) but within a single broken site, all 7 garbage
+       * words share the same top encoding-class byte (`& 0xff800000`).
+       *
+       * Real dispatcher code that follows a legitimate pair-0 stp varies:
+       * arithmetic, branches, loads, calls — DIFFERENT top bytes. So
+       * "uniform top byte across 7 words AND not 0xa9 (stp)" is a tight
+       * discriminator that catches every observed garbage class without
+       * false-positiving on real code.
+       *
+       * (Earlier negative-match-on-stp filter false-positived: legitimate
+       * pair-0 sites whose follow-up code has 7 non-stp instructions got
+       * their tails overwritten with pair-1..pair-7, breaking valid code.) */
+      static constexpr uint32_t kStpMask = 0xff800000;
+      static constexpr uint32_t kStp64SignedOffset = 0xa9000000;
+      uint32_t* base = reinterpret_cast<uint32_t*>(EnterEC);
+      int patched = 0;
+      int already_ok = 0;
+      for (size_t i = 0; i < kScanBytes / 4 - 8; i++) {
+        if (base[i] != kStpPair0) continue;
+        uint32_t top0 = base[i + 1] & kStpMask;
+        if (top0 == kStp64SignedOffset) { already_ok++; continue; }
+        bool uniform = true;
+        for (int j = 2; j <= 7; j++) {
+          if ((base[i + j] & kStpMask) != top0) { uniform = false; break; }
+        }
+        if (!uniform) continue;  /* legit code following pair-0 — leave alone */
+        /* Write to RW alias (RX + 256MB). See hardcoded-site comment for why. */
+        constexpr uintptr_t kRwOffset = 0x10000000;
+        uint32_t* rw_base = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(&base[i + 1]) + kRwOffset);
+        for (int j = 0; j < 7; j++) {
+          rw_base[j] = expected[j];
+        }
+        NtFlushInstructionCache(NtCurrentProcess(), &base[i + 1], sizeof(expected));
+        patched++;
+      }
+      log_hex("[FEX-iOS]   scan-patched broken sites: count=", (uint64_t)patched);
+      log_hex("[FEX-iOS]   scan-skipped already-ok pair-0 sites: count=", (uint64_t)already_ok);
+    }
+
     log_hex("[FEX-iOS] DispatcherPatch DONE.", 0);
   }
 #endif
