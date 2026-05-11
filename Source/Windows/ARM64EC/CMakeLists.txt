@@ -1,6 +1,7 @@
 add_library(arm64ecfex SHARED
   Module.cpp
   Module.S
+  IosJitAlias.cpp
   libarm64ecfex.def
   $<TARGET_OBJECTS:FEXCore_object>)
 
