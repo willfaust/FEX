@@ -61,6 +61,16 @@ $end_info$
 #include <winnt.h>
 #include <wine/debug.h>
 
+#ifdef FEX_IOS_HOST
+/* iOS JIT-pool alias resolution. Implemented in IosJitAlias.cpp (separate
+ * TU because ARM64EC class-method access to the static table directly from
+ * this TU triggered "misaligned ldr/str offset" link errors). The
+ * BTCpu64IosAddAliasMapping export is populated by Wine ntdll-unix when
+ * PE images are copied into the JIT pool. */
+extern "C" uint64_t IosJitTranslate(uint64_t Addr);
+extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
+#endif // FEX_IOS_HOST
+
 namespace Exception {
 class ECSyscallHandler;
 }
@@ -546,7 +556,24 @@ public:
   }
 
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
-    return ImageTracker->LookupExecutableFileSection(Address);
+    auto Result = ImageTracker->LookupExecutableFileSection(Address);
+#ifdef FEX_IOS_HOST
+    if (!Result.has_value()) {
+      /* iOS JIT-alias-aware: same pattern as QueryGuestExecutableRange. */
+      uint64_t OrigAddr = IosJitReverseTranslate(Address);
+      if (OrigAddr != Address) {
+        auto Inner = ImageTracker->LookupExecutableFileSection(OrigAddr);
+        if (Inner.has_value()) {
+          FEXCore::ExecutableFileSectionInfo Aliased = *Inner;
+          Aliased.FileStartVA = IosJitTranslate(Inner->FileStartVA);
+          Aliased.BeginVA = IosJitTranslate(Inner->BeginVA);
+          Aliased.EndVA = IosJitTranslate(Inner->EndVA - 1) + 1;
+          return Aliased;
+        }
+      }
+    }
+#endif
+    return Result;
   }
 
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
@@ -566,7 +593,21 @@ public:
   }
 
   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
-    return InvalidationTracker->QueryExecutableRange(Address);
+    auto Result = InvalidationTracker->QueryExecutableRange(Address);
+#ifdef FEX_IOS_HOST
+    if (Result.Size == 0) {
+      /* iOS JIT-alias-aware: reverse-translate alias → PE-original, query
+       * tracker with that, then forward-translate the result base back. */
+      uint64_t OrigAddr = IosJitReverseTranslate(Address);
+      if (OrigAddr != Address) {
+        auto Inner = InvalidationTracker->QueryExecutableRange(OrigAddr);
+        if (Inner.Size != 0) {
+          return {IosJitTranslate(Inner.Base), Inner.Size, Inner.Writable};
+        }
+      }
+    }
+#endif
+    return Result;
   }
 
   void PreCompile() override {
