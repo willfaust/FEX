@@ -161,6 +161,13 @@ DEF_OP(ExitFunction) {
       ARMEmitter::ForwardLabel l_BranchHost;
       ARMEmitter::ForwardLabel l_CallReturn;
       if (Op->Hint == IR::BranchHint::Call) {
+#ifdef ARCHITECTURE_arm64ec
+        // iOS-Mythic 2026-05-13: REG_CALLRET_SP (x17) gets clobbered when a
+        // previous BLR returns from native ARM64EC code (DXMT vtable methods,
+        // ARM64EC entry thunks). Reload from State.callret_sp before pushing
+        // the call-return frame so we don't stp to wherever x17 was left.
+        ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
         if (!Op->CallReturnBlock.IsInvalid()) {
           auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
           PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
@@ -215,6 +222,12 @@ DEF_OP(ExitFunction) {
     (void)Bind(&SkipFullLookup);
     if (Op->Hint == IR::BranchHint::Call) {
       ARMEmitter::ForwardLabel l_CallReturn;
+#ifdef ARCHITECTURE_arm64ec
+      // iOS-Mythic 2026-05-13: see note above — reload REG_CALLRET_SP (x17)
+      // from State.callret_sp before pushing the call-return frame, since
+      // native ARM64EC returns leave x17 pointing at an arbitrary RX page.
+      ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
       if (!Op->CallReturnBlock.IsInvalid()) {
         auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
         PendingCallReturnTargetLabel = &CallReturnTargets.try_emplace(Op->CallReturnBlock.ID()).first->second;
