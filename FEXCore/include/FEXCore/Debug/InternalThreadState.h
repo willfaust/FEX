@@ -114,7 +114,13 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   ///< Data pointer for exclusive use by the frontend
   void* FrontendPtr;
 
-  static constexpr size_t CALLRET_STACK_SIZE {0x400000};
+  // iOS-Mythic 2026-05-13: bumped 4MB → 16MB. SEH unwinds through translated
+  // code on iOS don't pop FEX callret entries (FEX has no SEH-aware callret
+  // cleanup yet), so caught faults leak entries. With 9700+ caught faults
+  // observed in Thumper FMOD worker, the original 4MB filled up. 16MB buys
+  // ~1M entries — enough to survive normal game runtimes that have a few
+  // hundred per-thread caught faults. Real fix: callret-aware SEH unwind.
+  static constexpr size_t CALLRET_STACK_SIZE {0x1000000};
 
   // The low address of the call-ret stack allocation (not including guard pages)
   void* CallRetStackBase {};
