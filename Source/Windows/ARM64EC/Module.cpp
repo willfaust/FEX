@@ -791,8 +791,25 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     LogMan::Msg::DFmt("Rethrowing onto guest stack: {:X}", NativeContext->Sp);
     return true;
   } else {
+#ifdef FEX_IOS_HOST
+    // iOS-Mythic 2026-05-13: iOS doesn't switch exception delivery to a
+    // separate emulator stack like Windows-ARM64EC does (no CPU_AREA-driven
+    // sigaltstack). Mach exception delivery arrives on whatever thread
+    // stack was current, which is usually the guest stack. Attempt rethrow
+    // anyway — same path Windows takes; worst case we crash here instead
+    // of terminating with "Unexpected exception" silently. Better signal
+    // than fatal bail.
+    LogMan::Msg::EFmt("iOS: rethrowing JIT fault onto guest stack despite "
+                       "frame@{:X} not in emulator-stack range ({:X}..{:X})",
+                       (uint64_t)__builtin_frame_address(0),
+                       CPUArea.EmulatorStackLimit(),
+                       CPUArea.EmulatorStackBase());
+    Exception::RethrowGuestException(*Exception, *NativeContext);
+    return true;
+#else
     LogMan::Msg::EFmt("Unexpected exception in JIT code on guest stack");
     return false;
+#endif
   }
 }
 
