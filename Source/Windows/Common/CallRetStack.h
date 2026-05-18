@@ -42,6 +42,11 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
 #endif
 
   Thread->CurrentFrame->State.callret_sp = GetInfoThread(Thread).DefaultLocation;
+  // iOS-Mythic 2026-05-18: mirror CallRetStackBase into CpuStateFrame so JIT
+  // code can emit inline bounds checks. Needed because iOS Wine doesn't honor
+  // PAGE_NOACCESS on the guard pages, so the SEH-driven HandleAccessViolation
+  // never fires — JIT code has to detect-and-reset proactively.
+  Thread->CurrentFrame->State.callret_sp_base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
 }
 
 void DestroyThread(FEXCore::Core::InternalThreadState* Thread) {

@@ -107,7 +107,11 @@ struct alignas(64) CPUState {
   uint64_t L1Pointer {};
   uint64_t L1Mask {};
   uint64_t callret_sp {};
-  uint64_t _pad1 {};
+  // iOS-Mythic 2026-05-18: callret_sp_base = Thread->CallRetStackBase, mirrored
+  // here so JIT code can emit inline bounds checks against it. Initialized by
+  // CallRetStack::InitializeThread alongside callret_sp. Repurposes _pad1
+  // (same offset, same size — was alignment padding).
+  uint64_t callret_sp_base {};
 
   // Cacheline: 1,2,3,4
   // The high 128-bits of AVX registers when not being emulated by SVE256.
