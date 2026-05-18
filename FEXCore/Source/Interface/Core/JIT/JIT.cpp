@@ -882,11 +882,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
   // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
   // This minimizes lock contention of CodeBufferWriteMutex.
-  LogMan::Msg::IFmt("[iOS] Arm64JIT: SSACount={} DesiredRange={}", SSACount, DesiredBufferRange);
+  // [iOS-Mythic] verbose SSACount/TempBuf logs suppressed
   auto TempCodeBufferInfo = TempAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
-  LogMan::Msg::IFmt("[iOS] Arm64JIT: TempBuf={:#x} size={} usable={}", (uintptr_t)TempCodeBuffer, TempCodeBufferInfo.Size, UsableBufferRange);
 
   SetBuffer(TempCodeBuffer, UsableBufferRange);
 #ifdef __APPLE__
@@ -933,7 +932,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   PendingTargetLabel = nullptr;
   PendingCallReturnTargetLabel = nullptr;
 
-  LogMan::Msg::IFmt("[iOS] Arm64JIT: Entering IR block loop, BlockCount={}", IR->GetHeader()->BlockCount);
+  // [iOS-Mythic] verbose IR block loop entry log suppressed
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     using namespace FEXCore::IR;
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
@@ -941,7 +940,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     LOGMAN_THROW_A_FMT(BlockIROp->Header.Op == IR::OP_CODEBLOCK, "IR type failed to be a code block");
 #endif
 
-    LogMan::Msg::IFmt("[iOS] Arm64JIT: Block header start, EntryPoint={}", BlockIROp->EntryPoint);
+    // [iOS-Mythic] verbose per-block log suppressed — was flooding 100MB log in 20m before splash.
     auto BlockStartHostCode = GetCursorAddress<uint8_t*>();
     {
       const auto Node = IR->GetID(BlockNode);
@@ -958,7 +957,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
       if (BlockIROp->EntryPoint) {
         uint64_t BlockStartRIP = Entry + BlockIROp->GuestEntryOffset;
-        LogMan::Msg::IFmt("[iOS] Arm64JIT: EmitEntryPoint for RIP={:#x}", BlockStartRIP);
+        // [iOS-Mythic] verbose EntryPoint log suppressed
 
         const auto IsReturnTarget = CallReturnTargets.try_emplace(Node).first;
         if (PendingTargetLabel) {
@@ -975,7 +974,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
 
         EmitEntryPoint(JITCodeHeaderLabel, CheckTF);
-        LogMan::Msg::IFmt("[iOS] Arm64JIT: EmitEntryPoint done");
+        // [iOS-Mythic] verbose EmitEntryPoint-done log suppressed
       }
 
       if (PendingCallReturnTargetLabel) {
@@ -988,13 +987,11 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       BindOrRestart(Target);
     }
 
-    LogMan::Msg::IFmt("[iOS] Arm64JIT: Block header done, entering op dispatch");
+    // [iOS-Mythic] verbose block-header-done log suppressed
     {
       int OpIdx = 0;
       for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
-        if (OpIdx < 5 || OpIdx % 10 == 0) {
-          LogMan::Msg::IFmt("[iOS] Arm64JIT: Dispatching Op[{}] = {}", OpIdx, FEXCore::IR::GetName(IROp->Op));
-        }
+        // [iOS-Mythic] verbose per-op dispatch log suppressed
         switch (IROp->Op) {
 #define REGISTER_OP(op, x) \
   case FEXCore::IR::IROps::OP_##op: Op_##x(IROp, CodeNode); break
@@ -1007,7 +1004,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         }
         OpIdx++;
       }
-      LogMan::Msg::IFmt("[iOS] Arm64JIT: Block done, dispatched {} ops", OpIdx);
+      // [iOS-Mythic] verbose block-done log suppressed
     }
 
     DebugData->Subblocks.push_back({static_cast<uint32_t>(BlockStartHostCode - CodeData.BlockBegin),

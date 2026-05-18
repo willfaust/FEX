@@ -144,6 +144,21 @@ DEF_OP(ExitFunction) {
         // ARM64EC entry thunks). Reload from State.callret_sp before pushing
         // the call-return frame so we don't stp to wherever x17 was left.
         ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+        // iOS-Mythic 2026-05-18: inline bounds-guard (Tier-2). iOS doesn't
+        // honor PAGE_NOACCESS on the callret stack's guard pages, so the
+        // SEH-driven HandleAccessViolation never resets the stack on
+        // underflow. Detect-and-reset inline before the `stp` to keep stack
+        // pointer in-range. Uses TMP1 as scratch; adr below re-initializes it.
+        {
+          ARMEmitter::ForwardLabel l_callret_ok;
+          ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+          sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
+          lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 24);
+          (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
+          ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+          add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
+          (void)Bind(&l_callret_ok);
+        }
 #endif
         if (!Op->CallReturnBlock.IsInvalid()) {
           auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
@@ -153,6 +168,12 @@ DEF_OP(ExitFunction) {
         } else {
           stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
         }
+#ifdef ARCHITECTURE_arm64ec
+        /* Write back post-push x17 so dispatcher LoopTop's reload picks
+         * up the new top. Without this, in-register PUSH changes get
+         * lost on next dispatcher iteration and the entry leaks. */
+        str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
       } else if (Op->Hint == IR::BranchHint::CheckTF) {
         ARMEmitter::ForwardLabel TFUnset;
         ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));
@@ -175,7 +196,32 @@ DEF_OP(ExitFunction) {
 
     if (Op->Hint == IR::BranchHint::Return) {
       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
+#ifdef ARCHITECTURE_arm64ec
+      // iOS-Mythic 2026-05-15: POP-side x17 reload + state sync. ARM64EC
+      // native returns clobber x17, so we reload from State.callret_sp
+      // before popping. AND we write back the post-pop value to State so
+      // the dispatcher LoopTop's reload (line 134 of Dispatcher.cpp) sees
+      // the updated stack pointer. Without this writeback, in-register
+      // pop changes are lost on next dispatcher iteration — quantified
+      // as ~1 leaked callret entry per block dispatch on Thumper FMOD.
+      ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+      // iOS-Mythic 2026-05-18: inline bounds-guard (Tier-2) — see CALL push
+      // site for rationale. Reset to DefaultLocation if OOB before ldp.
+      {
+        ARMEmitter::ForwardLabel l_callret_ok;
+        ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+        sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
+        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 24);
+        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
+        ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+        add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
+        (void)Bind(&l_callret_ok);
+      }
+#endif
       ldp<ARMEmitter::IndexType::POST>(TMP1, TMP2, REG_CALLRET_SP, 0x10);
+#ifdef ARCHITECTURE_arm64ec
+      str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
       sub(TMP1, TMP1, RipReg.X());
       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
     }
@@ -204,6 +250,18 @@ DEF_OP(ExitFunction) {
       // from State.callret_sp before pushing the call-return frame, since
       // native ARM64EC returns leave x17 pointing at an arbitrary RX page.
       ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+      // iOS-Mythic 2026-05-18: inline bounds-guard (Tier-2). Same as
+      // linked-path CALL push.
+      {
+        ARMEmitter::ForwardLabel l_callret_ok;
+        ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+        sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
+        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 24);
+        (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
+        ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+        add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
+        (void)Bind(&l_callret_ok);
+      }
 #endif
       if (!Op->CallReturnBlock.IsInvalid()) {
         auto CallReturnAddressReg = GetReg(Op->CallReturnAddress).X();
@@ -213,6 +271,10 @@ DEF_OP(ExitFunction) {
       } else {
         stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, REG_CALLRET_SP, -0x10);
       }
+#ifdef ARCHITECTURE_arm64ec
+      /* Write back post-push x17 so dispatcher LoopTop reload sees it. */
+      str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
+#endif
       blr(TMP2);
       (void)Bind(&l_CallReturn);
     } else if (Op->Hint == IR::BranchHint::Return) {
