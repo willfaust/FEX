@@ -228,6 +228,36 @@ void Dispatcher::EmitDispatcher() {
 
   ARMEmitter::ForwardLabel NoBlock;
 
+  /* iOS-Mythic 2026-07-03 perf: probe the L1 cache FIRST at loop top.
+   *
+   * Upstream's loop-top lookup goes straight to the L2 page table, which
+   * masks addresses to Config.VirtualMemSize (64GB). Wine on iOS maps PE
+   * DLLs at ~0x7EEx_xxxx_xxxx (~500GB): every DLL-code lookup aliases in
+   * L2, fails the entry compare, and falls through to the ~60us C++
+   * CompileBlock path. Measured: ~15K such fallbacks per menu frame
+   * (~0.9s/frame = the whole frame time), while the L1 — full 64-bit
+   * compare, populated by every C++ hit via CacheBlockMapping — sat warm
+   * and unread on this path (only indirect-branch sites probe it).
+   * Probing L1 here turns those fallbacks into ~ns hits. Thumper's exe at
+   * 0x140000000 fits inside VirtualMemSize, which is why the exe-heavy
+   * loading screen already ran at 60 FPS while DLL-heavy phases crawled.
+   *
+   * Register use mirrors the L2 sequence below (TMP1/2/4 scratch, RipReg
+   * preserved); no flag-setting instructions (NZCV must survive here). */
+  {
+    ARMEmitter::ForwardLabel L1Miss;
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+    // Entry address = L1Pointer + ((RIP << ilog2(entry size)) & pre-scaled mask)
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    add(TMP1, TMP1, TMP2);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, 0);
+    sub(TMP2, TMP2, RipReg);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &L1Miss);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP4, &L1Miss);
+    br(TMP4);
+    (void)Bind(&L1Miss);
+  }
+
   if (DisableL2Cache()) {
     (void)b(&NoBlock);
   } else {

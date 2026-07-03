@@ -21,16 +21,26 @@
 
 #ifdef FEX_IOS_HOST
 
-namespace {
-struct Entry {
+struct IosAliasEntry {
   uint64_t PeBase;
   uint64_t JitBase;
   uint64_t Size;
   uint64_t _Padding;  // Keeps the struct 32-byte to make array stride a power of 2.
 };
 constexpr int kMaxEntries = 256;
-Entry g_Entries[kMaxEntries];
-volatile int g_EntryCount = 0;
+
+// extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
+// can reach the table via adrp/:lo12: — it translates the branch target
+// PE VA → pool VA inline before jumping to native EC code. That asm relies
+// on the 32-byte stride and the PeBase/JitBase/Size field order.
+extern "C" {
+IosAliasEntry IosAliasEntries[kMaxEntries];
+volatile int IosAliasCount = 0;
+}
+
+namespace {
+IosAliasEntry* const g_Entries = IosAliasEntries;
+volatile int& g_EntryCount = IosAliasCount;
 }  // namespace
 
 extern "C" {
