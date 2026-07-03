@@ -1017,12 +1017,25 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     if ((total - g_cb_last_summary_total) >= 16384) {
       g_cb_last_summary_total = total;
       uint64_t reals = g_cb_real_compiles;
+      /* iOS-Mythic 2026-07-03 perf hunt: also print the JIT-visible L1
+       * lookup fields. The emitted dispatcher L1 probe reads
+       * State.L1Pointer/L1Mask; the measured ~15K CompileBlock calls per
+       * frame (~60us each = the whole frame time) with 99% cache hits mean
+       * that probe is missing for blocks the C++ path finds instantly. If
+       * State.L1Pointer here is 0 (or differs from the LookupCache's own
+       * pointer), the emitted probe reads the iOS-emulated zero page and
+       * silently misses every time — no crash, pure 60us tax per lookup. */
+      auto* T = Frame ? Frame->Thread : nullptr;
       LogMan::Msg::EFmt("[CB_SUMMARY] total={} real_compiles={} cache_hits={} "
-                        "hit_rate={}%  hottest_rip≈0x{:x} repeats~{}",
+                        "hit_rate={}%  hottest_rip≈0x{:x} repeats~{} "
+                        "L1ptr=0x{:x} L1mask=0x{:x} cacheL1=0x{:x}",
                         total, reals,
                         total - reals,
                         (total > 0) ? (100 * (total - reals) / total) : 0,
-                        g_cb_hot_rip, g_cb_hot_rip_count);
+                        g_cb_hot_rip, g_cb_hot_rip_count,
+                        Frame ? Frame->State.L1Pointer : 0,
+                        Frame ? Frame->State.L1Mask : 0,
+                        (T && T->LookupCache) ? T->LookupCache->GetL1Pointer() : 0);
     }
   }
 

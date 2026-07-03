@@ -110,6 +110,36 @@ ExitFunctionEC:
 
 .global ExitFunctionSuspendResumePoint
 ExitFunctionSuspendResumePoint:
+#ifdef FEX_IOS_HOST
+  // iOS: PE images can't execute at their mapped address (no mprotect(RX) on
+  // file-backed mmaps); the only runnable copy lives in the dual-mapped JIT
+  // pool. Translate the target through the alias table (IosJitAlias.cpp)
+  // before branching — otherwise every x64→EC call lands on the PE VA and
+  // costs a Mach exec-fault redirect (~33us each, measured ~40K/frame in
+  // Thumper's menu = the entire frame budget).
+  // x16/x17/x23 are already clobbered on all downstream paths; x4 maps to
+  // x64 R10 (volatile at this call/ret boundary) and is clobbered by the
+  // entry-thunk path below. NZCV is clobbered by the cmp at check_thunk
+  // regardless.
+  adrp x16, IosAliasEntries
+  add x16, x16, #:lo12:IosAliasEntries
+  adrp x17, IosAliasCount
+  ldr w17, [x17, #:lo12:IosAliasCount]
+ios_ec_xlate_loop:
+  cbz w17, ios_ec_xlate_done
+  ldr x23, [x16]        // Entry.PeBase
+  sub x23, x9, x23      // offset into image (unsigned-wraps huge if below base)
+  ldr x4, [x16, #16]    // Entry.Size
+  cmp x23, x4
+  b.lo ios_ec_xlate_hit
+  add x16, x16, #32
+  sub w17, w17, #1
+  b ios_ec_xlate_loop
+ios_ec_xlate_hit:
+  ldr x4, [x16, #8]     // Entry.JitBase
+  add x9, x4, x23
+ios_ec_xlate_done:
+#endif
   // Either return to an exit thunk (return to ARM64EC function) or call an entry thunk (call to ARM64EC function).
   // It is assumed that a 'blr x16' instruction is only ever used to call into x86 code from an exit thunk, and that all
   // exported ARM64EC functions have a 4-byte offset to their entry thunk immediately before their first instruction.
