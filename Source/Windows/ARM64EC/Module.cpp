@@ -176,8 +176,38 @@ std::pair<NTSTATUS, ThreadCPUArea> GetThreadCPUArea(HANDLE Thread) {
   return {Err, ThreadCPUArea(reinterpret_cast<_TEB*>(Info.TebBaseAddress))};
 }
 
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic 2026-05-19: NtCurrentTeb() compiles to a read of x18 on
+ * ARM64EC, but x18 is clobbered by Apple runtime calls (libobjc, mach
+ * syscalls, pthread, etc.). Reading it after any such call returns
+ * garbage — typically 0 in cold-start paths. This is the documented
+ * iOS quirk we already handle in Module.S via the IOS_LOAD_TEB macro
+ * (TPIDRRO_EL0 & ~7 + TSD slot 275). This helper is the C++ equivalent.
+ *
+ * Use this instead of NtCurrentTeb() anywhere we're reading TEB after
+ * having gone through any Apple/Wine/CRT runtime call. The asm has no
+ * dependency on x18, so it's safe across clobber boundaries. */
+static inline _TEB* IOSLoadTEB() {
+  uintptr_t tpidrro;
+  __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tpidrro));
+  tpidrro &= ~uintptr_t(7);
+  _TEB* via_tsd = *reinterpret_cast<_TEB**>(tpidrro + 0x898);  // IOS_TEB_TSD_OFFSET
+  if (via_tsd) return via_tsd;
+  /* 2026-05-19: TSD slot 275 isn't always populated by the time ThreadInit
+   * runs on FMOD worker threads (Wine thread bootstrap race). Fall back to
+   * NtCurrentTeb() which reads x18 — works if x18 hasn't been clobbered on
+   * this thread's setup path. Better than returning nullptr (which would
+   * set gs_cached=0 and cause every guest gs:[N] read to fault). */
+  return NtCurrentTeb();
+}
+#endif
+
 ThreadCPUArea GetCPUArea() {
+#ifdef FEX_IOS_HOST
+  return ThreadCPUArea(IOSLoadTEB());
+#else
   return ThreadCPUArea(NtCurrentTeb());
+#endif
 }
 
 FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
@@ -374,7 +404,20 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
     State.gs_idx = Context.SegGs & 0xffff;
 
     // The TEB is the only populated GDT entry by default
+    //
+    // iOS-Mythic 2026-07-02: use IOSLoadTEB() (TPIDRRO_EL0 + TSD slot 275)
+    // instead of NtCurrentTeb() (raw x18 read). This function runs late in
+    // ThreadInit and on every EC->x86 context restore; on threads whose x18
+    // has been clobbered by Apple runtime calls, NtCurrentTeb() returns 0
+    // and gs_cached gets zeroed — overwriting the correct value ThreadInit
+    // set earlier. Confirmed on iOS 27 beta: 2 of 8 Thumper worker threads
+    // ended ThreadInit with gs_cached=0 via this path, causing gs:[N] fault
+    // loops when MSVC TLS guard code ran on those threads.
+#ifdef FEX_IOS_HOST
+    const auto TEB = reinterpret_cast<uint64_t>(IOSLoadTEB());
+#else
     const auto TEB = reinterpret_cast<uint64_t>(NtCurrentTeb());
+#endif
     auto GDT = State.GetSegmentFromIndex(State, (Context.SegGs & 0xffff));
     State.SetGDTBase(GDT, TEB);
     State.SetGDTLimit(GDT, 0xF'FFFFU);
@@ -630,7 +673,27 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
   Exception::LoadStateFromECContext(Thread, *Context);
 }
 
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic 2026-05-19: define FEXCore::DualMap::WriteOffset for THIS PE.
+ * xtajit64.dll has its own statically-linked copy of FEXCore separate from
+ * the iOS Mythic app's libFEXCore_Base.a — so we need our own storage for
+ * the variable. Set early in ProcessInit (before InitCore + dispatcher emit).
+ * Convention is +0x10000000 (RX→RW alias separation), matching the iOS JIT
+ * pool layout established in virtual_ios.c. */
+namespace FEXCore::DualMap {
+int64_t WriteOffset = 0;
+} // namespace FEXCore::DualMap
+#endif
+
 NTSTATUS ProcessInit() {
+  /* iOS-Mythic: DualMap::WriteOffset (RX→RW alias distance) is set below,
+   * after InitCRTProcess() populates the environment, and BEFORE InitCore().
+   * It is read from MYTHIC_JIT_WRITE_OFFSET rather than hardcoded, because
+   * the app creates the RW alias with VM_FLAGS_ANYWHERE — the alias is NOT
+   * guaranteed to land at RX+0x10000000 (observed +0x105a4000 on iOS 27).
+   * The old hardcode corrupted the JIT pool on runs where the offset
+   * differed. See FEXBridge.mm (setenv) + env_ios.c (forwarding). */
+
   InitSyscalls();
 
   FEX::Windows::InitCRTProcess();
@@ -662,6 +725,55 @@ NTSTATUS ProcessInit() {
 
   CTX->SetSignalDelegator(SignalDelegator.get());
   CTX->SetSyscallHandler(SyscallHandler.get());
+
+#ifdef FEX_IOS_HOST
+  /* Set DualMap::WriteOffset BEFORE InitCore (the dispatcher's emit path
+   * reads it via the JIT class constructor). Compute it from the SAME
+   * env vars the app already publishes for the unix side's JIT pool —
+   * WINE_IOS_JIT_RW / WINE_IOS_JIT_RX (set in ContentView.swift before
+   * Wine launches, forwarded through get_initial_environment because they
+   * are WINE-prefixed and non-special). offset = RW_base - RX_base.
+   *
+   * This replaces the earlier MYTHIC_JIT_WRITE_OFFSET attempt, which read
+   * an uninitialized FEXBridge pool (the guest's real pool is owned by
+   * StikJITHelper, not FEXBridge) and always came back null. Fail LOUD if
+   * the vars are missing — a wrong/zero offset corrupts the JIT pool. */
+  {
+    const char *rw_env = getenv("WINE_IOS_JIT_RW");
+    const char *rx_env = getenv("WINE_IOS_JIT_RX");
+    uint64_t rw = rw_env ? strtoull(rw_env, nullptr, 16) : 0;
+    uint64_t rx = rx_env ? strtoull(rx_env, nullptr, 16) : 0;
+    int64_t off = (rw && rx) ? (int64_t)(rw - rx) : 0;
+    HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
+        ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
+              NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
+        : nullptr;
+    char buf[160];
+    if (off != 0) {
+      /* iOS-Mythic 2026-07-03: TRAP-MODE writes are the shipping config.
+       * WriteOffset stays 0 so WritePtr is identity — every JIT-pool write
+       * faults and the Wine Mach STR emulator redirects it through the RW
+       * alias AND invalidates icache. The direct-RW fast-write path
+       * (WriteOffset = off) corrupted x86→EC transitions (msvcp140 DllMain
+       * EH via RtlPcToFileHeader; Goldberg steam_api64 init) — root cause
+       * inside it unproven, suspected inline dc/ic flush. Bisect-verified
+       * 2026-07-03: trap-mode reaches the 3D menu; fast-write dies pre-
+       * splash. Before re-enabling, rework the flush to
+       * NtFlushInstructionCache and re-verify those two crash sites. */
+      FEXCore::DualMap::WriteOffset = 0;
+      int n = snprintf(buf, sizeof(buf),
+          "[FEX-iOS] trap-mode writes (WriteOffset=0; real off=0x%llx RW=0x%llx RX=0x%llx)\n",
+          (unsigned long long)off, (unsigned long long)rw, (unsigned long long)rx);
+      if (stderr_h) { ULONG w = 0; WriteFile(stderr_h, buf, n, &w, nullptr); }
+    } else {
+      int n = snprintf(buf, sizeof(buf),
+          "[FEX-iOS] FATAL: WINE_IOS_JIT_RW/RX missing (RW=%s RX=%s) — JIT pool writes will corrupt!\n",
+          rw_env ? rw_env : "(null)", rx_env ? rx_env : "(null)");
+      if (stderr_h) { ULONG w = 0; WriteFile(stderr_h, buf, n, &w, nullptr); }
+    }
+  }
+#endif
+
   CTX->InitCore();
   Exception::HandlerConfig.emplace(*CTX);
   InvalidationTracker.emplace(*CTX, Threads);
@@ -1036,11 +1148,28 @@ NTSTATUS ThreadInit() {
    * the path where x86 code starts running before any CONTEXT-load happens
    * (e.g. Thumper's startup invoking thread-local guards before its first
    * exception-driven context restore), gs_cached stays 0 and gs:[N] hits
-   * SEGV at addr=N.                                                       */
+   * SEGV at addr=N.
+   *
+   * 2026-05-19: use IOSLoadTEB() (TPIDRRO_EL0 + TSD slot 275) instead of
+   * NtCurrentTeb(). The latter reads x18, which is clobbered by Apple
+   * runtime calls earlier in ThreadInit (InitCRTThread, VirtualAlloc,
+   * CreateThread). With x18=0, gs_cached was getting set to 0 — confirmed
+   * regression that broke boot intermittently. Use the TSD-slot path
+   * which is x18-independent. */
   {
-    const uint64_t TEB = reinterpret_cast<uint64_t>(NtCurrentTeb());
+    const uint64_t TEB = reinterpret_cast<uint64_t>(IOSLoadTEB());
     Frame->State.gs_cached = TEB;
     Frame->State.fs_cached = 0;
+  }
+  /* Hard guard: if somehow STILL zero, log loudly so we catch it. */
+  if (Frame->State.gs_cached == 0) {
+    HANDLE stderr_h_g = NtCurrentTeb() ? (HANDLE)reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
+        NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError : nullptr;
+    if (stderr_h_g) {
+      const char *msg = "[FEX-iOS] FATAL: gs_cached STILL 0 after IOSLoadTEB!\n";
+      ULONG written = 0;
+      WriteFile(stderr_h_g, msg, 53, &written, nullptr);
+    }
   }
 #endif
 
@@ -1103,7 +1232,18 @@ NTSTATUS ThreadInit() {
       bool      nop_after_pair7; // need a NOP just past pair-7?
     };
     static constexpr PatchSite kSites[] = {
-      { 0x164, true  },  // first site: shift left, NOP at +0x180
+      // 2026-05-19: The hardcoded {0x164, true} site has been removed.
+      // With the per-Buffer dual-map fix in place, FEX's dispatcher emit
+      // now produces correct stp instructions at +0x164 directly (GPT
+      // diagnosed: pair0 at +0x158, pair1 at +0x15c, pair2 at +0x160 —
+      // valid code, not the broken pattern). The hardcoded patch was
+      // OVERWRITING valid code with stp's that didn't belong there,
+      // corrupting the dispatcher layout and causing st1 faults later.
+      //
+      // The generic uniformity-based scanner below correctly handles the
+      // REAL broken sites (where pair-0 stp is followed by 7 uniform-class
+      // garbage words). If the scanner reports 0 patched, the dispatcher
+      // came out correct.
       // All other sites are scanned/patched dynamically below — the FEX
       // emitter produces the same broken 7-word pattern at MANY offsets
       // (24+ sites in Thumper, growing with each new code path). Iterating
@@ -1159,10 +1299,12 @@ NTSTATUS ThreadInit() {
          * page-protection quirk where ThreadInit's STRs to RX from xtajit64.dll
          * neither succeed natively nor trap.
          *
-         * Bypass entirely by writing to the RW alias. RX→RW offset is the
-         * fixed 256MB pool size — same convention used everywhere else in
-         * the iOS JIT pool code. */
-        constexpr uintptr_t kRwOffset = 0x10000000;  // 256MB JIT pool size
+         * Bypass entirely by writing to the RW alias. RX→RW offset comes
+         * from DualMap::WriteOffset (set in ProcessInit from the app's real
+         * runtime mapping) — NOT a hardcoded 0x10000000, since the RW alias
+         * is placed with VM_FLAGS_ANYWHERE and isn't guaranteed to sit at
+         * RX+256MB. */
+        const int64_t kRwOffset = FEXCore::DualMap::WriteOffset;
         uint32_t* patch_rw = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(patch_rx) + kRwOffset);
         for (int i = 0; i < 7; i++) {
           patch_rw[i] = expected[i];
@@ -1217,8 +1359,9 @@ NTSTATUS ThreadInit() {
           if ((base[i + j] & kStpMask) != top0) { uniform = false; break; }
         }
         if (!uniform) continue;  /* legit code following pair-0 — leave alone */
-        /* Write to RW alias (RX + 256MB). See hardcoded-site comment for why. */
-        constexpr uintptr_t kRwOffset = 0x10000000;
+        /* Write to RW alias via the real runtime offset (DualMap::WriteOffset),
+         * not a hardcoded 0x10000000. See the other patch site for rationale. */
+        const int64_t kRwOffset = FEXCore::DualMap::WriteOffset;
         uint32_t* rw_base = reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(&base[i + 1]) + kRwOffset);
         for (int j = 0; j < 7; j++) {
           rw_base[j] = expected[j];

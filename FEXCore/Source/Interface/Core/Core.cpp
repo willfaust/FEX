@@ -569,21 +569,19 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     const uint8_t* GuestCode {};
     GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
 
-    LogMan::Msg::IFmt("[iOS] GenerateIR: GuestCode={} first bytes: {:02x} {:02x} {:02x} {:02x} {:02x}",
-                      fmt::ptr(GuestCode), GuestCode[0], GuestCode[1], GuestCode[2], GuestCode[3], GuestCode[4]);
+    /* perf-silenced GenerateIR GuestCode log */
 
     bool HadDispatchError {false};
     bool HadInvalidInst {false};
 
-    LogMan::Msg::IFmt("[iOS] GenerateIR: Calling DecodeInstructionsAtEntry...");
+    /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] GenerateIR: Calling DecodeInstructionsAtEntry...");
     Thread->FrontendDecoder->DecodeInstructionsAtEntry(Thread, GuestCode, GuestRIP, MaxInst);
-    LogMan::Msg::IFmt("[iOS] GenerateIR: DecodeInstructionsAtEntry returned");
+    /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] GenerateIR: DecodeInstructionsAtEntry returned");
 
     auto BlockInfo = Thread->FrontendDecoder->GetDecodedBlockInfo();
     auto CodeBlocks = &BlockInfo->Blocks;
 
-    LogMan::Msg::IFmt("[iOS] GenerateIR: Blocks={} TotalInsts={} Is64Bit={}",
-                      CodeBlocks->size(), BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode);
+    /* perf-silenced GenerateIR Blocks log */
 
     Thread->OpDispatcher->BeginFunction(GuestRIP, CodeBlocks, BlockInfo->TotalInstructionCount, BlockInfo->Is64BitMode,
                                         AreMonoHacksActive() && MonoBackpatcherBlock.load(std::memory_order_relaxed) == GuestRIP);

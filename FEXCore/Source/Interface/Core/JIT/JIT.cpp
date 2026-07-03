@@ -15,6 +15,21 @@ $end_info$
 #include <libkern/OSCacheControl.h>
 #endif
 
+#if defined(FEX_IOS_HOST) && !defined(__APPLE__)
+// iOS-Mythic 2026-05-19: helper to flush a single ARM64 instruction (4 bytes)
+// from the block-linking backpatch sites below. dc cvau on the RW alias
+// (read access OK), ic ivau on the RX alias (XO OK on Apple silicon).
+// dsb/isb provide ordering.
+namespace {
+inline void IOSFlushOneInstr(void* RWAddr, void* RXAddr) {
+  __asm__ volatile("dc cvau, %0" :: "r"(RWAddr) : "memory");
+  __asm__ volatile("dsb ish" ::: "memory");
+  __asm__ volatile("ic ivau, %0" :: "r"(RXAddr) : "memory");
+  __asm__ volatile("dsb ish; isb" ::: "memory");
+}
+}  // namespace
+#endif
+
 #include "Interface/Context/Context.h"
 #include "Interface/Core/LookupCache.h"
 #include "Interface/Core/Dispatcher/Dispatcher.h"
@@ -521,6 +536,9 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, 
   __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))),
                           reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))) + 4);
   sys_icache_invalidate(reinterpret_cast<void*>(CallerAddress), 4);
+#elif defined(FEX_IOS_HOST)
+  IOSFlushOneInstr(FEXCore::DualMap::WriteAddr(reinterpret_cast<void*>(CallerAddress)),
+                   reinterpret_cast<void*>(CallerAddress));
 #else
   ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
 #endif
@@ -538,6 +556,9 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
   __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))),
                           reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))) + 4);
   sys_icache_invalidate(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+#elif defined(FEX_IOS_HOST)
+  IOSFlushOneInstr(FEXCore::DualMap::WriteAddr(reinterpret_cast<void*>(JumpThunkStartAddress)),
+                   reinterpret_cast<void*>(JumpThunkStartAddress));
 #else
   ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
 #endif
@@ -611,6 +632,9 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))),
                             reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))) + 4);
     sys_icache_invalidate(reinterpret_cast<void*>(CallerAddress), 4);
+#elif defined(FEX_IOS_HOST)
+    IOSFlushOneInstr(FEXCore::DualMap::WriteAddr(reinterpret_cast<void*>(CallerAddress)),
+                     reinterpret_cast<void*>(CallerAddress));
 #else
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
 #endif
@@ -630,6 +654,9 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))),
                             reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))) + 4);
     sys_icache_invalidate(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+#elif defined(FEX_IOS_HOST)
+    IOSFlushOneInstr(FEXCore::DualMap::WriteAddr(reinterpret_cast<void*>(JumpThunkStartAddress)),
+                     reinterpret_cast<void*>(JumpThunkStartAddress));
 #else
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
 #endif
@@ -856,7 +883,7 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
 CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
-  LogMan::Msg::IFmt("[iOS] Arm64JIT::CompileCode: Entry={:#x} Size={} SingleInst={}", Entry, Size, SingleInst);
+  /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] Arm64JIT::CompileCode: Entry={:#x} Size={} SingleInst={}", Entry, Size, SingleInst);
 
   const auto PrevNumAllocations = Relocations.size();
 
@@ -902,9 +929,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
 
   SetBuffer(TempCodeBuffer, UsableBufferRange);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(FEX_IOS_HOST)
   // TempCodeBuffer is regular heap memory, not dual-mapped. Disable WriteOffset
   // so dc32/dcn writes go to the actual buffer, not buffer+WriteOffset.
+  // (FEX_IOS_HOST: same logic for ARM64EC PE build — temp buffer is heap.)
   SetWriteOffset(0);
 #endif
 
@@ -1025,7 +1053,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
                                     static_cast<uint32_t>(GetCursorAddress<uint8_t*>() - BlockStartHostCode)});
   }
 
-  LogMan::Msg::IFmt("[iOS] Arm64JIT: IR block loop done, emitting final branches...");
+  /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] Arm64JIT: IR block loop done, emitting final branches...");
   // Make sure last branch is generated. It certainly can't be eliminated here.
   if (PendingTargetLabel) {
     if (PendingTargetLabel->Backward.Location) {
@@ -1147,8 +1175,9 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
       // NOTE: 16-byte alignment of the new cursor offset must be preserved for block linking records
       SetBuffer(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->AllocatedSize);
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(FEX_IOS_HOST)
       // Restore WriteOffset for dual-mapped JIT pool (CodeBuffer is RX, writes go to RW mirror).
+      // (FEX_IOS_HOST: same logic for ARM64EC PE build — CodeBuffer is iOS-allocated dual-mapped.)
       SetWriteOffset(FEXCore::DualMap::WriteOffset);
 #endif
       SetCursorOffset(CodeBuffers.LatestOffset);
@@ -1173,13 +1202,34 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     }
 
     // Copy over CodeBuffer contents (write to RW mirror on iOS)
-    LogMan::Msg::IFmt("[iOS] Arm64JIT: Copying {} bytes to CodeBuffer at RX={:#x}", TempSize, (uintptr_t)GetCursorAddress<uint8_t*>());
+#if defined(FEX_IOS_HOST)
+    /* iOS-Mythic 2026-05-19 sanity log: one-shot diagnostic on first 2 JIT
+     * copies to verify the per-Buffer dual-map wiring is correct.
+     * Expect: TempCodeBuffer != RXCursor (temp is heap, offset 0), and
+     * RWCursor = RXCursor + WriteOffset where WriteOffset is the real
+     * runtime RX→RW distance (from MYTHIC_JIT_WRITE_OFFSET — NOT a fixed
+     * 0x10000000; the RW alias is placed with VM_FLAGS_ANYWHERE). */
+    {
+      static volatile int dual_map_log_count = 0;
+      int n = __sync_add_and_fetch(&dual_map_log_count, 1);
+      if (n <= 2) {
+        auto* RXCursor = GetCursorAddress<uint8_t*>();
+        auto* RWCursor = WritePtr(RXCursor);
+        LogMan::Msg::EFmt("[DUAL_MAP_SANITY #{}] TempCodeBuffer=0x{:x} RXCursor=0x{:x} "
+                          "RWCursor=0x{:x} WriteOffset=0x{:x} TempSize=0x{:x}",
+                          n, reinterpret_cast<uintptr_t>(TempCodeBuffer),
+                          reinterpret_cast<uintptr_t>(RXCursor),
+                          reinterpret_cast<uintptr_t>(RWCursor),
+                          (int64_t)GetWriteOffset(), (size_t)TempSize);
+      }
+    }
+#endif
     memcpy(WritePtr(GetCursorAddress<uint8_t*>()), TempCodeBuffer, TempSize);
     SetCursorOffset(CodeBuffers.LatestOffset + TempSize);
 
     CodeBuffers.LatestOffset = GetCursorOffset();
   }
-  LogMan::Msg::IFmt("[iOS] Arm64JIT: CompileCode done, returning");
+  /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] Arm64JIT: CompileCode done, returning");
 
   TempAllocator.DelayedDisownBuffer();
 
@@ -1194,6 +1244,34 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     __builtin___clear_cache(reinterpret_cast<char*>(RWBegin), reinterpret_cast<char*>(RWBegin) + CodeOnlySize);
     // Invalidate instruction cache for the RX view
     sys_icache_invalidate(CodeBegin, CodeOnlySize);
+  }
+#elif defined(FEX_IOS_HOST)
+  // Same logic as __APPLE__ for ARM64EC PE running on iOS, but without
+  // Darwin libsystem (sys_icache_invalidate not available). Use inline
+  // ARM64 asm: dc cvau (clean to PoU) on RW alias where we have read
+  // access, then ic ivau (invalidate to PoU) on RX alias which works on
+  // XO pages on Apple Silicon. dsb ish / isb provide the required
+  // ordering.
+  //
+  // 2026-07-02: cache-line stride is hardcoded to 64 bytes. It was
+  // previously read from CTR_EL0, but on iOS 27 that `mrs` raises an
+  // illegal-instruction fault when executed from JIT-pool memory
+  // (confirmed: C000001D exactly on the mrs at pool+0x8eeaac, killing
+  // Thumper's main thread ~31s in). 64 bytes is the true I/D cache line
+  // size on all Apple Silicon (A-series and M-series), so this is
+  // correct, not approximate.
+  {
+    auto* RWBegin = WritePtr(CodeBegin);
+    auto* RXBegin = CodeBegin;
+    constexpr size_t kCacheLine = 64;
+    for (size_t off = 0; off < CodeOnlySize; off += kCacheLine) {
+      __asm__ volatile("dc cvau, %0" :: "r"(RWBegin + off) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (size_t off = 0; off < CodeOnlySize; off += kCacheLine) {
+      __asm__ volatile("ic ivau, %0" :: "r"(RXBegin + off) : "memory");
+    }
+    __asm__ volatile("dsb ish; isb" ::: "memory");
   }
 #else
   ClearICache(CodeBegin, CodeOnlySize);

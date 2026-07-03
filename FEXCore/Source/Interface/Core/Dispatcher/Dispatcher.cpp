@@ -91,7 +91,24 @@ void Dispatcher::EmitDispatcher() {
   // Push our memory base to the correct register
   // Move our thread pointer to the correct register
   // This is passed in to parameter 0 (x0)
+#if defined(ARCHITECTURE_arm64ec) && defined(FEX_IOS_HOST)
+  /* iOS-Mythic 2026-07-03: derive STATE from the thread's CPU area instead
+   * of trusting the caller's x0. Observed on iOS 27: the exit-linker path
+   * reached DispatchPtr with x0=0 (x28 had been zeroed after an EC call and
+   * every spill store was silently absorbed by the Wine page-0 Mach
+   * emulation), so the ReturningStackLocation store below dereferenced
+   * NULL+0x5c0 and derailed the thread into a NoExec loop. FillStaticRegs
+   * re-derives STATE from TPIDRRO_EL0 immediately after this prologue
+   * anyway — x0 was only ever used for this one store, so deriving here is
+   * strictly safer and matches the rest of the iOS dispatcher. */
+  mrs(TMP1, ARMEmitter::SystemRegister::TPIDRRO_EL0);
+  and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, ~7ULL);
+  ldr(TMP1, TMP1, IOS_TEB_TSD_OFFSET);
+  ldr(TMP1, TMP1, TEB_CPU_AREA_OFFSET);
+  ldr(STATE, TMP1, CPU_AREA_EMULATOR_DATA_OFFSET);
+#else
   mov(STATE, ARMEmitter::XReg::x0);
+#endif
 
   // Save this stack pointer so we can cleanly shutdown the emulation with a long jump
   // regardless of where we were in the stack
@@ -677,6 +694,26 @@ void Dispatcher::EmitDispatcher() {
     auto* RWPtr = WritePtr(reinterpret_cast<uint8_t*>(DispatchPtr));
     __builtin___clear_cache(reinterpret_cast<char*>(RWPtr), reinterpret_cast<char*>(RWPtr) + DispatchSize);
     sys_icache_invalidate(reinterpret_cast<void*>(DispatchPtr), DispatchSize);
+  }
+#elif defined(FEX_IOS_HOST)
+  // Same dual-map I-cache flush as JIT.cpp for the ARM64EC PE build.
+  // Uses inline asm — sys_icache_invalidate isn't available in PE builds.
+  // 2026-07-02: stride hardcoded to 64 bytes (true for all Apple Silicon).
+  // Reading CTR_EL0 faults on iOS 27 when executed from JIT-pool memory —
+  // see the matching comment in JIT.cpp.
+  {
+    auto DispatchSize = End - reinterpret_cast<uint64_t>(DispatchPtr);
+    auto* RWPtr = WritePtr(reinterpret_cast<uint8_t*>(DispatchPtr));
+    auto* RXPtr = reinterpret_cast<uint8_t*>(DispatchPtr);
+    constexpr size_t kCacheLine = 64;
+    for (size_t off = 0; off < DispatchSize; off += kCacheLine) {
+      __asm__ volatile("dc cvau, %0" :: "r"(RWPtr + off) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (size_t off = 0; off < DispatchSize; off += kCacheLine) {
+      __asm__ volatile("ic ivau, %0" :: "r"(RXPtr + off) : "memory");
+    }
+    __asm__ volatile("dsb ish; isb" ::: "memory");
   }
 #else
   ClearICache(reinterpret_cast<void*>(DispatchPtr), End - reinterpret_cast<uint64_t>(DispatchPtr));
