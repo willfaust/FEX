@@ -1092,6 +1092,27 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
   }
 }
 
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic: step markers through ThreadInit. Two runs have died with a
+ * fresh post-detach thread's "ThreadInit() entered" as the last FEX log
+ * line (silent kill, no crash report) — once during loading's worker-thread
+ * spawn, once when QuickTime's recording start triggered a thread spawn.
+ * These markers bisect which init step dies (CreateThread's per-thread
+ * CodeBuffer/LookupCache allocation is the prime suspect). */
+static void IosTiLog(const char* msg) {
+  HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
+      ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
+            NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
+      : nullptr;
+  if (stderr_h) {
+    ULONG written = 0;
+    size_t len = 0;
+    while (msg[len]) len++;
+    WriteFile(stderr_h, msg, static_cast<DWORD>(len), &written, nullptr);
+  }
+}
+#endif
+
 NTSTATUS ThreadInit() {
 #ifdef FEX_IOS_HOST
   /* iOS-Mythic diagnostic: log entry to thread-init so we can confirm Wine
@@ -1111,7 +1132,13 @@ NTSTATUS ThreadInit() {
   }
 #endif
   std::scoped_lock Lock(ThreadCreationMutex);
+#ifdef FEX_IOS_HOST
+  IosTiLog("[FEX-iOS] TI:lock\n");
+#endif
   FEX::Windows::InitCRTThread();
+#ifdef FEX_IOS_HOST
+  IosTiLog("[FEX-iOS] TI:crt\n");
+#endif
   const auto CPUArea = GetCPUArea();
 
   static constexpr size_t EmulatorStackSize = 0x40000;
@@ -1119,8 +1146,14 @@ NTSTATUS ThreadInit() {
     reinterpret_cast<uint64_t>(::VirtualAlloc(nullptr, EmulatorStackSize, MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE));
   CPUArea.EmulatorStackLimit() = EmulatorStack;
   CPUArea.EmulatorStackBase() = EmulatorStack + EmulatorStackSize;
+#ifdef FEX_IOS_HOST
+  IosTiLog("[FEX-iOS] TI:stack\n");
+#endif
 
   auto* Thread = CTX->CreateThread(0, 0);
+#ifdef FEX_IOS_HOST
+  IosTiLog("[FEX-iOS] TI:createthread\n");
+#endif
 
   // Default segment setup.
   auto Frame = Thread->CurrentFrame;
@@ -1174,6 +1207,9 @@ NTSTATUS ThreadInit() {
 #endif
 
   FEX::Windows::CallRetStack::InitializeThread(Thread);
+#ifdef FEX_IOS_HOST
+  IosTiLog("[FEX-iOS] TI:callret\n");
+#endif
   Thread->CurrentFrame->Pointers.ExitFunctionEC = reinterpret_cast<uintptr_t>(&ExitFunctionEC);
   CPUArea.StateFrame() = Thread->CurrentFrame;
 
