@@ -452,7 +452,15 @@ private:
   constexpr static size_t MIN_L1_ENTRIES = 8 * 1024;        // Must be a power of 2
   constexpr static size_t MAX_L1_ENTRIES = 1 * 1024 * 1024; // Must be a power of 2
 
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic: halve the per-thread block-backing arena — it's committed
+   * upfront on iOS (see LookupCache.cpp) and 128MB × ~19 threads was OOM-ing
+   * the process. 64MB still backs 1024 guest code pages per thread; on
+   * overflow AllocateBackingForPage returns 0 → clean ClearCodeCache. */
+  constexpr static size_t CODE_SIZE = 64 * 1024 * 1024;
+#else
   constexpr static size_t CODE_SIZE = 128 * 1024 * 1024;
+#endif
   constexpr static size_t SIZE_PER_PAGE = FEXCore::Utils::FEX_PAGE_SIZE * sizeof(LookupCacheEntry);
   constexpr static size_t MAX_L1_SIZE = MAX_L1_ENTRIES * sizeof(LookupCacheEntry);
 

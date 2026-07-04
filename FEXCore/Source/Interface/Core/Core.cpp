@@ -114,6 +114,18 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
   }
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic: shrink the per-thread LookupCache L2 page table from 128MB
+   * (64GB VirtualMemSize) to 16MB (8GB). Every thread's LookupCache commits
+   * its full arena upfront on iOS (commit-on-fault doesn't work — see
+   * LookupCache.cpp), so ~264MB × ~19 game threads ≈ 5GB was killing the
+   * process when Thumper's loading screen spawned workers (silent death
+   * inside the LookupCache ctor, bisected via [TI-IC] markers). 8GB covers
+   * everything the L2 usefully serves anyway: the exe at 0x140000000 (5GB)
+   * and low mappings. DLL code at ~0x7EExxxxxxxxx aliased in L2 even at
+   * 64GB and is served by the dispatcher's loop-top L1 probe instead. */
+  Config.VirtualMemSize = 1ULL << 33;
+#endif
 
   if (Config.BlockJITNaming() || Config.GlobalJITNaming() || Config.LibraryJITNaming()) {
     // Only initialize symbols file if enabled. Ensures we don't pollute /tmp with empty files.
@@ -404,11 +416,18 @@ void ContextImpl::ExecuteThread(FEXCore::Core::InternalThreadState* Thread) {
 }
 
 void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread) {
+  /* iOS-Mythic: step markers — new-thread ThreadInit deaths on iOS land
+   * between Module.cpp's TI:stack and TI:createthread, i.e. inside this
+   * function or the InternalThreadState allocation. Bisect which step. */
+  LogMan::Msg::EFmt("[TI-IC] opdispatch");
   Thread->OpDispatcher = fextl::make_unique<FEXCore::IR::OpDispatchBuilder>(this);
   Thread->OpDispatcher->SetMultiblock(Config.Multiblock);
+  LogMan::Msg::EFmt("[TI-IC] lookupcache");
   Thread->LookupCache = fextl::make_unique<FEXCore::LookupCache>(this);
+  LogMan::Msg::EFmt("[TI-IC] decoder");
   Thread->FrontendDecoder = fextl::make_unique<FEXCore::Frontend::Decoder>(Thread);
   Thread->PassManager = fextl::make_unique<FEXCore::IR::PassManager>();
+  LogMan::Msg::EFmt("[TI-IC] passmanager");
 
   Thread->CurrentFrame->State.L1Pointer = Thread->LookupCache->GetL1Pointer();
   Thread->CurrentFrame->State.L1Mask = Thread->LookupCache->GetScaledL1PointerMask();
@@ -424,16 +443,20 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
 
   // Create CPU backend
   Thread->PassManager->InsertRegisterAllocationPass(this);
+  LogMan::Msg::EFmt("[TI-IC] jitcore");
   Thread->CPUBackend = FEXCore::CPU::CreateArm64JITCore(this, Thread);
+  LogMan::Msg::EFmt("[TI-IC] jitcore-done");
 
   Thread->PassManager->Finalize();
 }
 
 FEXCore::Core::InternalThreadState*
 ContextImpl::CreateThread(uint64_t InitialRIP, uint64_t StackPointer, const FEXCore::Core::CPUState* NewThreadState) {
+  LogMan::Msg::EFmt("[TI-IC] createthread-enter");
   FEXCore::Core::InternalThreadState* Thread = new FEXCore::Core::InternalThreadState {
     .CTX = this,
   };
+  LogMan::Msg::EFmt("[TI-IC] threadstate-alloc");
   FEXCore::Allocator::VirtualName("FEXMem_ThreadState", Thread, sizeof(*Thread));
 
   Thread->CurrentFrame->State.gregs[X86State::REG_RSP] = StackPointer;

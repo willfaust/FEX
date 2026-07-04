@@ -48,7 +48,9 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
    * on iOS — pages stay faulting after VirtualAlloc(MEM_COMMIT) returns.
    * Pre-commit the whole region; physical pages are still demand-faulted
    * by the kernel. */
+  LogMan::Msg::EFmt("[TI-IC] lookupcache-alloc size=0x{:x}", TotalCacheSize);
   PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, true));
+  LogMan::Msg::EFmt("[TI-IC] lookupcache-alloc -> 0x{:x}", PagePointer);
 #else
   PagePointer = reinterpret_cast<uintptr_t>(FEXCore::Allocator::VirtualAlloc(TotalCacheSize, false, false));
 #endif
