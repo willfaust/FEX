@@ -750,19 +750,19 @@ NTSTATUS ProcessInit() {
         : nullptr;
     char buf[160];
     if (off != 0) {
-      /* iOS-Mythic 2026-07-03: TRAP-MODE writes are the shipping config.
-       * WriteOffset stays 0 so WritePtr is identity — every JIT-pool write
-       * faults and the Wine Mach STR emulator redirects it through the RW
-       * alias AND invalidates icache. The direct-RW fast-write path
-       * (WriteOffset = off) corrupted x86→EC transitions (msvcp140 DllMain
-       * EH via RtlPcToFileHeader; Goldberg steam_api64 init) — root cause
-       * inside it unproven, suspected inline dc/ic flush. Bisect-verified
-       * 2026-07-03: trap-mode reaches the 3D menu; fast-write dies pre-
-       * splash. Before re-enabling, rework the flush to
-       * NtFlushInstructionCache and re-verify those two crash sites. */
-      FEXCore::DualMap::WriteOffset = 0;
+      /* iOS-Mythic 2026-07-06: FAST-WRITE re-enabled per the 2026-07-03
+       * TODO — the flush is now NtFlushInstructionCache (kernel IPI) in
+       * JIT.cpp instead of inline dc/ic asm, which was the suspected root
+       * cause of the msvcp140-DllMain/steam_api64 fast-write crashes AND
+       * the proven cause of the Thumper-desktop icache-staleness ILLs
+       * (every crash pc 64-byte aligned; trap-mode's 1000x slower copies
+       * just widened the same window). Fast-write removes ~300K mach
+       * exceptions per compile storm. If the old fast-write crash sites
+       * return (msvcp140 EH pre-splash, steam_api64 init), revert THIS
+       * assignment to 0 but KEEP the NtFlushInstructionCache flush. */
+      FEXCore::DualMap::WriteOffset = off;
       int n = snprintf(buf, sizeof(buf),
-          "[FEX-iOS] trap-mode writes (WriteOffset=0; real off=0x%llx RW=0x%llx RX=0x%llx)\n",
+          "[FEX-iOS] fast-write ENABLED (WriteOffset=0x%llx RW=0x%llx RX=0x%llx)\n",
           (unsigned long long)off, (unsigned long long)rw, (unsigned long long)rx);
       if (stderr_h) { ULONG w = 0; WriteFile(stderr_h, buf, n, &w, nullptr); }
     } else {

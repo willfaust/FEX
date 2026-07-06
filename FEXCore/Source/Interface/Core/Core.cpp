@@ -1201,6 +1201,23 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
+  /* iOS-Mythic diag (Thumper desktop ILL 2026-07-06): three crashes branched
+   * to BlockTail+0x18 instead of a code entry — the published entry itself
+   * was wrong. Validate every entry against the block layout at publication
+   * time: an entry must land in [BlockBegin, Tail) and must not decode as
+   * the NOP prefill. */
+  if (CodePtr && CompiledCode.BlockBegin) {
+    uint32_t TailOff = *reinterpret_cast<uint32_t*>(CompiledCode.BlockBegin);
+    uint8_t* Tail = CompiledCode.BlockBegin + TailOff;
+    uint32_t FirstInsn = *reinterpret_cast<uint32_t*>(CodePtr);
+    if (reinterpret_cast<uint8_t*>(CodePtr) < CompiledCode.BlockBegin ||
+        reinterpret_cast<uint8_t*>(CodePtr) >= Tail || FirstInsn == 0xd503201fu) {
+      LogMan::Msg::EFmt("[fex-entry] BAD ENTRY at publication: rip=0x{:x} entry=0x{:x} "
+                        "block=0x{:x} tail_off=0x{:x} first_insn=0x{:08x}",
+                        GuestRIP, reinterpret_cast<uintptr_t>(CodePtr),
+                        reinterpret_cast<uintptr_t>(CompiledCode.BlockBegin), TailOff, FirstInsn);
+    }
+  }
   if (CodePtr == nullptr) {
     return 0;
   } else if (!DebugData) {
