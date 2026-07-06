@@ -16,16 +16,18 @@ $end_info$
 #endif
 
 #if defined(FEX_IOS_HOST) && !defined(__APPLE__)
-// iOS-Mythic 2026-05-19: helper to flush a single ARM64 instruction (4 bytes)
-// from the block-linking backpatch sites below. dc cvau on the RW alias
-// (read access OK), ic ivau on the RX alias (XO OK on Apple silicon).
-// dsb/isb provide ordering.
+// iOS-Mythic 2026-07-06: cross-modifying code flushes MUST go through the
+// kernel (NtFlushInstructionCache → __clear_cache → sys_icache_invalidate),
+// which IPIs every core so remote PEs take the required context
+// synchronization. The old inline dc/ic asm only broadcast the cache
+// maintenance — a core already executing near the target kept stale
+// icache lines (prefill NOPs) and slid into block-tail data: every
+// Thumper-desktop ILL pc was exactly 64-byte cache-line aligned.
+extern "C" long NtFlushInstructionCache(void* Handle, const void* Addr, unsigned long long Size);
 namespace {
 inline void IOSFlushOneInstr(void* RWAddr, void* RXAddr) {
-  __asm__ volatile("dc cvau, %0" :: "r"(RWAddr) : "memory");
-  __asm__ volatile("dsb ish" ::: "memory");
-  __asm__ volatile("ic ivau, %0" :: "r"(RXAddr) : "memory");
-  __asm__ volatile("dsb ish; isb" ::: "memory");
+  (void)RWAddr; // dcache clean by RX VA reaches the same physical lines (PIPT)
+  NtFlushInstructionCache(reinterpret_cast<void*>(~0ull), RXAddr, 4);
 }
 }  // namespace
 #endif
@@ -586,6 +588,18 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
       if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
         return HostCode;
       }
+    }
+  }
+
+  /* iOS-Mythic diag: companion to [fex-entry] in Core.cpp — scream when the
+   * link target the blocks will be patched to jump at starts with the NOP
+   * prefill or decodes as block-tail data (upper 16 bits all zero — no real
+   * ARM64 instruction looks like that). */
+  if (HostCode) {
+    uint32_t FirstInsn = *reinterpret_cast<uint32_t*>(HostCode);
+    if (FirstInsn == 0xd503201fu || (FirstInsn >> 16) == 0) {
+      LogMan::Msg::EFmt("[fex-link] SUSPICIOUS resolved target: rip=0x{:x} host=0x{:x} first_insn=0x{:08x}",
+                        GuestRip, HostCode, FirstInsn);
     }
   }
 
@@ -1232,33 +1246,16 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     sys_icache_invalidate(CodeBegin, CodeOnlySize);
   }
 #elif defined(FEX_IOS_HOST)
-  // Same logic as __APPLE__ for ARM64EC PE running on iOS, but without
-  // Darwin libsystem (sys_icache_invalidate not available). Use inline
-  // ARM64 asm: dc cvau (clean to PoU) on RW alias where we have read
-  // access, then ic ivau (invalidate to PoU) on RX alias which works on
-  // XO pages on Apple Silicon. dsb ish / isb provide the required
-  // ordering.
-  //
-  // 2026-07-02: cache-line stride is hardcoded to 64 bytes. It was
-  // previously read from CTR_EL0, but on iOS 27 that `mrs` raises an
-  // illegal-instruction fault when executed from JIT-pool memory
-  // (confirmed: C000001D exactly on the mrs at pool+0x8eeaac, killing
-  // Thumper's main thread ~31s in). 64 bytes is the true I/D cache line
-  // size on all Apple Silicon (A-series and M-series), so this is
-  // correct, not approximate.
-  {
-    auto* RWBegin = WritePtr(CodeBegin);
-    auto* RXBegin = CodeBegin;
-    constexpr size_t kCacheLine = 64;
-    for (size_t off = 0; off < CodeOnlySize; off += kCacheLine) {
-      __asm__ volatile("dc cvau, %0" :: "r"(RWBegin + off) : "memory");
-    }
-    __asm__ volatile("dsb ish" ::: "memory");
-    for (size_t off = 0; off < CodeOnlySize; off += kCacheLine) {
-      __asm__ volatile("ic ivau, %0" :: "r"(RXBegin + off) : "memory");
-    }
-    __asm__ volatile("dsb ish; isb" ::: "memory");
-  }
+  // iOS-Mythic 2026-07-06: route the whole-block flush through
+  // NtFlushInstructionCache (kernel-coordinated __clear_cache /
+  // sys_icache_invalidate) instead of inline dc/ic asm. The inline
+  // broadcast never forced the required ISB on OTHER cores — a core
+  // entering a freshly-published block through stale (prefill-NOP)
+  // icache lines slid into the block tail and ILL'd at a 64-byte line
+  // boundary. The kernel IPI in the blessed flush closes that window;
+  // dcache clean by RX VA reaches the physical lines dirtied via the
+  // RW alias (PIPT). Pool RX pages are readable, so dc-by-RX is safe.
+  NtFlushInstructionCache(reinterpret_cast<void*>(~0ull), CodeBegin, CodeOnlySize);
 #else
   ClearICache(CodeBegin, CodeOnlySize);
 #endif
