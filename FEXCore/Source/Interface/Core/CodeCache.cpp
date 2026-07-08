@@ -838,7 +838,10 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
 
   FEXCORE_PROFILE_SCOPED("FinalizeCodePages");
 
-#ifndef _WIN32
+// Apple/iOS has no mremap(MREMAP_*); the persistent code cache isn't used on
+// the iOS host anyway, so fall through to the direct in-place relocation path
+// below (same as the Windows branch) rather than the mremap staging dance.
+#if !defined(_WIN32) && !defined(__APPLE__)
   // Atomicity is critical when making the finalized code data visible.
   // We ensure this by remapping a temporary buffer onto the PROT_NONE
   // placeholder page in CodeBuffer. Some constraints to keep in mind are:

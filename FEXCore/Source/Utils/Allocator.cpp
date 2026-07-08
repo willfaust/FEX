@@ -361,4 +361,22 @@ void LockBeforeFork(FEXCore::Core::InternalThreadState* Thread) {}
 void UnlockAfterFork(FEXCore::Core::InternalThreadState* Thread, bool Child) {}
 
 } // namespace FEXCore::Allocator
+#else
+// _WIN32 (incl. the ARM64EC PE / WoW64 builds). Provide the hook-pointer
+// allocator API that upstream FEX-2607 introduced (VirtualTHPControl + the
+// HookPtrs SetupHooks signature). Matches FEX-2607's Windows #else branch.
+// DualMap::WriteOffset is intentionally NOT defined here — the EC PE gets it
+// from Source/Windows/ARM64EC/Module.cpp (defining it here would duplicate).
+namespace FEXCore::Allocator {
+void VirtualNameNOP(const char*, const void*, size_t) {}
+void VirtualTHPNOP(const void* Ptr, size_t Size, THPControl Control) {}
+
+VirtualNamePtr VirtualName {VirtualNameNOP};
+VirtualTHPPtr VirtualTHPControl {VirtualTHPNOP};
+
+void SetupHooks(size_t PageSize, HookPtrs Ptrs) {
+  VirtualName = Ptrs.VirtualName;
+  VirtualTHPControl = Ptrs.VirtualTHPControl;
+}
+} // namespace FEXCore::Allocator
 #endif

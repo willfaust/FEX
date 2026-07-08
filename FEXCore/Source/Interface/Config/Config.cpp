@@ -242,9 +242,15 @@ void MetaLayer::MergeConfigMap(const LayerOptions& Options) {
   }
 }
 
-/* iOS-Mythic bisect tags. */
+/* iOS-Mythic bisect tags. NtTerminateProcess + __declspec are ntdll/MS-only,
+ * so they're available on the ARM64EC PE (llvm-mingw) build but not the native
+ * iOS-host build (Apple clang has no __declspec / no ntdll). No-op there. */
+#if defined(_WIN32)
 extern "C" __declspec(dllimport) long __stdcall NtTerminateProcess(void *hProcess, long ExitStatus);
 #define INIT_TAG_EXIT(id) NtTerminateProcess((void*)-1, (long)(0xCC700000 | (id)))
+#else
+#define INIT_TAG_EXIT(id) ((void)0)
+#endif
 
 void Initialize() {
   AddLayer(fextl::make_unique<MetaLayer>(FEXCore::Config::LayerType::LAYER_TOP));

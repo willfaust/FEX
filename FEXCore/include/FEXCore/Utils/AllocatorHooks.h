@@ -150,7 +150,14 @@ inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
 }
 
 inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) {
+#if defined(MADV_HUGEPAGE) && defined(MADV_NOHUGEPAGE)
   ::madvise(const_cast<void*>(Ptr), Size, Control == THPControl::Enable ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+#else
+  // Darwin/iOS has no transparent-hugepage madvise advice; no-op.
+  (void)Ptr;
+  (void)Size;
+  (void)Control;
+#endif
 }
 
 #endif
