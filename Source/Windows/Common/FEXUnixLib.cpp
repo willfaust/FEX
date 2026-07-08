@@ -118,9 +118,23 @@ bool Init(HMODULE NtDll) {
     return NtQueryVirtualMemory(NtCurrentProcess(), &__ImageBase, MemoryWineUnixFuncs, &UnixLibHandle, sizeof(UnixLibHandle), nullptr) == 0;
   };
 
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic (FEX-2607 rebase): the new load-by-name unixlib method
+   * (TryNewWineMethod) expects a separate "libarm64ecfex" .so unixlib. iOS has
+   * no .so files — load_unixlib_by_name dlopen()s a nonexistent path and can
+   * return a bogus handle whose funcs table is garbage; the dispatcher then
+   * blr's into code bytes (the post-rebase fault storm). The old
+   * MemoryWineUnixFuncs-on-__ImageBase path is the one our iOS ntdll-unix
+   * actually implements and what ios-port always used. Force it. */
+  (void)TryNewWineMethod;
+  if (!TryOldWineMethod()) {
+    return false;
+  }
+#else
   if (!TryNewWineMethod() && !TryOldWineMethod()) {
     return false;
   }
+#endif
 
 #ifdef ARCHITECTURE_arm64ec
   UnixCallDispatcherDirect = *reinterpret_cast<decltype(__wine_unix_call_dispatcher)*>(Sym);
@@ -130,7 +144,7 @@ bool Init(HMODULE NtDll) {
 #endif
 
   // Give a log saying that the unix lib was loaded.
-  LogMan::Msg::IFmt("FEX: Loaded FEXUnixLib");
+  LogMan::Msg::IFmt("FEX: Loaded FEXUnixLib (UnixLibHandle=0x{:x})", static_cast<unsigned long long>(UnixLibHandle));
   return true;
 }
 
@@ -139,6 +153,13 @@ static bool UnixLibAvailable() {
 }
 
 bool TryEnableHardwareTSO() {
+#ifdef FEX_IOS_HOST
+  // iOS: FEX-2607's FEXUnixLib funcs table isn't registered on the iOS unix
+  // side, and the legacy Illegal:: paths issue raw Linux syscalls (unsafe on
+  // XNU). No-op every entry point; FEX falls back to software TSO, which is
+  // correct (our hand-rolled HostFeatures doesn't advertise hardware TSO).
+  return false;
+#endif
   if (UnixLibAvailable()) {
     // UnixLib path.
     FEXUnixLib_SetHardwareTSOControlArgs Args {
@@ -155,6 +176,10 @@ bool TryEnableHardwareTSO() {
 }
 
 bool SetKernelUnalignedAtomicControl(uint64_t Flags) {
+#ifdef FEX_IOS_HOST
+  (void)Flags;
+  return false;
+#endif
   if (UnixLibAvailable()) {
     // UnixLib path.
     FEXUnixLib_SetKernelUnalignedAtomicControl Args {
@@ -169,6 +194,12 @@ bool SetKernelUnalignedAtomicControl(uint64_t Flags) {
 }
 
 void VirtualTHPControl(const void* Ptr, size_t Size, FEXCore::Allocator::THPControl Control) {
+#ifdef FEX_IOS_HOST
+  (void)Ptr;
+  (void)Size;
+  (void)Control;
+  return;
+#endif
   if (UnixLibAvailable()) {
     // UnixLib path.
     FEXUnixLib_Madvise Args {
@@ -186,6 +217,12 @@ void VirtualTHPControl(const void* Ptr, size_t Size, FEXCore::Allocator::THPCont
 }
 
 void VirtualName(const char* Name, const void* Ptr, size_t Size) {
+#ifdef FEX_IOS_HOST
+  (void)Name;
+  (void)Ptr;
+  (void)Size;
+  return;
+#endif
   if (!SupportsVirtualName) {
     return;
   }
@@ -209,6 +246,12 @@ void VirtualName(const char* Name, const void* Ptr, size_t Size) {
 }
 
 SHMSlotResult AllocateSHMSlots(void* SHMBase, uint32_t MapSize, uint32_t MaxSize) {
+#ifdef FEX_IOS_HOST
+  (void)SHMBase;
+  (void)MapSize;
+  (void)MaxSize;
+  return {};
+#endif
   if (UnixLibAvailable()) {
     // UnixLib path.
     FEXUnixLib_GetSHMStatsVMA Args {
@@ -277,6 +320,9 @@ SHMSlotResult AllocateSHMSlots(void* SHMBase, uint32_t MapSize, uint32_t MaxSize
 }
 
 void DeleteSHMStatsFile() {
+#ifdef FEX_IOS_HOST
+  return;
+#endif
   if (UnixLibAvailable()) {
     // UnixLib path.
     Call(FEXUnixLibFunctions::DeleteSHMStatsFile, nullptr);
