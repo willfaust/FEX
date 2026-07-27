@@ -48,37 +48,59 @@ static rpmalloc_config_t global_config {
   .unmap_on_finalize = 0,
 };
 
+// iOS-Mythic (ml107-ml109): threads that enter FEX without passing through
+// InitCRTThread (wine loader threads during EC child boot) have no rpmalloc
+// thread heap, so every hook below returned NULL/failed. The observed death:
+// LogMan::Msg::MFmtImpl -> aligned_alloc == NULL -> unchecked memmove(NULL)
+// -> c0000005 in ntdll memcpy, killing the child before the message it was
+// formatting ever surfaced. Lazily initialize the thread heap at the hook
+// boundary; rpmalloc_is_thread_initialized() is a cheap TLS read.
+static inline void EnsureThreadHeap() {
+  if (!::rpmalloc_is_thread_initialized()) {
+    ::rpmalloc_thread_initialize();
+  }
+}
+
 void* malloc(size_t size) {
+  EnsureThreadHeap();
   return ::rpmalloc(size);
 }
 void* calloc(size_t n, size_t size) {
+  EnsureThreadHeap();
   return ::rpcalloc(n, size);
 }
 void* memalign(size_t align, size_t s) {
+  EnsureThreadHeap();
   return ::rpmemalign(align, s);
 }
 void* valloc(size_t size) {
+  EnsureThreadHeap();
   return ::rpaligned_alloc(global_config.page_size, size);
 }
 int posix_memalign(void** r, size_t a, size_t s) {
   void* ptr;
+  EnsureThreadHeap();
   auto res = ::rpposix_memalign(&ptr, a, s);
   *r = ptr;
   return res;
 }
 void* realloc(void* ptr, size_t size) {
+  EnsureThreadHeap();
   return ::rprealloc(ptr, size);
 }
 void free(void* ptr) {
+  EnsureThreadHeap();
   return ::rpfree(ptr);
 }
 size_t malloc_usable_size(void* ptr) {
   return ::rpmalloc_usable_size(ptr);
 }
 void* aligned_alloc(size_t a, size_t s) {
+  EnsureThreadHeap();
   return ::rpaligned_alloc(a, s);
 }
 void aligned_free(void* ptr) {
+  EnsureThreadHeap();
   return ::rpfree(ptr);
 }
 
