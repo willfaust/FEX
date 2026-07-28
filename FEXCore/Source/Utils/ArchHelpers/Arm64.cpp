@@ -521,6 +521,31 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
   return false;
 }
 
+/* iOS-Mythic ml220 PROBE. RunCASPAL implements ONLY Size==0 (32-bit pairs); Size==1
+ * (64-bit pairs, i.e. a 128-bit CAS from x86 LOCK CMPXCHG16B) falls straight through to
+ * `return false`, which callers report as "Unhandled JIT SIGBUS CASPAL" and escalate to a
+ * fatal STATUS_DATATYPE_MISALIGNMENT. Steam/CEF hits this
+ *   Unhandled JIT SIGBUS CASPAL: PC: 0x120e53c00 Instruction: 0x4866fd64
+ *     = CASPAL x6,x7, x4,x5, [x11]   (sz=1)
+ *
+ * Implementing a 128-bit unaligned CAS is real work, so establish WHY the address is
+ * unaligned first: a correct x86 program cannot issue an unaligned LOCK CMPXCHG16B (it
+ * #GPs on hardware), so either the guest really does it -- and we must emulate -- or the
+ * address we computed is wrong, which is a different bug entirely and would make the
+ * emulation pointless. Print the address and its misalignment so the next run decides. */
+static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t AddressReg) {
+  static int reports;
+
+  if (Size == 0 || reports >= 8) {
+    return;
+  }
+  reports++;
+  LogMan::Msg::EFmt("[caspal128] UNIMPLEMENTED Size={} addrReg=x{} addr={:#x} misalign={} "
+                    "crosses16B={}",
+                    Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
+                    (GPRs[AddressReg] & 15) ? "yes" : "no");
+}
+
 static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
   uint32_t Size = (Instr >> 30) & 1;
 
@@ -530,6 +555,7 @@ static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLo
   uint32_t ExpectedReg2 = ExpectedReg1 + 1;
   uint32_t AddressReg = (Instr >> 5) & 0b11111;
 
+  IosLogUnimplementedCASPAL(Size, GPRs, AddressReg);
   return RunCASPAL(GPRs, Size, DesiredReg1, DesiredReg2, ExpectedReg1, ExpectedReg2, AddressReg, StrictSplitLockMutex);
 }
 

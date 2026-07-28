@@ -165,6 +165,19 @@ ret_sp_misaligned:
   // In the case of the x64 caller leaving sp only 8-byte aligned, leave the return address on the stack to keep 16-byte
   // alignment and have the callee return to an x86 ret instruction. FEX can then return to the actual caller keeping
   // the misaligned RSP.
+  //
+  // ml218: x4 must still point PAST the return address. On the path above the address is
+  // popped (`ldr lr, [x4], #0x8`), leaving x4 = RSP+8 -- the base of the x64 home space,
+  // which a variadic entry thunk then advances by 0x20 to reach the first stack argument:
+  //   $ientry_thunk$cdecl$i8$varargs:  add x4, x4, #0x20
+  // Here the address is deliberately LEFT on the stack, so x4 = RSP is one slot short and
+  // every stack argument is read 8 bytes early. Measured directly in a Steam RPC call:
+  //   [ndr-shift] param3 off=0x18 StackTop=0x703CD5EBF0 HERE=0x10 next=0x703CD5EC88
+  //               => SHIFT: real pointer is ONE SLOT LATER (+8)
+  // which is how ccontext arrived as 0x10 and faulted in #NdrContextHandleUnmarshall+0xcc.
+  // Only variadic callees are affected -- non-variadic entry thunks never read x4 -- which
+  // is why this stayed hidden outside RPC. sp is intentionally left untouched.
+  add x4, x4, #0x8
   adrp lr, X64ReturnInstr
   ldr lr, [lr, #:lo12:X64ReturnInstr]
   br x17
