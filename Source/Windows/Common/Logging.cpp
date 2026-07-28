@@ -17,13 +17,50 @@ namespace {
 void (*WineDbgOut)(const char* Message);
 FILE* LogFile;
 
+/* iOS-Mythic ml194: FEX's log output was being DISCARDED, which is why no LogMan
+ * message (e.g. "[TI-IC] lookupcache-alloc") has ever appeared in mythic-log.txt and why
+ * every FEX-side question this session had to be answered indirectly from ntdll probes.
+ *
+ * Logging::Init() IS called (ARM64EC Module.cpp ProcessInit) and ProcessInit completes,
+ * yet even its own install trace never showed up. Cause: this is a PE module, so
+ * ::write(2, ...) goes through the CRT's descriptor table bound to the Windows stderr
+ * HANDLE — NOT the unix fd 2 that the app redirects into mythic-log.txt. Writing to the
+ * process's real hStdError is the path already proven to work here (see the FEX-iOS FATAL
+ * message in ARM64EC/Module.cpp). */
+static void IosLogWrite(const char* Str, size_t Len) {
+  /* ml195: hStdError is NULL in this context, so the WriteFile path produced nothing
+   * (which also means the pre-existing "[FEX-iOS] FATAL" message was never functional).
+   * Prefer __wine_dbg_output: it IS exported by our PE ntdll (export table ordinal 1464)
+   * and is exactly what that ntdll's own ERR() lines go through — those reach
+   * mythic-log.txt reliably. Keep WriteFile as a fallback. */
+  static int (__cdecl *DbgOut)(const char*);
+  static bool Resolved;
+  if (!Resolved) {
+    Resolved = true;
+    DbgOut = reinterpret_cast<decltype(DbgOut)>(
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "__wine_dbg_output"));
+  }
+  if (DbgOut) {
+    DbgOut(Str);
+    return;
+  }
+  HANDLE h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
+                 ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(
+                       NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
+                 : nullptr;
+  if (h) {
+    ULONG Written = 0;
+    WriteFile(h, Str, static_cast<DWORD>(Len), &Written, nullptr);
+  }
+}
+
 static void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
   const auto Output = fextl::fmt::format("{} {:X} {}\n", LogMan::DebugLevelStr(Level), GetCurrentThreadId(), Message);
 #ifdef FEX_IOS_HOST
   /* iOS-Mythic: route directly to stderr (which is dup2'd to mythic-log.txt
    * by WineProcessBridge). __wine_dbg_output is exported but doesn't always
    * resolve via GetProcAddress on our embedded ntdll, so go around it. */
-  ::write(2, Output.c_str(), Output.size());
+  IosLogWrite(Output.c_str(), Output.size());
   return;
 #endif
   if (WineDbgOut) {
@@ -35,6 +72,10 @@ static void MsgHandler(LogMan::DebugLevels Level, const char* Message) {
 
 static void AssertHandler(const char* Message) {
   const auto Output = fextl::fmt::format("A {}\n", Message);
+#ifdef FEX_IOS_HOST
+  IosLogWrite(Output.c_str(), Output.size());
+  return;
+#endif
   if (WineDbgOut) {
     WineDbgOut(Output.c_str());
   } else if (LogFile) {
@@ -55,7 +96,7 @@ void Init() {
 #ifdef FEX_IOS_HOST
   /* iOS-Mythic: trace install via stderr directly to confirm Init() ran. */
   const char *m = "[FEX-iOS] Logging::Init installing MsgHandler\n";
-  ::write(2, m, 47);
+  IosLogWrite(m, __builtin_strlen(m));
 #endif
 
   WineDbgOut = reinterpret_cast<decltype(WineDbgOut)>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "__wine_dbg_output"));

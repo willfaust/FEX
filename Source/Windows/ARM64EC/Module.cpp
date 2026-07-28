@@ -340,6 +340,33 @@ void HandleImageMap(uint64_t Address, bool MainImage = false) {
   ImageTracker->HandleImageMap(ModulePath, Address, MainImage);
 }
 
+/* iOS-Mythic ml190: REPLAY IMAGE MAPS THAT ARRIVE BEFORE THE TRACKERS EXIST.
+ *
+ * NotifyMapViewOfSection returns early when InvalidationTracker/ImageTracker are not yet
+ * constructed (they are created in ProcessInit), and that notification was previously lost
+ * forever. Any image mapped in that window never gets its executable sections inserted
+ * into InvalidationTracker::XIntervals, so every later decode inside it reports NOEXEC ->
+ * NoExecOp -> FAULT_SIGSEGV -> the GuestSignal_SIGSEGV trampoline -> dead thread.
+ *
+ * Evidence this is the remaining hole (ml190, self-targeting probe): libcef IS notified at
+ * map time, and NOTHING ever removes its interval — 0 unexec and 0 unmap touching its
+ * range — yet the decoder still reports NOEXEC at libcef+0x1900733 / +0x3b508f0. So the
+ * INSERT is what failed. Queue them and replay once the trackers are up. */
+constexpr size_t MaxPendingImageMaps = 64;
+uint64_t PendingImageMaps[MaxPendingImageMaps];
+size_t PendingImageMapCount = 0;
+
+void QueuePendingImageMap(uint64_t Address) {
+  for (size_t i = 0; i < PendingImageMapCount; i++) {
+    if (PendingImageMaps[i] == Address) {
+      return;
+    }
+  }
+  if (PendingImageMapCount < MaxPendingImageMaps) {
+    PendingImageMaps[PendingImageMapCount++] = Address;
+  }
+}
+
 void HandleImageUnmap(uint64_t Address, uint64_t Size) {
   ImageTracker->HandleImageUnmap(Address, Size);
 }
@@ -649,6 +676,14 @@ public:
         }
       }
     }
+    if (Result.Size == 0) {
+      static uint32_t QueryFailCount = 0;
+      if (QueryFailCount < 12) {
+        QueryFailCount++;
+        LogMan::Msg::EFmt("[iOS-xquery] MISS tracker={} addr={:#x} rev={:#x}",
+                          static_cast<void*>(&*InvalidationTracker), Address, IosJitReverseTranslate(Address));
+      }
+    }
 #endif
     return Result;
   }
@@ -784,12 +819,34 @@ NTSTATUS ProcessInit() {
 
   HandleImageMap(NtDllBase);
 
+  /* ml190: replay any image maps that arrived before the trackers existed. */
+  for (size_t i = 0; i < PendingImageMapCount; i++) {
+    HandleImageMap(PendingImageMaps[i]);
+  }
+  PendingImageMapCount = 0;
+
   CPUFeatures.emplace(*CTX);
 
   X64ReturnInstr = ::VirtualAlloc(nullptr, FEXCore::Utils::FEX_PAGE_SIZE, MEM_COMMIT | MEM_TOP_DOWN, PAGE_EXECUTE_READWRITE);
   InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(X64ReturnInstr), FEXCore::Utils::FEX_PAGE_SIZE,
                                                           PAGE_EXECUTE_READ);
   *reinterpret_cast<uint8_t*>(X64ReturnInstr) = 0xc3;
+
+  /* iOS-Mythic ml199: state this address explicitly.
+   *
+   * [iOS-noexec]/[iOS-bogusrip] show FEX being handed GuestRIP=0x7c200e0080 — page
+   * 0x7c200e0000 plus 0x80 — and the same +0x0e0080 offset has appeared across three
+   * different runs/arenas. This sentinel is a ONE-PAGE MEM_TOP_DOWN allocation holding a
+   * single 0xC3 at offset 0, which Module.S:168 loads into lr before entering the
+   * simulator, so guest returns out of simulation land on it. Top-down placement now puts
+   * it in the 0x7c.. band, which is also where the iOS VA steering places its 512MB
+   * reserve-only ranges — so log the address (and whether it is inside a steer slot) to
+   * confirm the failing RIP really is X64ReturnInstr+0x80 rather than a coincidence, and
+   * whether the sentinel is landing inside a steered reservation. */
+  LogMan::Msg::EFmt("[iOS-sentinel] X64ReturnInstr={:#x} page={:#x} in_steer_band={}",
+                    reinterpret_cast<uint64_t>(X64ReturnInstr),
+                    reinterpret_cast<uint64_t>(X64ReturnInstr) & ~0xfffULL,
+                    reinterpret_cast<uint64_t>(X64ReturnInstr) >= 0x7400000000ULL ? "YES" : "no");
 
   const uintptr_t KiUserExceptionDispatcherFFS = reinterpret_cast<uintptr_t>(GetProcAddress(NtDll, "KiUserExceptionDispatcher"));
   Exception::KiUserExceptionDispatcher = NtDllRedirectionLUT[KiUserExceptionDispatcherFFS - NtDllBase] + NtDllBase;
@@ -1011,7 +1068,26 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
 }
 
 NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Size, ULONG AllocType, ULONG Prot) {
-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
+  /* iOS-Mythic ml183: do NOT require GetCPUArea().ThreadState() here.
+   *
+   * HandleImageMap() only needs InvalidationTracker + ImageTracker — it never touches
+   * thread state. Requiring a live ThreadState silently DROPPED the notification whenever
+   * a module was mapped on a thread FEX had not initialised yet, so that image's
+   * executable sections were never inserted into InvalidationTracker::XIntervals.
+   *
+   * The consequence is severe and was the Steam/CEF blocker: Decoder::CheckRangeExecutable
+   * -> QueryGuestExecutableRange -> QueryExecutableRange returns Size==0 for the untracked
+   * range, the decoder sets HitNonExecutableRange, Core.cpp raises NoExecOp
+   * (FAULT_SIGSEGV / TRAPNO_PF / SEGV_ACCERR), and the JIT branches to the
+   * GuestSignal_SIGSEGV trampoline which deliberately reads address 0 to force a SIGSEGV.
+   * On iOS that lands in our Mach/segv handler as an unhandleable fault and kills the
+   * thread — observed 41x per run in the webhelper at libcef.dll function entries
+   * (+0x1900733, +0x3b508f0), which is why CEF never finished initialising.
+   *
+   * Keep the tracker null-checks; only the thread-state requirement is wrong. */
+  if (!InvalidationTracker || !ImageTracker) {
+    /* ml190: do not drop it — replay once ProcessInit has built the trackers. */
+    QueuePendingImageMap(reinterpret_cast<uint64_t>(Address));
     return STATUS_SUCCESS;
   }
 

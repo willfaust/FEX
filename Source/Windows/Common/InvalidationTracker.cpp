@@ -67,6 +67,30 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
       }
       return true;
     } else if (XIntervals.Intersect(ProtInterval)) {
+      /* iOS-Mythic ml208 ROOT-CAUSE FIX.
+       *
+       * A >=1GB non-executable range is an allocator reserving or managing a pool, never a
+       * code-permission change. Removing exec intervals for it wipes the executable range
+       * of EVERY module inside at once. Observed: PartitionAlloc reserving its 16GB soft
+       * pool 0x7000000000-0x7400000000 erased libcef's .text (0x7388f41000-0x7393f7cd23),
+       * after which the decoder reported NOEXEC at libcef code addresses, raised
+       * FAULT_SIGSEGV and killed 42 webhelper threads.
+       *
+       * Note this arrives via NotifyMemoryAlloc (ARM64EC/Module.cpp), NOT NotifyMemoryProtect
+       * — an earlier fix guarding Wine's NtProtectVirtualMemory therefore never fired. The
+       * guard belongs here, at the single choke point all three callers share.
+       *
+       * Only the REMOVAL branch is guarded: modules keep their own mappings and issue their
+       * own notifications, so ignoring a bulk range cannot lose a genuine executability
+       * transition, while the insert path above is left untouched so DEP promotion behaves
+       * exactly as before. */
+      if (AlignedSize >= (1ull << 30)) {
+        LogMan::Msg::EFmt("[iOS-xrem] SUPPRESSED bulk non-exec {:#x}-{:#x} ({} MB) prot={:#x}", ProtInterval.Offset,
+                          ProtInterval.End, AlignedSize >> 20, Prot);
+        return false;
+      }
+      LogMan::Msg::EFmt("[iOS-xrem] via=protect tracker={} {:#x}-{:#x}", static_cast<void*>(this),
+                        ProtInterval.Offset, ProtInterval.End);
       XIntervals.Remove(ProtInterval);
       RWXIntervals.Remove(ProtInterval);
       if (DEPDisabled) {
@@ -120,6 +144,8 @@ void InvalidationTracker::HandleProcessExecuteFlagsChange(ULONG Flags) {
     }
   } else {
     for (const auto& Interval : DEPPromotedIntervals) {
+      LogMan::Msg::EFmt("[iOS-xrem] via=depflags tracker={} {:#x}-{:#x}", static_cast<void*>(this),
+                        Interval.Offset, Interval.End);
       XIntervals.Remove(Interval);
       RWXIntervals.Remove(Interval);
     }
@@ -144,6 +170,14 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
       uint64_t SectionBase = Address + Section->VirtualAddress;
       uint64_t SectionEnd = SectionBase + Section->Misc.VirtualSize;
       XIntervals.Insert({SectionBase, SectionEnd});
+      /* iOS-Mythic ml200: FEX reports NOEXEC for libcef code addresses even though the
+       * ntdll side proves the map notification arrives and nothing ever removes the
+       * interval. So log the actual inserts (with `this`, since each pseudo-process runs
+       * its own xtajit64 copy and its own tracker) and pair it with the query-side log in
+       * QueryGuestExecutableRange. If the insert and the failing query name different
+       * `this`, the registration is landing in a different process's tracker. */
+      LogMan::Msg::EFmt("[iOS-xins] tracker={} {} sec={:#x}-{:#x}", static_cast<void*>(this), Name,
+                        SectionBase, SectionEnd);
       LastExecutableSectionEnd = std::max(LastExecutableSectionEnd, SectionEnd);
       if (Section->Characteristics & IMAGE_SCN_MEM_WRITE) {
         LogMan::Msg::DFmt("Add image SMC interval: {:X} - {:X}", SectionBase, SectionBase + Section->Misc.VirtualSize);
@@ -187,6 +221,8 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
 
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
+    LogMan::Msg::EFmt("[iOS-xrem] via=section tracker={} {:#x}-{:#x}", static_cast<void*>(this),
+                      SectionBase, SectionBase + SectionSize);
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
   }
@@ -207,6 +243,8 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
 
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
+    LogMan::Msg::EFmt("[iOS-xrem] via=aligned tracker={} {:#x}-{:#x}", static_cast<void*>(this),
+                      AlignedBase, AlignedBase + AlignedSize);
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
   }
@@ -248,6 +286,16 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
   return ProtectRWXIntervalsInternal(Address, Size, true);
 }
 
+/* iOS-Mythic ml201: log EVERY XIntervals removal, tagged by path.
+ *
+ * Proven this run: libcef's .text IS inserted (0x7385cf1000-0x7390d2cd23) into the SAME
+ * tracker (0x1229612c8) that later reports MISS for 0x73875f0733 and 0x73898408f0 — both
+ * inside that range. IntervalList::Query and ::Insert are correct for a sorted disjoint
+ * list, so a sub-range must be getting REMOVED. My ntdll-side probes only covered
+ * NtProtectVirtualMemory and unmap; Remove is also reachable from
+ * HandleProcessExecuteFlagsChange (DEP) and InvalidateAlignedInterval (via
+ * NotifyMemoryFree), neither of which was instrumented. Tag each site so the culprit
+ * path names itself. */
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
   std::shared_lock Lock(IntervalsLock);
   const auto XResult = XIntervals.Query(Address);

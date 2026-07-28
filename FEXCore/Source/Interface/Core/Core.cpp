@@ -762,6 +762,17 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             } else if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::UNIMPLEMENTED_INST) {
               Thread->OpDispatcher->UnimplementedOp(DecodedInfo);
             } else {
+              /* iOS-Mythic ml196: name the decode failure. The pre-existing
+               * "Invalid or Unknown instruction" message above cannot fire for this path
+               * because DecodeInstruction sets TableInfo = nullptr on exactly these
+               * errors. This branch (NOEXEC_INST / PARTIAL_DECODE_INST) is what raises
+               * FAULT_SIGSEGV -> GuestSignal_SIGSEGV -> the deliberate read of address 0
+               * that has been killing webhelper threads. Log which address failed and
+               * which status, so the guest RIP is stated rather than inferred. */
+              LogMan::Msg::EFmt("[iOS-noexec] status={} BlockEntry={:#x} GuestRIP={:#x}",
+                                Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::NOEXEC_INST ?
+                                  "NOEXEC" : "PARTIAL",
+                                Block.Entry, GuestRIP);
               Thread->OpDispatcher->NoExecOp(DecodedInfo);
             }
           }
@@ -909,6 +920,35 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   if (GuestRIP < 0x10000) {
     LogMan::Msg::IFmt("[iOS] CompileBlock: REFUSING low/invalid RIP={:#x}", GuestRIP);
     return 0;
+  }
+
+  /* iOS-Mythic ml197: NAME THE PRODUCER OF A HOST-ADDRESS "GUEST RIP".
+   *
+   * [iOS-noexec] showed FEX being asked to decode x86 at addresses that are not guest
+   * code at all:
+   *   GuestRIP=0x133f39a14   -> a JIT-POOL address (host code / module copies)
+   *   GuestRIP=0x7c600e0080  -> inside a steered 512MB FEX arena, at +0x0e0080 — the
+   *                             SAME offset seen in three runs across three arenas
+   * Decoding those yields NOEXEC/PARTIAL, which raises FAULT_SIGSEGV -> the
+   * GuestSignal_SIGSEGV trampoline -> the deliberate read of 0 that kills the thread.
+   * So the memory was never the problem; the POINTER is.
+   *
+   * ml198 CORRECTION: the first cut also flagged 0x1xxxxxxxx as "JIT pool", which was
+   * WRONG — guest PE IMAGES live in that band too (e.g. steamexe.exe maps at 0x15c800000,
+   * whose pool copy is at 0x127566000). That produced 17 false positives of perfectly
+   * legitimate RIPs. Only >= 0x7400000000 is unambiguous: that is steered-arena space and
+   * no guest image is ever placed there. Keep the check to that band only.
+   *
+   * Log the host return address (which lands in the dispatcher stub that supplied the
+   * RIP) plus State.rip, so the PRODUCER is named instead of the consumer. */
+  if (GuestRIP >= 0x7400000000ULL) {
+    static uint32_t BogusRIPCount = 0;
+    if (BogusRIPCount < 16) {
+      BogusRIPCount++;
+      LogMan::Msg::EFmt("[iOS-bogusrip] GuestRIP={:#x} State.rip={:#x} host_ret={} callret_sp={:#x}", GuestRIP,
+                        Frame ? Frame->State.rip : 0, __builtin_return_address(0),
+                        Frame ? Frame->State.callret_sp : 0);
+    }
   }
 
   /* iOS-Mythic 2026-05-18: CALLRET_SP bounds-validation + RESET.
