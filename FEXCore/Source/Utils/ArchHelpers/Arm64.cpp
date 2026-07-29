@@ -540,10 +540,24 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
     return;
   }
   reports++;
+
+  /* ml223: the address came back 16-byte ALIGNED (misalign=0), so this is not the
+   * unaligned-CAS case the Size==0 path exists for -- implementing a 128-bit unaligned
+   * CAS would not have fixed it. An aligned LSE atomic that still faults points at the
+   * MEMORY rather than the instruction, and the address sits inside the JIT pool's range,
+   * which we DUAL-MAP (RW alias + RX alias). Aliased mappings are exactly where atomics
+   * can fault despite correct alignment. Report what the region actually is, so "guest
+   * data in a dual-mapped pool page" is distinguishable from ordinary private memory. */
+  MEMORY_BASIC_INFORMATION mbi {};
+  const char* type = "?";
+  if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
+    type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
+  }
   LogMan::Msg::EFmt("[caspal128] UNIMPLEMENTED Size={} addrReg=x{} addr={:#x} misalign={} "
-                    "crosses16B={}",
+                    "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
                     Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
-                    (GPRs[AddressReg] & 15) ? "yes" : "no");
+                    (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,
+                    mbi.Protect, type, mbi.State);
 }
 
 static bool HandleCASPAL(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSplitLockMutex) {
