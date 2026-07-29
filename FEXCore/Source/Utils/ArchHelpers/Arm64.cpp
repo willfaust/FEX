@@ -517,6 +517,53 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
         }
       }
     }
+  } else if (Size == 1) {
+    // 64-bit pairs -- a true 128-bit CAS, which is what x86 LOCK CMPXCHG16B lowers to.
+    //
+    // iOS-Mythic ml258: this branch did not exist, so every CASPAL with sz=1 fell
+    // through to `return false`, which callers escalate to "Unhandled JIT SIGBUS
+    // CASPAL" and a fatal STATUS_DATATYPE_MISALIGNMENT. That is what ends the Steam
+    // run: CASPAL x6,x7, x4,x5, [x11] (Instruction 0x4866fd64), reported aligned
+    // (misalign=0, crosses16B=no) -- so nothing exotic, simply unimplemented.
+    uint64_t Addr = GPRs[AddressReg];
+
+    // Lower register must be even, so only the upper register can be 31.
+    uint64_t DesiredLower = GPRs[DesiredReg1];
+    uint64_t DesiredUpper = DesiredReg2 == 31 ? 0 : GPRs[DesiredReg2];
+
+    uint64_t ExpectedLower = GPRs[ExpectedReg1];
+    uint64_t ExpectedUpper = ExpectedReg2 == 31 ? 0 : GPRs[ExpectedReg2];
+
+    if (Addr & 0b1111) {
+      // CASP with 64-bit operands architecturally requires a 16-byte aligned address,
+      // and the LOCK CMPXCHG16B it comes from #GPs on hardware when unaligned -- so a
+      // correct guest cannot produce this. Emulating it would be inventing semantics
+      // x86 does not have, so keep the existing behaviour and let the caller report it.
+      return false;
+    }
+
+    // A 16-byte aligned 16-byte access can never cross a 64-byte cacheline
+    // (16 divides 64), so the split-lock handling the Size==0 path needs
+    // cannot apply here.
+    auto Atomic128 = std::atomic_ref<__uint128_t>(*reinterpret_cast<__uint128_t*>(Addr));
+
+    __uint128_t Desired = (static_cast<__uint128_t>(DesiredUpper) << 64) | DesiredLower;
+    __uint128_t Expected = (static_cast<__uint128_t>(ExpectedUpper) << 64) | ExpectedLower;
+
+    __uint128_t Tmp = Expected;
+    if (Atomic128.compare_exchange_strong(Tmp, Desired)) {
+      // Succeeded. CAS writes the loaded value back to the Rs pair, and on success
+      // that value equals Expected, so the registers already hold it.
+      return true;
+    }
+
+    // Failed: compare_exchange_strong left the observed value in Tmp, and CAS returns
+    // it in the Rs pair so the guest can retry its loop.
+    GPRs[ExpectedReg1] = static_cast<uint64_t>(Tmp);
+    if (ExpectedReg2 != 31) {
+      GPRs[ExpectedReg2] = static_cast<uint64_t>(Tmp >> 64);
+    }
+    return true;
   }
   return false;
 }
@@ -536,7 +583,10 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
 static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t AddressReg) {
   static int reports;
 
-  if (Size == 0 || reports >= 8) {
+  /* ml258: Size==1 is IMPLEMENTED now (see RunCASPAL). The only case still handed
+   * back to the caller is a misaligned CASP, which a correct guest cannot emit, so
+   * report exactly that and stay quiet otherwise. */
+  if (Size == 0 || (GPRs[AddressReg] & 15) == 0 || reports >= 8) {
     return;
   }
   reports++;
@@ -553,7 +603,7 @@ static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t Ad
   if (VirtualQuery(reinterpret_cast<LPCVOID>(GPRs[AddressReg]), &mbi, sizeof(mbi))) {
     type = mbi.Type == MEM_IMAGE ? "MEM_IMAGE" : mbi.Type == MEM_MAPPED ? "MEM_MAPPED" : "MEM_PRIVATE";
   }
-  LogMan::Msg::EFmt("[caspal128] UNIMPLEMENTED Size={} addrReg=x{} addr={:#x} misalign={} "
+  LogMan::Msg::EFmt("[caspal128] MISALIGNED-UNSUPPORTED Size={} addrReg=x{} addr={:#x} misalign={} "
                     "crosses16B={} | region base={} size={:#x} prot={:#x} type={} state={:#x}",
                     Size, AddressReg, GPRs[AddressReg], GPRs[AddressReg] & 15,
                     (GPRs[AddressReg] & 15) ? "yes" : "no", mbi.BaseAddress, mbi.RegionSize,

@@ -566,6 +566,32 @@ ContextImpl::GenerateIRResult
 ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("GenerateIR");
 
+  /* iOS-Mythic ml250: Thread->OpDispatcher has been observed NULL here, faulting as
+   * `str xzr,[x0,#0x378]` with x0=0 inside IREmitter::ResetWorkingList and killing the
+   * process (unhandled c0000005, ml247 via chromehtml.dll -> tier0_s64).
+   *
+   * It is not a missing init: the faulting thread logged the FULL [TI-IC] sequence, so
+   * InitializeCompiler ran and created the OpDispatcher. That leaves a stale/foreign
+   * InternalThreadState -- the same class as #33, where a CEF child was wired to the wrong
+   * JIT-pool ntdll copy, and pseudo-processes get CLONED .data.
+   *
+   * The caller already handles an empty IRView ("OpDispatcher IR already released"), so
+   * bail cleanly instead of dereferencing NULL, and report enough state to identify whose
+   * thread object this is. */
+  if (!Thread || !Thread->OpDispatcher) {
+    static int NullN = 0;
+    if (NullN++ < 12) {
+      LogMan::Msg::EFmt("[ir-null] Thread={} OpDispatcher={} LookupCache={} FrontendDecoder={} "
+                        "CurrentFrame={} GuestRIP={:#x} -- bailing instead of faulting",
+                        static_cast<void*>(Thread),
+                        Thread ? static_cast<void*>(Thread->OpDispatcher.get()) : nullptr,
+                        Thread ? static_cast<void*>(Thread->LookupCache.get()) : nullptr,
+                        Thread ? static_cast<void*>(Thread->FrontendDecoder.get()) : nullptr,
+                        Thread ? static_cast<void*>(Thread->CurrentFrame) : nullptr, GuestRIP);
+    }
+    return {};
+  }
+
   Thread->OpDispatcher->ResetWorkingList();
 
   uint64_t TotalInstructions {0};

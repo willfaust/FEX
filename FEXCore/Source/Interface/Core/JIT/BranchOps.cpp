@@ -174,9 +174,28 @@ DEF_OP(ExitFunction) {
         // pointer in-range. Uses TMP1 as scratch; adr below re-initializes it.
         {
           ARMEmitter::ForwardLabel l_callret_ok;
+          /* iOS-Mythic ml263: the >>24 test only fires when the pointer leaves the
+           * ENTIRE 16MB region, so a large-but-in-range leak sails straight through.
+           * Measured on the CEF webhelper thread:
+           *   tid 0098 sp-base=0x2c8c40 -> 1.1MB pushed  (~36,000 nested calls)
+           *   tid 0078 sp-base=0x132900 -> 2.75MB pushed (~90,000 nested calls)
+           * while those threads' GUEST stacks had used only 2,264 and 10,008 bytes. 36,000
+           * nested calls cannot exist in 2.2KB of stack (every x86 CALL pushes >=8 bytes),
+           * so entries are pushed and never popped -- non-local exits (SEH unwind, C++
+           * throw) skip the guest RETs, and CEF init throws constantly.
+           *
+           * Bound it to a 4MB window CENTRED on DefaultLocation (base + 4MB): test
+           * (sp - (base + 2MB)) >> 22, so sp-base must stay in [2MB, 6MB). Caps pushes at
+           * ~131,072 entries (~65,536 nested calls), far beyond any real program.
+           *
+           * Resetting is SAFE, not a papering-over: this stack is purely a return-address
+           * PREDICTOR. A stale or missing entry fails the `sub TMP1, TMP1, RipReg` compare
+           * and falls through to the L1 lookup, which is always correct. A reset costs
+           * mispredictions, nothing else. */
           ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+          add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x200000);
           sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
-          lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 24);
+          lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 22);
           (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
           ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
           add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
@@ -232,9 +251,11 @@ DEF_OP(ExitFunction) {
       // site for rationale. Reset to DefaultLocation if OOB before ldp.
       {
         ARMEmitter::ForwardLabel l_callret_ok;
+        /* iOS-Mythic ml263: tightened to a 4MB window -- see the first CALL push site. */
         ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+        add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x200000);
         sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
-        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 24);
+        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 22);
         (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
         ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
         add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);
@@ -277,9 +298,11 @@ DEF_OP(ExitFunction) {
       // linked-path CALL push.
       {
         ARMEmitter::ForwardLabel l_callret_ok;
+        /* iOS-Mythic ml263: tightened to a 4MB window -- see the first CALL push site. */
         ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
+        add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x200000);
         sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
-        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 24);
+        lsr(ARMEmitter::Size::i64Bit, TMP1, TMP1, 22);
         (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_callret_ok);
         ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
         add(ARMEmitter::Size::i64Bit, REG_CALLRET_SP, REG_CALLRET_SP, 0x400000);

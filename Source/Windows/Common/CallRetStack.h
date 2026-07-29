@@ -47,6 +47,26 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
   // PAGE_NOACCESS on the guard pages, so the SEH-driven HandleAccessViolation
   // never fires — JIT code has to detect-and-reset proactively.
   Thread->CurrentFrame->State.callret_sp_base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
+
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml263: print the geometry ONCE per process. Two jobs:
+   * (1) a verifiable content marker for the JIT-side guard change in BranchOps.cpp
+   *     (an emitter constant leaves no string in the binary, so there is otherwise
+   *     nothing to grep in the installed bundle);
+   * (2) states the window the inline guard now enforces, so a [callret] dump in a
+   *     later crash can be read against it without re-deriving the arithmetic. */
+  {
+    static bool reported = false;
+    if (!reported) {
+      reported = true;
+      auto Info = GetInfoThread(Thread);
+      LogMan::Msg::EFmt("[callret-geom] base={:#x} default={:#x} size={:#x} "
+                        "guard-window=[base+0x200000, base+0x600000) grows-DOWN",
+                        reinterpret_cast<uint64_t>(Thread->CallRetStackBase), Info.DefaultLocation,
+                        FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    }
+  }
+#endif
 }
 
 void DestroyThread(FEXCore::Core::InternalThreadState* Thread) {

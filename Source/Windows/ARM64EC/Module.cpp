@@ -210,6 +210,42 @@ ThreadCPUArea GetCPUArea() {
 #endif
 }
 
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic ml259 PROBE (#44). The CEF thread (0098) executes FEX JIT with x28 == 0:
+ *   insn ldr x0,[x28,#0x658] faults with addr=0x658 -- the fault address IS the
+ *   immediate, so the base is null. x28 is the CpuStateFrame, i.e. EmulatorData[0].
+ *
+ * Three causes need three different fixes and must be told apart:
+ *   (a) ThreadInit never ran for this thread            -> no [ti-area] line for its tid
+ *   (b) it ran, then the area was clobbered             -> [ti-area] non-null, [no-state] null
+ *   (c) we are reading the WRONG CPU area               -> teb/area differ between the two
+ * (c) is a live risk on iOS because GetCPUArea() goes through IOSLoadTEB(), which
+ * falls back to NtCurrentTeb() (an x18 read) when TSD slot 275 is not yet populated --
+ * and x18 is clobbered by Apple runtime calls.
+ *
+ * Deliberately uses LogMan (which reaches mythic-log.txt, as [caspal128] proved) and
+ * NOT the WriteFile(hStdError) path the existing "ThreadInit() done" line uses -- that
+ * one has never once appeared in a log, so its silence means nothing. */
+static void IosLogCPUArea(const char* tag) {
+  uintptr_t tpidrro;
+  __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tpidrro));
+  void* tsd275 = *reinterpret_cast<void**>((tpidrro & ~uintptr_t(7)) + 0x898);
+  _TEB* teb = IOSLoadTEB();
+  auto* area = *reinterpret_cast<CHPE_V2_CPU_AREA_INFO**>(reinterpret_cast<uintptr_t>(teb) + ThreadCPUArea::TEBCPUAreaOffset);
+
+  LogMan::Msg::EFmt("[cpu-area] {} tid={:#x} teb={} tsd275={} x18teb={} area={} "
+                    "StateFrame(ED0)={} ThreadState(ED1)={} EnterEC={}",
+                    tag, (unsigned long long)GetCurrentThreadId(), (void*)teb, tsd275,
+                    (void*)NtCurrentTeb(), (void*)area,
+                    area ? (void*)area->EmulatorData[0] : nullptr,
+                    area ? (void*)area->EmulatorData[1] : nullptr,
+                    /* ml265: EnterEC is the dispatcher base. Needed to convert a faulting
+                     * pool PC into a dispatcher-relative offset, so it can be matched
+                     * against the documented emit layout (+0x160 / +0x184 / +0x264). */
+                    area ? (void*)area->EmulatorData[2] : nullptr);
+}
+#endif
+
 FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
   return static_cast<FrontendThreadData*>(Thread->FrontendPtr);
 }
@@ -1000,6 +1036,14 @@ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestConte
 
   const auto CPUArea = GetCPUArea();
   if (!CPUArea.ThreadState()) {
+#ifdef FEX_IOS_HOST
+    /* ml259 #44: this bail SILENTLY swallows the null-state case and returns
+     * STATUS_SUCCESS, so the fault escalates with no trace. Say so, capped. */
+    static int reported;
+    if (reported++ < 10) {
+      IosLogCPUArea("no-state-at-exception");
+    }
+#endif
     return STATUS_SUCCESS;
   }
 
@@ -1517,6 +1561,9 @@ NTSTATUS ThreadInit() {
 
   CPUArea.ThreadState() = Thread;
   CPUArea.Area->SuspendDoorbell = reinterpret_cast<ULONG*>(&Thread->CurrentFrame->SuspendDoorbell);
+#ifdef FEX_IOS_HOST
+  IosLogCPUArea("ThreadInit-done");
+#endif
 #ifdef FEX_IOS_HOST
   {
     HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
