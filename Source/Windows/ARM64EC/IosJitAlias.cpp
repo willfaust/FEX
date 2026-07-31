@@ -45,18 +45,62 @@ volatile int& g_EntryCount = IosAliasCount;
 
 extern "C" {
 
+// ml357: STALE ALIASES ARE FATAL, and the old de-dupe guaranteed them.
+//
+// The previous rule was "same PeBase = already registered, ignore" — so a DLL
+// that unloaded and was replaced at the same (or an overlapping) PE VA kept
+// FEX pointing at the ORIGINAL pool copy forever. That copy is tombstoned and
+// eventually reclaimed/zeroed, so every guest RIP in the new module translated
+// into dead memory: ml356 died executing a page of zeros (udf → c000001d) one
+// instruction after wevtapi.dll loaded INSIDE a departed module's old range.
+//
+// Wine's own table (ios_jit_add_mapping) already purges by OVERLAP for exactly
+// this reason; this is that rule's missing twin on the FEX side. Tombstone
+// order matches wine's: Size = 0 first (a zero-size entry matches no range
+// query, including Module.S's inline asm walk), barrier, then reuse the slot.
 void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
-  int idx = g_EntryCount;
-  // De-dupe: same PE base = already registered.
-  for (int i = 0; i < idx; i++) {
-    if (g_Entries[i].PeBase == PeBase) return;
+  int count = g_EntryCount;
+
+  // Identical re-registration: nothing to do.
+  for (int i = 0; i < count; i++) {
+    if (g_Entries[i].PeBase == PeBase && g_Entries[i].JitBase == JitBase && g_Entries[i].Size == Size) {
+      return;
+    }
   }
-  if (idx >= kMaxEntries) return;
-  g_Entries[idx].PeBase = PeBase;
-  g_Entries[idx].JitBase = JitBase;
-  g_Entries[idx].Size = Size;
+
+  // Retire every entry whose PE range overlaps the incoming image: a live
+  // image proves any overlapping entry is dead (two images cannot share a VA).
+  for (int i = 0; i < count; i++) {
+    const uint64_t pb = g_Entries[i].PeBase;
+    const uint64_t sz = g_Entries[i].Size;
+    if (!sz) {
+      continue;
+    }
+    if (pb < PeBase + Size && PeBase < pb + sz) {
+      g_Entries[i].Size = 0;
+      __sync_synchronize();
+    }
+  }
+
+  // Prefer a retired slot so long-running processes don't exhaust the table.
+  for (int i = 0; i < count; i++) {
+    if (!g_Entries[i].Size) {
+      g_Entries[i].PeBase = PeBase;
+      g_Entries[i].JitBase = JitBase;
+      __sync_synchronize();
+      g_Entries[i].Size = Size; // published last: readers see a complete entry
+      return;
+    }
+  }
+
+  if (count >= kMaxEntries) {
+    return;
+  }
+  g_Entries[count].PeBase = PeBase;
+  g_Entries[count].JitBase = JitBase;
+  g_Entries[count].Size = Size;
   __sync_synchronize();
-  g_EntryCount = idx + 1;
+  g_EntryCount = count + 1;
 }
 
 uint64_t IosJitTranslate(uint64_t Addr) {
