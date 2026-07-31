@@ -85,15 +85,18 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   }
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: explicitly memset PageMemory (L2) and L1 to 0. iOS demand-faults
-   * fresh pages with a 0x69 byte at the start of every iOS page (a kernel quirk
-   * we observed during JIT-pool dumps). If FEX's L2/L1 lookup hits one of those
-   * bytes via the page-shift arithmetic, cbz fails to fire and the dispatcher
-   * BRs to a nonzero stale pointer (= empty pool space → SIGILL). The memset
-   * touches every iOS page so we end up with zero-filled, fully-committed L2/L1. */
-  std::memset(reinterpret_cast<void*>(PageMemory),
-              0, ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8);
-  std::memset(reinterpret_cast<void*>(L1Pointer), 0, MAX_L1_SIZE);
+  /* iOS-Mythic: L2/L1 must start all-zero — nonzero stale bytes (the 0x69
+   * pattern observed during JIT-pool dumps, or recycled-arena content) make
+   * the dispatcher's cbz miss and BR to garbage. The original fix was two
+   * unconditional memsets, but those commit 32MB of private-dirty pages per
+   * guest thread — ~1.3GB at 40 threads (ml361 [phys-map]), against a 4096MB
+   * jetsam limit. ZeroScrub verifies by read (untouched anon pages map the
+   * shared zero page, no footprint) and memsets only stale pages. The stale
+   * counts double as the probe for whether the hazard still exists at all. */
+  size_t StaleL2 = FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(PageMemory),
+                                                 ctx->Config.VirtualMemSize / FEXCore::Utils::FEX_PAGE_SIZE * 8);
+  size_t StaleL1 = FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
+  LogMan::Msg::EFmt("[TI-IC] zero-scrub rev=ml362 l2-stale=0x{:x} l1-stale=0x{:x}", StaleL2, StaleL1);
 #endif
 }
 

@@ -354,6 +354,28 @@ namespace CPU {
   CodeBuffer::CodeBuffer(size_t Size)
     : AllocatedSize(Size) {
     Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+#ifdef FEX_IOS_HOST
+    /* iOS-Mythic ml364: exec allocations come from the finite JIT pool, and
+     * ml363 died exactly here — the pool was exhausted (bump 858/896MB,
+     * freelist 0), VirtualAlloc returned garbage/NULL with LOGMAN_THROW
+     * compiled out, and ClearCache scribbled the detection string through a
+     * wild pointer on Chrome's GPU thread. Degrade before dying: halve the
+     * request down to 1MB (freelist gaps often satisfy small carves), and if
+     * even that fails force a fault at a recognizable address so the honest-
+     * fault pipeline reports it instead of a random-looking wild write. */
+    while (!Ptr && Size > 0x100000) {
+      Size >>= 1;
+      Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+    }
+    if (Ptr && Size != AllocatedSize) {
+      LogMan::Msg::EFmt("[code-buffer] rev=ml364 exec alloc degraded 0x{:x} -> 0x{:x} (pool pressure)", AllocatedSize, Size);
+      AllocatedSize = Size;
+    }
+    if (!Ptr) {
+      LogMan::Msg::EFmt("[code-buffer] rev=ml364 EXEC ALLOC FAILED even at 0x{:x} — JIT pool exhausted; forcing honest fault at 0xdead", Size);
+      *reinterpret_cast<volatile uint64_t*>(0xdeadULL) = Size;
+    }
+#endif
     LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
     // Protect the last page of the allocated buffer to trigger SIGSEGV on write access

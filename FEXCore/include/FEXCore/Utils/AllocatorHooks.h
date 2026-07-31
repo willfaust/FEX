@@ -24,6 +24,7 @@
 #include <new>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <sys/types.h>
 
 namespace FEXCore::Allocator {
@@ -203,6 +204,38 @@ inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) 
 }
 
 #endif
+
+/* iOS-Mythic ml362: zero a region without dirtying pages that are already
+ * zero. The defensive full memsets added for stale-content bugs (LookupCache
+ * L2/L1, CallRetStack) each commit their whole range as private-dirty pages;
+ * at ~40 guest threads that is ~1.9GB of phys_footprint against the 4096MB
+ * jetsam limit (measured, ml361 [phys-map]). Reading an untouched anonymous
+ * page maps the shared zero page instead — no footprint — so verify by read
+ * and memset only pages that hold stale bytes. Returns the number of bytes
+ * actually scrubbed: a nonzero return is the proof the stale-content hazard
+ * is real for that allocation (and it was scrubbed); zero means the memset
+ * was pure footprint waste. */
+inline size_t ZeroScrub(void* Base, size_t Size) {
+  const size_t Page = 16384;
+  char* P = static_cast<char*>(Base);
+  size_t Scrubbed = 0;
+  for (size_t Off = 0; Off < Size; Off += Page) {
+    const size_t Chunk = (Size - Off < Page) ? (Size - Off) : Page;
+    const uint64_t* Q = reinterpret_cast<const uint64_t*>(P + Off);
+    bool Zero = true;
+    for (size_t i = 0; i < Chunk / 8; i++) {
+      if (Q[i]) {
+        Zero = false;
+        break;
+      }
+    }
+    if (!Zero) {
+      memset(P + Off, 0, Chunk);
+      Scrubbed += Chunk;
+    }
+  }
+  return Scrubbed;
+}
 
 // Memory allocation routines to be defined externally.
 // This allows to use jemalloc for emulation while using the normal allocator

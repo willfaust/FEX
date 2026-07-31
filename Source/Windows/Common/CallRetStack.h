@@ -61,9 +61,17 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
   /* iOS-Mythic: VirtualAlloc(MEM_COMMIT) on a previously-MEM_RESERVE'd
    * PAGE_NOACCESS region might not zero-initialize the pages on iOS. The
    * dispatcher uses callret_sp to BLR via stored values; uninit content
-   * (e.g. 0x55 poison from prior wine activity) would BLR to garbage. */
+   * (e.g. 0x55 poison from prior wine activity) would BLR to garbage.
+   * ml362: the unconditional memset committed the full 16MB as private-dirty
+   * per thread (~670MB at 40 threads, ml361 [phys-map] showed these regions
+   * fully dirty). ZeroScrub keeps the zero guarantee but only dirties pages
+   * that actually hold stale bytes; the stale count is the probe for whether
+   * wine's commit really hands back nonzero pages. */
 #ifdef FEX_IOS_HOST
-  memset(Thread->CallRetStackBase, 0, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+  {
+    size_t Stale = FEXCore::Allocator::ZeroScrub(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    LogMan::Msg::EFmt("[callret] zero-scrub rev=ml362 stale=0x{:x}", Stale);
+  }
 #endif
 
   Thread->CurrentFrame->State.callret_sp = GetInfoThread(Thread).DefaultLocation;

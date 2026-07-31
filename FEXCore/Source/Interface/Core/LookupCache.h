@@ -450,7 +450,22 @@ private:
   // Start with 8k entries in L1 to give 128KB of L1 cache to each thread.
   // Max out at 1 million entries to give each thread 16MB of L1 cache maximum.
   constexpr static size_t MIN_L1_ENTRIES = 8 * 1024;        // Must be a power of 2
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml363: cap the dynamic-L1 growth ceiling at 128K entries (2MB)
+   * instead of 1M (16MB). A hot thread's L1 inserts hash-scatter across the
+   * whole array, so a few thousand cached blocks dirty nearly every 16KB page
+   * of whatever the ceiling allows — ml362 [phys-map] measured ~29MB dirty
+   * per thread cache with ~40 guest threads ≈ 1GB against the 4096MB jetsam
+   * limit, even with construction memsets removed (zero-scrub stale=0 on all
+   * 42 threads). 2MB bounds that at ~80MB fleet-wide; hot threads fall back
+   * to L2 more often (hit rate was 77% at the 8K MINIMUM, so the ceiling cut
+   * is expected to cost little). Also shrinks each per-thread allocation by
+   * 14MB ([TI-IC] lookupcache-alloc size drops 0x6000000 → 0x5200000, which
+   * doubles as the deploy marker). */
+  constexpr static size_t MAX_L1_ENTRIES = 128 * 1024; // Must be a power of 2
+#else
   constexpr static size_t MAX_L1_ENTRIES = 1 * 1024 * 1024; // Must be a power of 2
+#endif
 
 #ifdef FEX_IOS_HOST
   /* iOS-Mythic: halve the per-thread block-backing arena — it's committed
