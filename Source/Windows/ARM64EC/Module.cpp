@@ -624,6 +624,22 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   Args->Context = StoreStateToPackedECContext(Thread, Context.Fpcr, Context.Fpsr);
   LogMan::Msg::DFmt("pc: {:X} rip: {:X}", Context.Pc, Args->Context.Pc);
 
+  // ml341: same gap as #52 but on the exception path — the reconstructed rip can be a
+  // module POOL-COPY alias (block metadata predating the CompileBlock redirect, or a
+  // branch target captured mid-lookup). Handing a pool-band rip to KiUserExceptionDispatcher
+  // makes the fault unresolvable for guest SEH (Steam's handlers see an address outside
+  // every module) and the process dies on an otherwise-survivable fault. Reverse-translate
+  // via the alias table (the only valid discriminator — never a band test).
+  {
+    const uint64_t PeRip = IosJitReverseTranslate(Args->Context.Pc);
+    if (PeRip != Args->Context.Pc) {
+      LogMan::Msg::EFmt("[exc-pool-rip] rev=ml341 reconstructed guest rip {:#x} is a POOL-COPY alias of PE {:#x} "
+                        "-- rewriting so guest SEH can resolve the faulting module",
+                        Args->Context.Pc, PeRip);
+      Args->Context.Pc = PeRip;
+    }
+  }
+
   // X64 Windows always clears TF, DF and AF when handling an exception, restoring after.
   // Current ARM64EC windows can only restore NZCV+SS when returning from an exception and other flags are left untouched from the handler context.
   // TODO: Can extend wine to support this by mapping the remaining EFlags into reserved cpsr members.
@@ -811,7 +827,7 @@ NTSTATUS ProcessInit() {
    * compile time, so changing only another .cpp leaves the stamp stale and the ambiguity
    * half-returns. The MYTHIC_REV tag below fixes that: bump it for every deploy, which
    * necessarily edits this file and so refreshes the timestamp too. Self-enforcing. */
-#define MYTHIC_REV "ml326-bandfix"
+#define MYTHIC_REV "ml341-excrip"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MYTHIC_REV " compiled " __DATE__ " " __TIME__);
 #endif
 
