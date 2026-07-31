@@ -22,8 +22,33 @@ CallRetStackInfo GetInfoThread(FEXCore::Core::InternalThreadState* Thread) {
 
 void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
   // Allocate the call-ret stack with guard pages on both sides
-  const void* CallRetStackAlloc = ::VirtualAlloc(nullptr, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE,
-                                                 MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
+  const size_t CallRetStackAllocSize = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
+  const void* CallRetStackAlloc = nullptr;
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml324: steer the call-ret stack out of the guest VA band.
+   *
+   * This calls ::VirtualAlloc directly rather than FEXCore::Allocator::VirtualAlloc,
+   * so ml321's steering missed it -- ml323 confirmed every other FEXMem_* region moved
+   * to 0x74xx while FEXMem_CallRetStacks stayed at 0x73dx, interleaved with guest
+   * allocations. This is the worst region to leave there: each 16-byte frame holds a
+   * HOST code label (the intra-block adr(&l_CallReturn)), so a guest over-read lands on
+   * exactly the kind of value that has been showing up as a bogus branch target
+   * ("loaded from guest memory", ml316). Same window and same fallback discipline as
+   * AllocatorHooks.h -- see the ml325 correction there for why the band must stay
+   * clear of [0x7400000000, 0x7c00000000) (CEF's four 16GB PartitionAlloc pools). */
+  {
+    MEM_ADDRESS_REQUIREMENTS AddrReq {};
+    MEM_EXTENDED_PARAMETER AddrParam {};
+    AddrReq.LowestStartingAddress = reinterpret_cast<void*>(0x7C00000000ULL);
+    AddrReq.HighestEndingAddress = reinterpret_cast<void*>(0x7FFFFFFFFFULL);
+    AddrParam.Type = MemExtendedParameterAddressRequirements;
+    AddrParam.Pointer = &AddrReq;
+    CallRetStackAlloc = ::VirtualAlloc2(nullptr, nullptr, CallRetStackAllocSize, MEM_RESERVE, PAGE_NOACCESS, &AddrParam, 1);
+  }
+#endif
+  if (!CallRetStackAlloc) {
+    CallRetStackAlloc = ::VirtualAlloc(nullptr, CallRetStackAllocSize, MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
+  }
 
   FEXCore::Allocator::VirtualName("FEXMem_CallRetStacks", CallRetStackAlloc,
                                   FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE);

@@ -58,6 +58,48 @@ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Co
   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
 #ifdef ARCHITECTURE_arm64ec
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml321: keep FEX's host structures OUT of the guest VA band.
+   *
+   * Every FEXMem_* region (Lookup/L1, BlockLinks, CallRetStacks, OpDispatcher,
+   * Frontend, ThreadState, ...) allocates through here, and by default wine's VA
+   * scanner places them in the same sub-ceiling band as guest allocations. ml308
+   * caught FEXMem_BlockLinks mapped DIRECTLY above a guest thread stack: a guest
+   * over-read there silently returns host JIT code labels instead of faulting,
+   * and ml316's webhelper died branching to exactly such a value ([iOS-bogusrip]
+   * band=FEX-CODE-BUFFER, "loaded from guest memory"). On Windows the space above
+   * a stack is a guard/unmapped region; here it was a table of host code pointers.
+   *
+   * Steer non-exec, any-address allocations into [0x7c00000000, 0x8000000000) --
+   * the band FEX's own jemalloc arenas already occupy, so it is host-only memory
+   * with no guest allocation in it.
+   *
+   * ml325 CORRECTION: the first cut used [0x7400000000, 0x7800000000), which broke
+   * CEF. PartitionAlloc reserves four 16GB jumbo pools and two of them land at
+   * 0x7400000000 / 0x77ffff0000; ~3.8GB of FEXMem reserves scattered through that
+   * window fragmented it, so only 2 of 4 pools were obtained ("jumbo fail" x23,
+   * ml320 got all four). The guest then hit STATUS_NO_MEMORY, ignored it, and
+   * dereferenced NULL -- run depth fell 48k -> 18k calls. Keep FEX out of
+   * [0x7400000000, 0x7c00000000): that whole span belongs to CEF's pools.
+   *
+   * On ANY failure fall through to the unconstrained path -- placement is a
+   * hardening, never a new fatal (#43).
+   * Exec allocations are excluded: EC_CODE buffers have their own JIT-pool
+   * steering that must keep control of placement. */
+  if (!Base && !Execute) {
+    MEM_ADDRESS_REQUIREMENTS AddrReq {};
+    MEM_EXTENDED_PARAMETER AddrParam {};
+    AddrReq.LowestStartingAddress = reinterpret_cast<void*>(0x7C00000000ULL);
+    AddrReq.HighestEndingAddress = reinterpret_cast<void*>(0x7FFFFFFFFFULL);
+    AddrParam.Type = MemExtendedParameterAddressRequirements;
+    AddrParam.Pointer = &AddrReq;
+    // No MEM_TOP_DOWN here: Windows rejects it in combination with address requirements.
+    void* Ret = ::VirtualAlloc2(nullptr, nullptr, Size, (Commit ? MEM_COMMIT : 0) | MEM_RESERVE, PAGE_READWRITE, &AddrParam, 1);
+    if (Ret) {
+      return Ret;
+    }
+  }
+#endif
   MEM_EXTENDED_PARAMETER Parameter {};
   if (Execute) {
     Parameter.Type = MemExtendedParameterAttributeFlags;

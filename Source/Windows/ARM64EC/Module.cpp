@@ -811,7 +811,7 @@ NTSTATUS ProcessInit() {
    * compile time, so changing only another .cpp leaves the stamp stale and the ambiguity
    * half-returns. The MYTHIC_REV tag below fixes that: bump it for every deploy, which
    * necessarily edits this file and so refreshes the timestamp too. Self-enforcing. */
-#define MYTHIC_REV "ml317-ffsxlate"
+#define MYTHIC_REV "ml326-bandfix"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MYTHIC_REV " compiled " __DATE__ " " __TIME__);
 #endif
 

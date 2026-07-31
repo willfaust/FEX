@@ -568,8 +568,38 @@ void Dispatcher::EmitDispatcher() {
     }
 
     PauseReturnInstruction = GetCursorAddress<uint64_t>();
+#ifdef FEX_IOS_HOST
+    /* iOS-Mythic ml325 -- THE #51 ROOT CAUSE.
+     *
+     * Upstream ends this block with hlt(0) and relies on the signal handler to notice
+     * Pc == PauseReturnInstruction and resume via RestoreThreadState(TYPE_PAUSE)
+     * (LinuxEmulation/SignalDelegator.cpp). That handler is Linux-only: the ARM64EC
+     * exception path in Source/Windows/ARM64EC/Module.cpp never references
+     * PauseReturnInstruction, because on real Windows this block is unreachable
+     * (suspension goes through the SuspendDoorbell / ExitFunctionSuspendPoint brk).
+     * On iOS we DO reach it -- ml324 counted 269 arrivals in one webhelper run.
+     *
+     * With no handler, the hlt raises c000001d and execution resumes at pc+4, which is
+     * the very next emitted byte: CallbackPtr's prologue. That is the entire "#51
+     * ReentrantCallback" mystery -- CallbackPtr was never CALLED, it was FALLEN INTO.
+     * The registers it captures are leftovers, which is why x0(Frame) was NULL, LR was
+     * garbage or 0, and x1 carried an arbitrary host-heap arena address -- and that
+     * address then became State.rip and produced the recurring
+     * [iOS-bogusrip] band=host-heap(0x7c-0x7f) GuestRIP=<arena>+0x0?0080 reports.
+     * ml323/ml324 tie the two together directly: the same 0x7ea00f0080 appears as the
+     * bogus GuestRIP and as x1 at the phantom callback entry.
+     *
+     * SleepThread has returned, so the correct action is simply to resume guest
+     * execution. Static registers were spilled by ThreadPauseHandlerAddressSpillSRA
+     * above, so re-enter through the FillSRA loop top: it refills them and dispatches
+     * to State.rip -- exactly "start running again", with no fault round trip.
+     * PauseReturnInstruction is still published so a future handler can match it. */
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, AbsoluteLoopTopAddressFillSRA);
+    br(TMP1);
+#else
     // Fault to start running again
     hlt(0);
+#endif
   }
 
   {
