@@ -9,9 +9,11 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/Telemetry.h>
 #include <FEXCore/Utils/ArchHelpers/Arm64.h>
+#include <FEXCore/Utils/DualMap.h>
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 
 namespace FEXCore::ArchHelpers::Arm64 {
 constexpr uint32_t CASPAL_MASK = 0xBF'E0'FC'00;
@@ -335,6 +337,77 @@ static __uint128_t DoLoad128(uint64_t Addr) {
   return Result;
 }
 
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic ml275: route an emulated ATOMIC to the JIT pool's WRITABLE alias.
+ *
+ * Guest PE images are COPIED into the JIT pool so they can execute, and the copy
+ * includes their .data. The pool's execute alias is mapped READ|EXECUTE with no write
+ * bit, so a guest that atomically updates one of its own globals lands a STORE on a
+ * non-writable page. Plain stores already survive this -- the Mach STR/STLR emulator
+ * redirects RX-alias stores to the RW alias -- but the atomic helpers were never taught
+ * the same trick, so they re-issue the CAS at the RX address and fault again inside
+ * themselves. Measured in ml275 (webhelper thread, 60 consecutive faults, sole blocker
+ * of that run):
+ *   [atomic-mem] addr=0x15261beb0 JIT-POOL-RX (dual-mapped) pooloff=0x3621beb0
+ *                region=0x152618000+0x4000 prot=5 max=7 share_mode=5 user_tag=0
+ *   BUS: unhandled store insn=0x4866fe6a (CASPAL) x57, plus CAS 32/64 at the same addr
+ * prot=5 is READ|EXECUTE -- no WRITE bit. The 0x80000002
+ * (STATUS_DATATYPE_MISALIGNMENT) label was a red herring; the address is 16-byte
+ * aligned. An exclusive store to a non-writable aliased page reports as SIGBUS.
+ *
+ * SELF-VALIDATING BY CONSTRUCTION: redirect only when the target is genuinely
+ * non-writable AND target+WriteOffset genuinely IS writable. If either check fails the
+ * address is returned untouched, so behaviour outside this exact situation cannot
+ * change. Both aliases map the same physical memory, and ARM64 exclusive monitors track
+ * physical addresses, so the atomic stays correct through either view. Cost is one
+ * VirtualQuery on an already-faulted slow path, never on the fast path. */
+static uint64_t IosAtomicWritableAlias(uint64_t Addr) {
+  const int64_t WriteOffset = FEXCore::DualMap::WriteOffset;
+  if (!WriteOffset || !Addr) {
+    return Addr;
+  }
+
+  /* ml276 CORRECTION: the first version used VirtualQuery to decide whether Addr was
+   * writable. That CANNOT work here -- VirtualQuery reports WINE's view, and Wine has no
+   * view of the JIT pool at all (pool addresses come back MEM_RESERVE/PAGE_NOACCESS with
+   * AllocationBase=0). So the `State != MEM_COMMIT` guard bailed on the very first check
+   * every single time: [atomic-alias] logged 0 and the fault counts were byte-identical
+   * to the previous run (60/60/10). Same trap that made [guest-rip] report
+   * "NOT COMMITTED" for pool addresses.
+   *
+   * Use the pool bounds instead, from the SAME env vars ProcessInit uses to compute
+   * WriteOffset (WINE_IOS_JIT_RX / WINE_IOS_JIT_SIZE, published by ContentView.swift and
+   * forwarded because they are WINE-prefixed). Read once. */
+  static uint64_t RxBase = 0;
+  static uint64_t RxSize = 0;
+  static bool Probed = false;
+  if (!Probed) {
+    Probed = true;
+    const char* RxEnv = getenv("WINE_IOS_JIT_RX");
+    const char* SzEnv = getenv("WINE_IOS_JIT_SIZE");
+    RxBase = RxEnv ? strtoull(RxEnv, nullptr, 16) : 0;
+    RxSize = SzEnv ? strtoull(SzEnv, nullptr, 16) : 0;
+  }
+  if (!RxBase || !RxSize) {
+    return Addr;
+  }
+  if (Addr < RxBase || Addr >= RxBase + RxSize) {
+    return Addr; // not the pool's execute alias -- leave it alone
+  }
+
+  /* Inside the pool's RX alias. The RW alias maps the same physical memory, and ARM64
+   * exclusive monitors track physical addresses, so performing the atomic through the
+   * writable view is equivalent and is the only view that can accept a store. */
+  const uint64_t Alias = static_cast<uint64_t>(static_cast<int64_t>(Addr) + WriteOffset);
+  static int reported = 0;
+  if (reported++ < 8) {
+    LogMan::Msg::EFmt("[atomic-alias] atomic on pool RX {:#x} (pooloff {:#x}) -> RW alias {:#x}", Addr,
+                      Addr - RxBase, Alias);
+  }
+  return Alias;
+}
+#endif
+
 static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint32_t DesiredReg2, uint32_t ExpectedReg1,
                       uint32_t ExpectedReg2, uint32_t AddressReg, uint32_t* StrictSplitLockMutex) {
 
@@ -342,6 +415,9 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
   if (Size == 0) {
     // 32bit
     uint64_t Addr = GPRs[AddressReg];
+#ifdef FEX_IOS_HOST
+    Addr = IosAtomicWritableAlias(Addr);
+#endif
 
     // Lower register must be even, so only upper register can be 31.
     uint32_t DesiredLower = GPRs[DesiredReg1];
@@ -526,6 +602,9 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
     // run: CASPAL x6,x7, x4,x5, [x11] (Instruction 0x4866fd64), reported aligned
     // (misalign=0, crosses16B=no) -- so nothing exotic, simply unimplemented.
     uint64_t Addr = GPRs[AddressReg];
+#ifdef FEX_IOS_HOST
+    Addr = IosAtomicWritableAlias(Addr);
+#endif
 
     // Lower register must be even, so only the upper register can be 31.
     uint64_t DesiredLower = GPRs[DesiredReg1];
@@ -1445,7 +1524,11 @@ static std::optional<uint64_t> DoCAS(uint32_t Size, uint64_t Desired, uint64_t E
 static bool RunCASAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg, uint32_t ExpectedReg, uint32_t AddressReg, uint32_t* StrictSplitLockMutex) {
   uint64_t Desired = DesiredReg == 31 ? 0 : GPRs[DesiredReg];
   uint64_t Expected = ExpectedReg == 31 ? 0 : GPRs[ExpectedReg];
+#ifdef FEX_IOS_HOST
+  std::optional<uint64_t> Res = DoCAS(Size, Desired, Expected, IosAtomicWritableAlias(GPRs[AddressReg]), StrictSplitLockMutex);
+#else
   std::optional<uint64_t> Res = DoCAS(Size, Desired, Expected, GPRs[AddressReg], StrictSplitLockMutex);
+#endif
   if (!Res.has_value()) {
     return false;
   }
@@ -1474,6 +1557,9 @@ static bool HandleAtomicMemOp(uint32_t Instr, uint64_t* GPRs, uint32_t* StrictSp
   uint32_t AddressReg = (Instr >> 5) & 0b11111;
 
   uint64_t Addr = GPRs[AddressReg];
+#ifdef FEX_IOS_HOST
+  Addr = IosAtomicWritableAlias(Addr);   /* ml275: see IosAtomicWritableAlias */
+#endif
 
   uint8_t Op = (Instr >> 12) & 0xF;
 
@@ -1665,6 +1751,9 @@ static bool HandleAtomicStore(uint32_t Instr, uint64_t* GPRs, int64_t Offset, ui
   uint32_t AddressReg = (Instr >> 5) & 0b11111;
 
   uint64_t Addr = GPRs[AddressReg] + Offset;
+#ifdef FEX_IOS_HOST
+  Addr = IosAtomicWritableAlias(Addr);   /* ml275: see IosAtomicWritableAlias */
+#endif
 
   constexpr bool DoRetry = false;
   uint64_t Data = DataReg == 31 ? 0 : GPRs[DataReg];
@@ -1806,6 +1895,9 @@ static uint64_t HandleAtomicLoadstoreExclusive(uintptr_t ProgramCounter, uint64_
   uint32_t ResultReg = GetRdReg(Instr);
   uint32_t AddressReg = GetRnReg(Instr);
   uint64_t Addr = GPRs[AddressReg];
+#ifdef FEX_IOS_HOST
+  Addr = IosAtomicWritableAlias(Addr);   /* ml275: see IosAtomicWritableAlias */
+#endif
 
   size_t NumInstructionsToSkip = 0;
 

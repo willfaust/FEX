@@ -69,6 +69,12 @@ $end_info$
  * PE images are copied into the JIT pool. */
 extern "C" uint64_t IosJitTranslate(uint64_t Addr);
 extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
+/* ml316: FFS-bypass diagnostics, written by ExitToX64's bypass path in Module.S:
+ * [0] = native short-circuits taken, [1] = last EC target,
+ * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
+ * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
+extern "C" uint64_t IosFfsBypassLog[4];
+uint64_t IosFfsBypassLog[4] {};
 #endif // FEX_IOS_HOST
 
 namespace Exception {
@@ -772,6 +778,42 @@ NTSTATUS ProcessInit() {
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml278: announce the atomic-alias geometry UNCONDITIONALLY, AFTER
+   * Logging::Init().
+   *
+   * The first cut put this line inside IosAtomicWritableAlias (Arm64.cpp), on its first
+   * call -- so it could only ever appear if the situation it exists to report had already
+   * occurred. ml277 then logged nothing at all, and "the fix works" was indistinguishable
+   * from "the helper was never called" and from "the env vars never arrived". A liveness
+   * marker that depends on the event it measures is useless; print it at init. */
+  {
+    const char* RxEnv = getenv("WINE_IOS_JIT_RX");
+    const char* SzEnv = getenv("WINE_IOS_JIT_SIZE");
+    const char* RwEnv = getenv("WINE_IOS_JIT_RW");
+    LogMan::Msg::EFmt("[atomic-alias] LIVE: WINE_IOS_JIT_RX={} SIZE={} RW={} -- atomics whose "
+                      "target lands in the pool's RX alias get redirected to RX+WriteOffset",
+                      RxEnv ? RxEnv : "<unset>", SzEnv ? SzEnv : "<unset>", RwEnv ? RwEnv : "<unset>");
+  }
+
+  /* iOS-Mythic ml293: UNCONDITIONAL BUILD IDENTITY.
+   *
+   * ml292 could only be attributed to a build by comparing the log's wall-clock start
+   * against the install time, because every other marker in the binary is printed from
+   * inside the very code path under test -- so "marker absent" meant either "old build"
+   * or "new build, event did not fire", with no way to tell them apart. That is the same
+   * defect as the [atomic-alias] note above, one level up.
+   *
+   * __DATE__/__TIME__ are baked at compile time and this line is printed before any guest
+   * code runs. Grep it first in every pull.
+   *
+   * CAVEAT found immediately (ml294): __DATE__/__TIME__ stamp THIS translation unit's
+   * compile time, so changing only another .cpp leaves the stamp stale and the ambiguity
+   * half-returns. The MYTHIC_REV tag below fixes that: bump it for every deploy, which
+   * necessarily edits this file and so refreshes the timestamp too. Self-enforcing. */
+#define MYTHIC_REV "ml317-ffsxlate"
+  LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MYTHIC_REV " compiled " __DATE__ " " __TIME__);
+#endif
 
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");
 

@@ -2,6 +2,7 @@
 #include <FEXCore/fextl/fmt.h>
 #include <FEXCore/Utils/LogManager.h>
 
+#include <atomic>
 #include <cstdint>
 #include <windef.h>
 #include <winbase.h>
@@ -218,9 +219,32 @@ void VirtualTHPControl(const void* Ptr, size_t Size, FEXCore::Allocator::THPCont
 
 void VirtualName(const char* Name, const void* Ptr, size_t Size) {
 #ifdef FEX_IOS_HOST
-  (void)Name;
-  (void)Ptr;
-  (void)Size;
+  /* iOS-Mythic ml294 (task #51): PUBLISH FEX'S OWN NAME FOR EVERY HOST ALLOCATION.
+   *
+   * The prctl/unixlib naming below is meaningless on iOS, so this was a pure no-op --
+   * which meant FEX already knew the identity of every region it allocates and we were
+   * throwing that away.
+   *
+   * ml293 established that the recurring bogus guest RIP (<arena>+0xd0080/0xe0080/0xf0080)
+   * lands inside FEX's OWN 512MB host reservations, not Chromium's heap: all 23 [bigres]
+   * requests carry guest rsp=0/rip=0 (no guest context), two per thread, issued at FEX
+   * thread init. ml283 independently showed x28 (the CpuStateFrame pointer) = 0x7c20001140,
+   * i.e. a ThreadState living in one of those same arenas.
+   *
+   * So the question is no longer "what heap is this" but "WHICH FEX STRUCTURE". FEX names
+   * them itself -- FEXMem_ThreadState, FEXMem_Lookup, FEXMem_Lookup_L1, FEXMem_CallRetStacks,
+   * FEXMemJIT, FEXMem_Misc, FEXMem -- so emit name+range and the bogus RIP can be matched to
+   * a named structure offline, with no further device runs.
+   *
+   * This replaces a no-op, so it cannot change behaviour. Capped so a per-thread allocation
+   * pattern cannot storm the log. */
+  {
+    static std::atomic<uint32_t> NameCount {0};
+    if (NameCount.fetch_add(1) < 256) {
+      LogMan::Msg::EFmt("[vname] {} {:#x}..{:#x} size={:#x}", Name ? Name : "<null>", reinterpret_cast<uintptr_t>(Ptr),
+                        reinterpret_cast<uintptr_t>(Ptr) + Size, Size);
+    }
+  }
   return;
 #endif
   if (!SupportsVirtualName) {

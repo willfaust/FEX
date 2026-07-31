@@ -64,6 +64,23 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
                         "guard-window=[base+0x200000, base+0x600000) grows-DOWN",
                         reinterpret_cast<uint64_t>(Thread->CallRetStackBase), Info.DefaultLocation,
                         FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+      /* iOS-Mythic ml271: print the REAL CpuStateFrame offsets once.
+       *
+       * The ntdll-unix side reads these fields out of x28 in signal handlers using
+       * hand-derived constants, and ml271 showed why that is unsafe: [rsp-forensics]
+       * reported gregs[RSP]=0 using a GUESSED 0x28, when RSP is gregs[4] (0x20 into
+       * gregs) and gregs itself is not at 0. A wrong offset reads a neighbouring field
+       * and invents a bug. Emit the authoritative values so the unix-side probes can be
+       * checked against them instead of re-derived by hand. */
+      LogMan::Msg::EFmt("[state-offsets] rip={:#x} gregs={:#x} gregs[RSP]={:#x} "
+                        "callret_sp={:#x} callret_sp_base={:#x} flags={:#x} sizeof(CPUState)={:#x}",
+                        offsetof(FEXCore::Core::CpuStateFrame, State.rip),
+                        offsetof(FEXCore::Core::CpuStateFrame, State.gregs),
+                        offsetof(FEXCore::Core::CpuStateFrame, State.gregs[FEXCore::X86State::REG_RSP]),
+                        offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp),
+                        offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base),
+                        offsetof(FEXCore::Core::CpuStateFrame, State.flags),
+                        sizeof(FEXCore::Core::CPUState));
     }
   }
 #endif

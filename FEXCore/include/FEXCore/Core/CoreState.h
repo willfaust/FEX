@@ -438,6 +438,50 @@ struct CpuStateFrame {
 
   // Pointers that the JIT needs to load to remove relocations
   JITPointers Pointers;
+
+  /* iOS-Mythic ml299 (task #52): witness slot for the EnterEC State.rip store.
+   *
+   * Three code paths write State.rip -- BranchOps' L1-miss store, the JITCallback store, and
+   * AbsoluteLoopTopAddressEnterEC's `str(EC_CALL_CHECKER_PC_REG, State.rip)`. ml298 gathered strong
+   * circumstantial evidence for the third (the leaked value is a host PC 0x12b4 into the CURRENT
+   * JIT block, i.e. shaped like a return address, and is in no guest GPR) but never OBSERVED the
+   * store, and upstream's own logic implies EnterEC targets should be guest RIPs -- so the
+   * attribution is still an inference. Three theories have already had to be retracted on this bug
+   * by reasoning past the evidence.
+   *
+   * EnterEC additionally mirrors the value here, so the bogus-RIP probe can compare and say
+   * outright whether EnterEC wrote the value it later choked on. Appended AFTER Pointers so every
+   * offset the ntdll-side probes hardcode (all inside State) is unchanged. */
+  uint64_t IosLastEnterECRip {};
+
+  /* iOS-Mythic ml302 (task #51): second witness, completing the 3-way discriminator.
+   *
+   * ml301 ran with the corrected (narrow) gate and produced exactly one hit -- the host-heap
+   * variant, GuestRIP=0x7e600f0080 -- with the verdict NOT EnterEC (IosLastEnterECRip=0x73899eb34a,
+   * a legitimate guest address, so EnterEC was behaving). That eliminates EnterEC for #51 and
+   * leaves two writers: BranchOps' L1-miss `str(RipReg, State.rip)` and the JITCallback prologue's
+   * `str(x1, State.rip)`.
+   *
+   * JITCallback mirrors its RIP argument here, so the three cases separate cleanly:
+   *   IosLastEnterECRip   == GuestRIP -> EnterEC
+   *   IosLastCallbackRip  == GuestRIP -> JITCallback (a host->guest callback given a host address)
+   *   neither                          -> BranchOps' L1-miss store, by elimination
+   * Appended after IosLastEnterECRip, still past Pointers, so no hardcoded offset moves. */
+  uint64_t IosLastCallbackRip {};
+
+  /* iOS-Mythic ml303 (task #51): HOW did control reach CallbackPtr at all?
+   *
+   * ml302 proved via IosLastCallbackRip that the JITCallback prologue's str(x1, State.rip) is what
+   * writes the bad value. But on ARM64EC that code should be UNREACHABLE: ExecuteJITCallback is only
+   * invoked from ContextImpl::HandleCallback, whose sole caller is LinuxEmulation/Thunks.cpp (not
+   * built for this target), and the emitted code immediately preceding CallbackPtr ends in hlt(0),
+   * so it cannot be entered by fall-through either.
+   *
+   * So something BRANCHES there. Capturing x30 on entry names the branch site: if the entry came
+   * from a blr, LR points just past it, and [disp-addrs] plus the pool/module maps can attribute it
+   * offline. That makes the real bug "the dispatcher is being entered at the wrong address", of
+   * which the State.rip corruption is only the visible consequence. */
+  uint64_t IosLastCallbackLR {};
 };
 static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
 static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");

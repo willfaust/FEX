@@ -267,7 +267,40 @@ DEF_OP(ExitFunction) {
       str(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
 #endif
       sub(TMP1, TMP1, RipReg.X());
+#ifdef FEX_IOS_HOST
+      /* iOS-Mythic ml305 (tasks #42 / #51 / #52): DO NOT TRUST THE CALL-RET PREDICTION ON iOS.
+       *
+       * Taking this shortcut means `br TMP2`, where TMP2 is the HOST half of the popped entry -- an
+       * intra-block `adr(&l_CallReturn)` label recorded by the CALL push above. That is only safe if
+       * the popped entry actually belongs to this return. Upstream can assume it does because an
+       * unbalanced stack eventually walks into a guard page and CallRetStack::HandleAccessViolation
+       * resets it. On iOS that SEGV NEVER FIRES -- Wine's VirtualAlloc(MEM_RESERVE, PAGE_NOACCESS)
+       * does not enforce NOACCESS here, which is the whole reason the inline bounds-guard above
+       * exists -- so stale entries accumulate without bound inside the guard window and a RET can
+       * pop an entry belonging to an unrelated, long-abandoned call.
+       *
+       * When such a stale entry's guest_ret COINCIDENTALLY equals the real return address, the cbz
+       * fires and we branch into the middle of a DIFFERENT block at its l_CallReturn label, with
+       * this block's register state. Measured evidence for exactly that:
+       *   ml304  GuestRIP 0x1561b540c, InlineJITBlockHeader 0x1561b53e0  -> host PC +0x2c into block
+       *   ml298  GuestRIP 0x15621c354, InlineJITBlockHeader 0x15621b0a0  -> host PC +0x12b4 into block
+       * both in FEX's own EC_CODE tail, both absent from every guest GPR ([bogus-regs]), and with
+       * 79,880 leaked entries live (sp-base 2.78MB, inside [2MB,6MB) so the guard stayed silent).
+       *
+       * Dropping the shortcut is SEMANTICALLY SAFE by this file's own reasoning: the call-ret stack
+       * is "purely a return-address PREDICTOR", and "a stale or missing entry fails the compare and
+       * falls through to the L1 lookup, which is always correct". We keep the ldp POP and the
+       * State.callret_sp writeback so stack balance is completely unchanged -- only the act of
+       * trusting TMP2 goes away. Cost is a mispredict per guest RET (an L1 lookup instead of a
+       * direct branch), so this is a real throughput hit worth measuring on Thumper.
+       *
+       * A/B either way: if the [iOS-bogusrip] hits disappear, the predictor was the source and this
+       * becomes the fix; if they persist unchanged, the predictor is exonerated and a large suspect
+       * is eliminated for one run. */
+      (void)SkipFullLookup;
+#else
       (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &SkipFullLookup);
+#endif
     }
 
     // L1 Cache

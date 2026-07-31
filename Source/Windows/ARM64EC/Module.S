@@ -47,6 +47,110 @@ check_target_ec:
   // Expects target code address in x9, and to be called using a 'blr x16' instruction.
 .globl ExitToX64
 ExitToX64:
+#ifdef FEX_IOS_HOST
+  // iOS ml316 FFS BYPASS (root cause of the ml315 SCM-RPC ccontext=0x10 kill).
+  //
+  // When wine's __os_arm64x_check_call cannot classify a target (task #40: the x18 fix
+  // that would let it is A/B-proven to break CEF), a native EC caller's call to an EC
+  // function gets routed through clang's $iexit_thunk$cdecl$...$varargs with x9 = the
+  // target's x64 fast-forward sequence. That thunk builds NO x64 frame -- it just does
+  // `stp x4, x5, [sp, #0x20]` and calls here. After our `str lr, [sp,#-8]!` the guest
+  // frame reads [RSP+0x28]=saved x4, [RSP+0x30]=saved x5 -- so when the FFS jmp lands
+  // back in EC code and the varargs ENTRY thunk hands those to the callee as its stack
+  // arguments, a variadic EC callee receives (x4, x5) VERBATIM instead of the real
+  // args. ml315 measured exactly that: NdrClientCall2's param2 = the caller's
+  // stack-args pointer, param3 = 0x10 = x5 the size -- which became the "context
+  // handle" the SCM RPC then dereferenced.
+  //
+  // Real Windows never takes this round trip: check_call pattern-matches the FFS and
+  // returns the underlying EC target for a direct native call. Do that here instead --
+  // the one transition point we fully control. If x9 is the canonical 14-byte FFS
+  //   48 8b c4  mov rax, rsp
+  //   48 89 58 20  mov [rax+0x20], rbx
+  //   55 5d     push rbp; pop rbp
+  //   e9 rel32  jmp target
+  // (byte-identical in every wine-built EC DLL: rpcrt4/sechost dumps verified) and the
+  // jmp target is EC code per the bitmap, branch to it natively. x4/x5 flow through
+  // untouched and the exit thunk becomes a transparent pass-through; the EC callee
+  // rets to lr = the exit thunk's continuation. Non-FFS or non-EC targets fall
+  // through to normal emulation with every register intact.
+  //
+  // Scratch: x16/x17 (IP0/IP1, dead at any call boundary) + x23 -- safe for the same
+  // reason ExitFunctionEC already clobbers it: EnterEC rebuilds the RSP SRA register
+  // from the native sp on every JIT entry. The `br` targets the PE VA; the Mach
+  // exec-fault redirect translates it to the pool copy (proven ~33us path, and this
+  // is RPC-call frequency, not per-frame).
+  ldr x16, [x9]
+  movz x17, #0x8b48
+  movk x17, #0x48c4, lsl #16
+  movk x17, #0x5889, lsl #32
+  movk x17, #0x5520, lsl #48
+  cmp x16, x17
+  b.ne ios_ffs_no_bypass
+  ldrh w16, [x9, #8]
+  movz w17, #0xe95d
+  cmp w16, w17
+  b.ne ios_ffs_no_bypass
+  ldursw x16, [x9, #10]  // jmp rel32 (signed)
+  add x17, x9, x16
+  add x17, x17, #14      // raw target = FFS base + 14 + rel32
+  // ml316b: x9 (and thus the raw target) is usually the POOL-COPY alias -- wine
+  // installs pool aliases into the dispatch slots and IATs so native code can
+  // call them, and the copy is byte-identical so the pattern still matches.
+  // The EC bitmap only covers PE-space VAs (the #52 lesson all over again), so
+  // reverse-translate the target through IosAliasEntries BEFORE consulting it.
+  // x4/x9 are spilled to free loop registers; restored on every exit path.
+  // (Native EC callers keep sp 16-aligned at call boundaries per AAPCS.)
+  stp x4, x9, [sp, #-16]!
+  adrp x16, IosAliasEntries
+  add x16, x16, #:lo12:IosAliasEntries
+  adrp x9, IosAliasCount
+  ldr w9, [x9, #:lo12:IosAliasCount]
+ios_ffs_xlate_loop:
+  cbz w9, ios_ffs_xlate_done
+  ldr x4, [x16, #8]      // Entry.JitBase
+  sub x4, x17, x4
+  ldr x23, [x16, #16]    // Entry.Size
+  cmp x4, x23
+  b.lo ios_ffs_xlate_hit
+  add x16, x16, #32
+  sub w9, w9, #1
+  b ios_ffs_xlate_loop
+ios_ffs_xlate_hit:
+  ldr x23, [x16]         // Entry.PeBase
+  add x17, x23, x4       // target in PE space
+ios_ffs_xlate_done:
+  IOS_LOAD_TEB x16
+  ldr x16, [x16, #0x60]  // TEB->PEB
+  ldr x16, [x16, #0x368] // PEB->EcCodeBitMap
+  cbz x16, ios_ffs_reject
+  lsr x23, x17, #18
+  ldr x16, [x16, x23, lsl #3]
+  lsr x23, x17, #12
+  lsr x16, x16, x23
+  tbz x16, #0, ios_ffs_reject
+  ldp x4, x9, [sp], #16
+  adrp x16, IosFfsBypassLog
+  add x16, x16, #:lo12:IosFfsBypassLog
+  ldr x23, [x16]
+  add x23, x23, #1
+  str x23, [x16]         // [0] = bypass count (diagnostic, read by Core.cpp reporter)
+  str x17, [x16, #8]     // [1] = last EC target taken natively
+  br x17                 // PE VA; the Mach exec-fault redirect maps it to the pool copy
+ios_ffs_reject:
+  // Pattern matched but the (PE-space) target is not EC per the bitmap: fall
+  // through to normal emulation -- correct for genuine x64 jmp targets -- but
+  // COUNT it, so a run with zero bypasses is distinguishable from one where the
+  // probe never fired at all (ml316's silent miss must not repeat).
+  ldp x4, x9, [sp], #16
+  adrp x16, IosFfsBypassLog
+  add x16, x16, #:lo12:IosFfsBypassLog
+  ldr x23, [x16, #16]
+  add x23, x23, #1
+  str x23, [x16, #16]    // [2] = matched-but-rejected count
+  str x17, [x16, #24]    // [3] = last rejected (PE-space) target
+ios_ffs_no_bypass:
+#endif
   str lr, [sp, #-8]! // Push return address to stack, this will be popped by the x86 RET instr.
 
 enter_jit:

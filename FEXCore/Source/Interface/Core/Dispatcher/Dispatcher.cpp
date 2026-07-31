@@ -63,6 +63,17 @@ Dispatcher::~Dispatcher() {
   }
 }
 
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic ml306 (task #51): entry-state capture buffer for the CallbackPtr block.
+ * Layout: [0]=x0 [1]=x1 [2]=x16 [3]=x17 [4]=x30 [5]=sp [6]=entry count [7]=spare.
+ * Written by emitted code at CallbackPtr entry via a materialised constant address, so the
+ * capture works even when x0 is not a valid CpuStateFrame. Read by CompileBlock's [cb-entry]
+ * reporter in Core.cpp. Process-global and racy by design -- last entry wins; the counter says
+ * whether ANY entry happened, which is the primary question. */
+extern "C" uint64_t IosCbEntryLog[8];
+uint64_t IosCbEntryLog[8] {};
+#endif
+
 void Dispatcher::EmitDispatcher() {
   // Don't modify TMP3 since it contains our RIP once the block doesn't exist
   auto RipReg = TMP3;
@@ -142,6 +153,14 @@ void Dispatcher::EmitDispatcher() {
   // Load ThreadState and write the target PC there
   ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
   str(EC_CALL_CHECKER_PC_REG, STATE_PTR(CpuStateFrame, State.rip));
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml299 (task #52): witness the value this path writes into State.rip.
+   * One extra store, per-thread, no branch -- see CoreState.h IosLastEnterECRip. If a later
+   * [iOS-bogusrip] reports the same value, EnterEC is PROVEN to be the writer; if it reports a
+   * different one, the leak is in BranchOps' L1-miss store or the JITCallback store instead and
+   * the ml298 inference was wrong. */
+  str(EC_CALL_CHECKER_PC_REG, STATE_PTR(CpuStateFrame, IosLastEnterECRip));
+#endif
 
   // Swap stacks to the emulator stack
   ldr(TMP1, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_STACK_BASE_OFFSET);
@@ -574,8 +593,46 @@ void Dispatcher::EmitDispatcher() {
     // We expect the thunk to have previously pushed the registers it was using
     PushCalleeSavedRegisters();
 
+#ifdef FEX_IOS_HOST
+    /* iOS-Mythic ml306 (task #51): full entry-state capture into a STATIC buffer.
+     *
+     * ml302/ml306 proved this prologue's str(x1, State.rip) writes the recurring bad guest RIP
+     * (IosLastCallbackRip == GuestRIP, 2/2 host-heap-band hits), and the ml303 LR witness came
+     * back LR=0 -- so the block is entered by a plain `br` with no link register, and the
+     * "LR names the branch site" plan is dead. Worse, the ml303/ml304 [cb-entry] gate keyed on
+     * LR != 0, so LR=0 entries were invisible to it -- the very case that occurs.
+     *
+     * This capture fixes both flaws: it records x0/x1/x16/x17/x30/sp plus a counter into a
+     * static buffer whose address is materialised as a constant, so it works even if x0 is NOT
+     * a valid frame (an errant entry is exactly when it might not be), and counts every entry
+     * regardless of LR. x19/x20 are safe scratch here: PushCalleeSavedRegisters just saved them
+     * and the mov(STATE, x0) below re-establishes the only register contract that matters.
+     * x16/x17 are included because a `br` reaching here most plausibly came through one of the
+     * IP registers; whichever still holds an address near CallbackPtr names the branch. */
+    LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r19, reinterpret_cast<uint64_t>(&IosCbEntryLog[0]));
+    stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::x0, ARMEmitter::XReg::x1, ARMEmitter::Reg::r19, 0);
+    stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::x16, ARMEmitter::XReg::x17, ARMEmitter::Reg::r19, 16);
+    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r20, ARMEmitter::Reg::rsp, 0);
+    stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::x30, ARMEmitter::XReg::x20, ARMEmitter::Reg::r19, 32);
+    ldr(ARMEmitter::XReg::x20, ARMEmitter::Reg::r19, 48);
+    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r20, ARMEmitter::Reg::r20, 1);
+    str(ARMEmitter::XReg::x20, ARMEmitter::Reg::r19, 48);
+    /* ml307: capture the SRA guest-RSP register (x23) and the top guest-stack qword it points at.
+     * ml307 proved this block RECURSES (sp -0xa0/entry) with x0=0 (null Frame) x1=RIP(bogus), and
+     * the entry is neither a bl (x30 stale) nor a br x16/x17 (both hold small non-addresses). A
+     * ret-style entry would take its target from a return stack; capturing guest RSP and [RSP]
+     * distinguishes "guest RET to a stale host addr" from "L1-lookup br to a corrupt host target".
+     * x23 is the SRA RSP on this target; guarded read so a bad RSP cannot fault the probe. */
+    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r20, ARMEmitter::XReg::x23, 0);
+    str(ARMEmitter::XReg::x20, ARMEmitter::Reg::r19, 56);       // [7] = guest RSP (x23)
+#endif
+
     // First thing we need to move the thread state pointer back in to our register
     mov(STATE, ARMEmitter::XReg::x0);
+#ifdef FEX_IOS_HOST
+    /* ml303 witnesses, kept: per-frame copies for the [bogus-writer] discriminator. */
+    str(ARMEmitter::XReg::x30, STATE_PTR(CpuStateFrame, IosLastCallbackLR));
+#endif
 
     // Make sure to adjust the refcounter so we don't clear the cache now
     ldr(ARMEmitter::WReg::w2, STATE_PTR(CpuStateFrame, SignalHandlerRefCounter));
@@ -596,6 +653,10 @@ void Dispatcher::EmitDispatcher() {
 
     // Store RIP to the context state
     str(ARMEmitter::XReg::x1, STATE_PTR(CpuStateFrame, State.rip));
+#ifdef FEX_IOS_HOST
+    /* iOS-Mythic ml302 (task #51): witness this store -- see CoreState.h IosLastCallbackRip. */
+    str(ARMEmitter::XReg::x1, STATE_PTR(CpuStateFrame, IosLastCallbackRip));
+#endif
 
     // load static regs
     FillStaticRegs();
@@ -715,6 +776,25 @@ void Dispatcher::EmitDispatcher() {
 
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
   End = GetCursorAddress<uint64_t>();
+
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml298 (task #52): PUBLISH THE DISPATCHER ADDRESS MAP.
+   *
+   * ml297's [bogus-host] dump proved CompileBlock is reached with the guest RIP taken from x12,
+   * but there is no way to tell from a raw host address WHICH dispatcher entry ran -- and that is
+   * the whole question here, because AbsoluteLoopTopAddressEnterEC is the path that does
+   *   str(EC_CALL_CHECKER_PC_REG, State.rip)
+   * i.e. the suspected host-PC-into-guest-RIP write. Emitting the map once lets any host address
+   * in a later dump be attributed offline, with no extra device runs.
+   *
+   * Note these are emitted-code addresses, so they move every run; the map must be read from the
+   * SAME log as the dump it is used to interpret. */
+  LogMan::Msg::EFmt("[disp-addrs] dispatcher=[{:#x},{:#x}) LoopTop={:#x} LoopTopFillSRA={:#x} "
+                    "EnterEC={:#x} EnterECFillSRA={:#x} CallbackPtr={:#x} Dispatch={:#x}",
+                    Start, End, AbsoluteLoopTopAddress, AbsoluteLoopTopAddressFillSRA, AbsoluteLoopTopAddressEnterEC,
+                    AbsoluteLoopTopAddressEnterECFillSRA, reinterpret_cast<uint64_t>(CallbackPtr),
+                    reinterpret_cast<uint64_t>(DispatchPtr));
+#endif
   // sys_icache_invalidate is from libkern (Apple-native only). When cross-
   // compiling to Windows ARM64EC PE, libkern isn't available — use the
   // portable ClearICache path instead. Gate on build host AND target.
