@@ -471,8 +471,14 @@ private:
   /* iOS-Mythic: halve the per-thread block-backing arena — it's committed
    * upfront on iOS (see LookupCache.cpp) and 128MB × ~19 threads was OOM-ing
    * the process. 64MB still backs 1024 guest code pages per thread; on
-   * overflow AllocateBackingForPage returns 0 → clean ClearCodeCache. */
-  constexpr static size_t CODE_SIZE = 64 * 1024 * 1024;
+   * overflow AllocateBackingForPage returns 0 → clean ClearCodeCache.
+   *
+   * ml387: halved again 64→32MB — VA, not footprint, is now the wall: the
+   * guest band hit 38MB free with ~50 live lookupcaches at 82MB each
+   * (0x5200000). 32MB still backs 512 guest code pages per thread; overflow
+   * remains a clean ClearCodeCache. New [TI-IC] lookupcache-alloc marker:
+   * 0x3200000. */
+  constexpr static size_t CODE_SIZE = 32 * 1024 * 1024;
 #else
   constexpr static size_t CODE_SIZE = 128 * 1024 * 1024;
 #endif

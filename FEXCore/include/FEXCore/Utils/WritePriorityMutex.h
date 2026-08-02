@@ -50,11 +50,13 @@ public:
   void lock() {
     // Try a non-blocking lock first.
     if (try_lock()) {
+      NoteWriteAcquired();
       return;
     }
 
     // Try a quick WFE write-lock.
     if (Attempt_WFE_WriteLock()) {
+      NoteWriteAcquired();
       return;
     }
 
@@ -107,6 +109,7 @@ public:
       if (!Sleep) {
         // Acquired early.
         LOGMAN_THROW_A_FMT((Desired & WRITE_OWNED_BIT) == WRITE_OWNED_BIT, "Somehow acquired a write-lock without it being set!");
+        NoteWriteAcquired();
         return;
       }
 
@@ -159,6 +162,7 @@ public:
       if (!Sleep) {
         // Acquired early.
         LOGMAN_THROW_A_FMT((Desired & WRITE_OWNED_BIT) != WRITE_OWNED_BIT, "Somehow read-locked and got a write lock!");
+        NoteReadAcquired();
         return;
       }
 
@@ -176,6 +180,8 @@ public:
 
   void unlock() {
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+
+    NoteWriteReleased();
 
     uint32_t Expected = AtomicFutex.load(std::memory_order_relaxed);
     uint32_t Desired {};
@@ -207,6 +213,8 @@ public:
 
   void unlock_shared() {
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
+
+    NoteReadReleased();
 
     uint32_t Desired {};
 #if defined(ASSERTIONS_ENABLED) && ASSERTIONS_ENABLED
@@ -260,7 +268,11 @@ public:
     LOGMAN_THROW_A_FMT((Desired & READ_OWNER_COUNT_MASK) != 0, "Overflow in read-owners!");
 
     // Uncontended mutex check
-    return AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
+    const bool Acquired = AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (Acquired) {
+      NoteReadAcquired();
+    }
+    return Acquired;
   }
 
 #if !defined(_WIN32)
@@ -311,16 +323,56 @@ private:
     // No-op: spin-waiters will see the change
   }
 #else
+  /* iOS-Mythic ml411: an INFINITE wait here is unobservable — a thread parked
+   * on a never-released lock looks identical to an idle one, and this mutex is
+   * anonymous (no owner is recorded). Wait in 1s slices instead and, past a few
+   * seconds, name the write-owner from the ring below. Semantics are unchanged:
+   * both callers already loop and re-check state, and spurious wake-ups are
+   * explicitly tolerated. */
+  void IosStuckReport(const char* Which, uint32_t Expected) {
+    LogMan::Msg::EFmt("[fexlock] STUCK {} on mutex {} word={:08x} (write-owned={} read-waiter={} "
+                      "write-waiters={} read-owners={}) expected={:08x} | owner teb={:x} tid={:04x} depth={}",
+                      Which, static_cast<void*>(&Futex), Futex, !!(Futex & WRITE_OWNED_BIT), !!(Futex & READ_WAITER_BIT),
+                      (Futex & WRITE_WAITER_COUNT_MASK) >> WRITE_WAITER_OFFSET, Futex & READ_OWNER_COUNT_MASK, Expected,
+                      OwnerTeb, OwnerTid, OwnerDepth);
+    /* ml413: a parked writer means live read holds are the blockers — name them.
+     * ml414: dump from READ-wait reports too — ml414 died before any write
+     * waiter reached its report and the ring never printed. Global cap keeps
+     * the spam bounded instead. */
+    static std::atomic<int> HolderDumps {0};
+    if (HolderDumps.fetch_add(1, std::memory_order_relaxed) < 12) {
+      for (size_t i = 0; i < 16; i++) {
+        if (ReadHolderTeb[i]) {
+          LogMan::Msg::EFmt("[fexlock]   read-holder[{}] teb={:x} tid={:04x}", i, ReadHolderTeb[i], ReadHolderTid[i]);
+        }
+      }
+    }
+  }
+
   // Writers wait for the full 32-bit futex.
   void FutexWaitForWriteAvailable(uint32_t Expected) {
-    WaitOnAddress(&Futex, &Expected, sizeof(Futex), INFINITE);
+    for (uint32_t i = 0;; i++) {
+      if (WaitOnAddress(&Futex, &Expected, sizeof(Futex), 1000)) {
+        return;
+      }
+      if (i == 4 || i == 60) {
+        IosStuckReport("write-wait", Expected);
+      }
+    }
   }
 
   // Readers wait for Futex bits [31:16] to be zero.
   void FutexWaitForReadAvailable(uint32_t Expected) {
     auto ReadWaiterAddress = reinterpret_cast<uint8_t*>(&Futex) + 2;
     uint16_t smol_Expected = Expected >> 16;
-    WaitOnAddress(ReadWaiterAddress, &smol_Expected, sizeof(smol_Expected), INFINITE);
+    for (uint32_t i = 0;; i++) {
+      if (WaitOnAddress(ReadWaiterAddress, &smol_Expected, sizeof(smol_Expected), 1000)) {
+        return;
+      }
+      if (i == 4 || i == 60) {
+        IosStuckReport("read-wait", Expected);
+      }
+    }
   }
 
   void FutexWakeWriter() {
@@ -387,6 +439,7 @@ private:
         Desired = Expected + READ_OWNER_INCREMENT;
         LOGMAN_THROW_A_FMT((Desired & READ_OWNER_COUNT_MASK) != 0, "Overflow in read-owners!");
         if (AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          NoteReadAcquired();
           return true;
         }
       }
@@ -425,5 +478,95 @@ private:
   // Bits[29:16]: Write-waiter count.
   //  Bits[15:0]: Read-owner count.
   uint32_t Futex {};
+
+#if defined(_WIN32)
+  /* iOS-Mythic ml411: who holds it exclusive. Written after every successful
+   * write-acquire and cleared on release, so a stuck waiter can name the
+   * thread instead of guessing. TEB comes from x18 (the ARM64 platform
+   * register) and the tid from TEB.ClientId.UniqueThread at +0x48; both are
+   * logged so they cross-check against the [cpu-area] lines, which print the
+   * same pair. Plain stores — the lock word itself is the synchronisation. */
+  uint64_t OwnerTeb {};
+  uint32_t OwnerTid {};
+  uint32_t OwnerDepth {};
+
+  void NoteWriteAcquired() {
+    uint64_t Teb = 0;
+#ifdef ARCHITECTURE_arm64
+    __asm volatile("mov %0, x18" : "=r"(Teb));
+#endif
+    OwnerTeb = Teb;
+    OwnerTid = Teb ? *reinterpret_cast<uint32_t*>(Teb + 0x48) : 0;
+    OwnerDepth++;
+  }
+
+  void NoteWriteReleased() {
+    OwnerTeb = 0;
+    OwnerTid = 0;
+  }
+
+  /* iOS-Mythic ml413: the ml413 wedge was read-owners=1 with the writer parked
+   * behind it — the WRITE stamp above can't name a leaked READ hold. Ring of
+   * live shared holds: acquire claims a zero slot, release clears one of the
+   * caller's slots. Additionally each holder stamps TEB Instrumentation[8]
+   * (0x16f8) with the mutex address while it holds the lock, so the unix-side
+   * exception-delivery and thread-exit paths can spot "this thread holds a FEX
+   * shared lock" and log the leak-in-progress ([deliver-hold]/[exit-hold]).
+   * Slot 9 (0x1700) is the NotifyReadFile flag, slot 10 the wine PUMP beacon. */
+  uint64_t ReadHolderTeb[16] {};
+  uint32_t ReadHolderTid[16] {};
+
+  static uint64_t IosSelfTeb() {
+    uint64_t Teb = 0;
+#ifdef ARCHITECTURE_arm64
+    __asm volatile("mov %0, x18" : "=r"(Teb));
+#endif
+    return Teb;
+  }
+
+  void NoteReadAcquired() {
+    const uint64_t Teb = IosSelfTeb();
+    if (!Teb) {
+      return;
+    }
+    /* ml415: slot 7 (0x16f0) = per-thread shared-hold depth. Without it, a
+     * nested acquire+release pair wiped slot 8 while the outer hold remained,
+     * blinding [census-hold]/[deliver-hold] (the ml414 false-negatives). */
+    auto* Depth = reinterpret_cast<uint32_t*>(Teb + 0x16f0);
+    if (++*Depth == 1) {
+      *reinterpret_cast<uint64_t*>(Teb + 0x16f8) = reinterpret_cast<uint64_t>(&Futex);
+    }
+    for (size_t i = 0; i < 16; i++) {
+      uint64_t ExpectedSlot = 0;
+      if (std::atomic_ref<uint64_t>(ReadHolderTeb[i]).compare_exchange_strong(ExpectedSlot, Teb, std::memory_order_acq_rel)) {
+        ReadHolderTid[i] = *reinterpret_cast<uint32_t*>(Teb + 0x48);
+        return;
+      }
+    }
+  }
+
+  void NoteReadReleased() {
+    const uint64_t Teb = IosSelfTeb();
+    if (!Teb) {
+      return;
+    }
+    auto* Depth = reinterpret_cast<uint32_t*>(Teb + 0x16f0);
+    if (*Depth && --*Depth == 0) {
+      *reinterpret_cast<uint64_t*>(Teb + 0x16f8) = 0;
+    }
+    for (size_t i = 0; i < 16; i++) {
+      if (std::atomic_ref<uint64_t>(ReadHolderTeb[i]).load(std::memory_order_relaxed) == Teb) {
+        ReadHolderTid[i] = 0;
+        std::atomic_ref<uint64_t>(ReadHolderTeb[i]).store(0, std::memory_order_release);
+        return;
+      }
+    }
+  }
+#else
+  void NoteWriteAcquired() {}
+  void NoteWriteReleased() {}
+  void NoteReadAcquired() {}
+  void NoteReadReleased() {}
+#endif
 };
 } // namespace FEXCore::Utils::WritePriorityMutex

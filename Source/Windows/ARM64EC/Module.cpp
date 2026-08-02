@@ -1245,28 +1245,64 @@ void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
 }
 
+/* iOS-Mythic ml411 (#60/#66): the release half must never be gated on state
+ * that can change between the paired calls.
+ *
+ * Upstream returns early when `!InvalidationTracker || !ThreadState`, and
+ * reads the "do I hold the locks" flag out of ThreadState's frontend data.
+ * Wine calls this before AND after every NtReadFile, but if ThreadState (or
+ * the tracker) is gone by the "after" call, the early return skips the
+ * unlock and CodeInvalidationMutex stays WRITE-OWNED FOREVER. Every other
+ * thread that read-locks it then parks in WaitOnAddress with no waker —
+ * which is exactly the ml411 webhelper stall: the chrome_ipc pump receives
+ * Steam's hello, tries to take this lock, and never returns, so the reply is
+ * never written and Steam shows the "webhelper is not responding" dialog.
+ *
+ * Mirror the flag somewhere reachable with no dependency on ThreadState, and
+ * check it before any early return.
+ *
+ * ml412: that mirror must NOT be a thread_local — mingw TLS access loads
+ * TEB->ThreadLocalStoragePointer ([x18+0x58]), which is still NULL when the
+ * loader issues the first NtReadFile of the first process (crashed at
+ * BTCpu64NotifyReadFile+0x3c, addr=0). Use a raw TEB slot instead:
+ * Instrumentation[9] is dead space we own for the whole thread lifetime and
+ * is zero-initialized with the TEB. (Slot 10 is the wine chrome-ipc PUMP
+ * beacon; keep clear of it.) */
+static bool* IosInLockedRWXReadSlot() {
+  /* TEB->Instrumentation[9] = 0x16b8 + 9*8. mingw's _TEB doesn't expose the
+   * field, so address it by offset; wine's EC ntdll stamps Instrumentation[10]
+   * (0x1708) as the PUMP beacon, pinning this layout on device. */
+  return reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(NtCurrentTeb()) + 0x1700);
+}
+
 void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After, NTSTATUS Status) {
   auto* ThreadState = GetCPUArea().ThreadState();
+  bool* InLockedRead = IosInLockedRWXReadSlot();
+
+  if (After) {
+    if (*InLockedRead) {
+      *InLockedRead = false;
+      if (ThreadState) {
+        GetFrontendThreadData(ThreadState)->InLockedRWXRead = false;
+      }
+      CTX->GetCodeInvalidationMutex().unlock();
+      ThreadCreationMutex.unlock();
+    }
+    return;
+  }
+
   if (!InvalidationTracker || !ThreadState) {
     return;
   }
 
-  auto& InLockedRWXRead = GetFrontendThreadData(ThreadState)->InLockedRWXRead;
-  if (!After) {
-    ThreadCreationMutex.lock();
-    CTX->GetCodeInvalidationMutex().lock();
-    if (InvalidationTracker->BeginUntrackedWriteLocked(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size))) {
-      InLockedRWXRead = true;
-    } else {
-      CTX->GetCodeInvalidationMutex().unlock();
-      ThreadCreationMutex.unlock();
-    }
+  ThreadCreationMutex.lock();
+  CTX->GetCodeInvalidationMutex().lock();
+  if (InvalidationTracker->BeginUntrackedWriteLocked(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size))) {
+    GetFrontendThreadData(ThreadState)->InLockedRWXRead = true;
+    *InLockedRead = true;
   } else {
-    if (InLockedRWXRead) {
-      InLockedRWXRead = false;
-      CTX->GetCodeInvalidationMutex().unlock();
-      ThreadCreationMutex.unlock();
-    }
+    CTX->GetCodeInvalidationMutex().unlock();
+    ThreadCreationMutex.unlock();
   }
 }
 
