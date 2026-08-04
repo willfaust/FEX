@@ -802,10 +802,38 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
                * FAULT_SIGSEGV -> GuestSignal_SIGSEGV -> the deliberate read of address 0
                * that has been killing webhelper threads. Log which address failed and
                * which status, so the guest RIP is stated rather than inferred. */
-              LogMan::Msg::EFmt("[iOS-noexec] status={} BlockEntry={:#x} GuestRIP={:#x}",
-                                Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::NOEXEC_INST ?
-                                  "NOEXEC" : "PARTIAL",
-                                Block.Entry, GuestRIP);
+              /* iOS-Mythic ml486 (#89): this log was UNBOUNDED. ml485's run wrote
+               * 1,117,783 copies of the SAME line for ONE address (0x7ED30A0080,
+               * inside the FEX host band) — a 148MB log, 2.26M lines, from line
+               * 16,648 to the end. NoExecOp raises SIGSEGV, the guest resumes at
+               * the same RIP, and nothing breaks the cycle; the retry loop's
+               * allocations drove phys 3276 -> 4074MB and iOS jetsam-killed the
+               * app at its 4096MB limit. So the "memory wall" was really a
+               * runaway. Bound the log and name the runaway once; no
+               * thread_local here (banned in xtajit64), so use atomics. */
+              {
+                static std::atomic<uint64_t> LastNoExecRIP {};
+                static std::atomic<uint32_t> NoExecRepeat {};
+                uint32_t n;
+                if (LastNoExecRIP.load(std::memory_order_relaxed) == GuestRIP) {
+                  n = NoExecRepeat.fetch_add(1, std::memory_order_relaxed) + 1;
+                } else {
+                  LastNoExecRIP.store(GuestRIP, std::memory_order_relaxed);
+                  NoExecRepeat.store(1, std::memory_order_relaxed);
+                  n = 1;
+                }
+                if (n <= 32 || n == 1024 || n == 65536) {
+                  LogMan::Msg::EFmt("[iOS-noexec] status={} BlockEntry={:#x} GuestRIP={:#x} repeat={} rev=ml486",
+                                    Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::NOEXEC_INST ?
+                                      "NOEXEC" : "PARTIAL",
+                                    Block.Entry, GuestRIP, n);
+                }
+                if (n == 1024) {
+                  LogMan::Msg::EFmt("[iOS-noexec] RUNAWAY: {:#x} has failed to decode 1024 times — the guest is not "
+                                    "making progress (wild control transfer); further identical lines suppressed rev=ml486",
+                                    GuestRIP);
+                }
+              }
               Thread->OpDispatcher->NoExecOp(DecodedInfo);
             }
           }
