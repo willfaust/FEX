@@ -162,6 +162,21 @@ enter_jit:
 #endif
   mov w16, #1
   strb w16, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+#ifdef FEX_IOS_HOST
+  // ml460 (#75) Dekker handshake vs the pool-tail sweeper: InSimulation=1 is
+  // published above; the full barrier orders it before the gate read, so
+  // either the sweeper sees us in-simulation (and skips this thread) or we
+  // see the gate (and wait out the sweep before touching L1/callret state).
+  dmb ish
+8:
+  adrp x16, IosCodeBufferSweepGate
+  add x16, x16, #:lo12:IosCodeBufferSweepGate
+  ldar x16, [x16]
+  cbz x16, 9f
+  yield
+  b 8b
+9:
+#endif
   ldr x16, [x17, #0x40] // ChpeV2CpuAreaInfo->EmulatorData[2] - DispatcherLoopTopEnterEC
   br x16 // DispatcherLoopTopEnterEC(RIP:x9, CPUArea:x17)
 
@@ -171,6 +186,22 @@ BeginSimulation:
 #ifdef FEX_IOS_HOST
   IOS_LOAD_TEB x17
   ldr x17, [x17, #0x1788] // TEB->ChpeV2CpuAreaInfo
+  // ml460 (#75): this funnel re-enters the JIT after NtContinue (syscall
+  // resumes, guest SEH returns, suspend resumes) and could otherwise run
+  // emitted code with a stale InSimulation=0 — invisible to the sweeper.
+  // Publish InSimulation BEFORE SyncThreadContext (the sweeper touches
+  // State.callret_sp) and wait out any active sweep.
+  mov w16, #1
+  strb w16, [x17, #0x0] // ChpeV2CpuAreaInfo->InSimulation
+  dmb ish
+6:
+  adrp x16, IosCodeBufferSweepGate
+  add x16, x16, #:lo12:IosCodeBufferSweepGate
+  ldar x16, [x16]
+  cbz x16, 7f
+  yield
+  b 6b
+7:
 #else
   ldr x17, [x18, #0x1788] // TEB->ChpeV2CpuAreaInfo
 #endif

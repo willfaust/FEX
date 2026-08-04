@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+#include <atomic>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -243,8 +244,17 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
 
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
-    LogMan::Msg::EFmt("[iOS-xrem] via=aligned tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                      AlignedBase, AlignedBase + AlignedSize);
+    // ml437 (#74): this fires on EVERY guest free/decommit (the ml201 probe is
+    // unconditional) — ml436 logged 4,234 lines of ordinary heap decommit
+    // churn, drowning the log and costing a dprintf syscall per free. The
+    // signal (which path removes a tracked range) is preserved by the first 40
+    // plus a 1-in-64 sample.
+    static std::atomic<uint32_t> AlignedRemoveCount;
+    const auto N = AlignedRemoveCount.fetch_add(1) + 1;
+    if (N <= 40 || !(N & 63)) {
+      LogMan::Msg::EFmt("[iOS-xrem] via=aligned #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                        AlignedBase, AlignedBase + AlignedSize);
+    }
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
   }

@@ -51,6 +51,7 @@ $end_info$
 #include <cstdint>
 #include <cstdio>
 #include <type_traits>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -175,6 +176,16 @@ inline std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& GetThread
   return Map;
 }
 #define Threads GetThreadsMap()
+
+#ifdef FEX_IOS_HOST
+/* iOS-Mythic ml460 (#75): pool-tail sweep registry, implemented in
+ * CPUBackend.cpp (which has the full CPUBackend type). This frontend only
+ * registers each thread's ThreadState + &CpuArea->InSimulation at init and
+ * unregisters at term — the unregister BLOCKS until any in-flight sweep
+ * drains and must be called with no locks held. */
+extern "C" void IosSweepRegisterThread(FEXCore::Core::InternalThreadState* Thread, volatile uint8_t* InSimPtr);
+extern "C" void IosSweepUnregisterThread(FEXCore::Core::InternalThreadState* Thread);
+#endif
 
 std::pair<NTSTATUS, ThreadCPUArea> GetThreadCPUArea(HANDLE Thread) {
   THREAD_BASIC_INFORMATION Info;
@@ -827,7 +838,7 @@ NTSTATUS ProcessInit() {
    * compile time, so changing only another .cpp leaves the stamp stale and the ambiguity
    * half-returns. The MYTHIC_REV tag below fixes that: bump it for every deploy, which
    * necessarily edits this file and so refreshes the timestamp too. Self-enforcing. */
-#define MYTHIC_REV "ml341-excrip"
+#define MYTHIC_REV "ml466"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MYTHIC_REV " compiled " __DATE__ " " __TIME__);
 #endif
 
@@ -1653,6 +1664,11 @@ NTSTATUS ThreadInit() {
     }
   }
 
+#ifdef FEX_IOS_HOST
+  // ml460 (#75): expose this thread to the pool-tail sweeper.
+  IosSweepRegisterThread(Thread, reinterpret_cast<volatile uint8_t*>(&CPUArea.Area->InSimulation));
+#endif
+
   CPUArea.ThreadState() = Thread;
   CPUArea.Area->SuspendDoorbell = reinterpret_cast<ULONG*>(&Thread->CurrentFrame->SuspendDoorbell);
 #ifdef FEX_IOS_HOST
@@ -1691,6 +1707,9 @@ NTSTATUS ThreadInit() {
 
 NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
   if (!FEX::Windows::ValidateHandleAccess(Thread, THREAD_TERMINATE)) {
+    // ml435 (#73): every exit that bails here leaks the thread's rpmalloc heap
+    // (64-192MB of band spans) — count them.
+    LogMan::Msg::EFmt("[thr-term] rev=ml435 DENIED handle={}", Thread);
     return STATUS_ACCESS_DENIED;
   }
 
@@ -1698,6 +1717,7 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
 
   THREAD_BASIC_INFORMATION Info;
   if (auto Err = NtQueryInformationThread(*ThreadDup, ThreadBasicInformation, &Info, sizeof(Info), nullptr); Err) {
+    LogMan::Msg::EFmt("[thr-term] rev=ml435 QUERY-FAIL {:#x}", static_cast<uint32_t>(Err));
     return Err;
   }
 
@@ -1713,6 +1733,10 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
 
   const auto [Err, CPUArea] = GetThreadCPUArea(*ThreadDup);
   if (Err) {
+    LogMan::Msg::EFmt("[thr-term] rev=ml435 CPUAREA-FAIL tid={:#x} self={} st={:#x}", ThreadTID, Self, static_cast<uint32_t>(Err));
+    if (Self) {
+      FEX::Windows::DeinitCRTThread();
+    }
     return Err;
   }
 
@@ -1720,7 +1744,15 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
     std::scoped_lock Lock(ThreadCreationMutex);
     auto it = Threads.find(ThreadTID);
     if (it == Threads.end()) {
-      // Thread already terminated
+      // Thread already terminated. ml435 (#73): this early-out used to skip
+      // DeinitCRTThread entirely — a self-exiting thread that misses the
+      // registry leaked its rpmalloc heap (64-192MB of band spans) every
+      // time. rpmalloc_thread_finalize is fallback-safe (empty TLS resolves
+      // to global_heap_default and is skipped), so release it here too.
+      LogMan::Msg::EFmt("[thr-term] rev=ml435 REGISTRY-MISS tid={:#x} self={}", ThreadTID, Self);
+      if (Self) {
+        FEX::Windows::DeinitCRTThread();
+      }
       return STATUS_SUCCESS;
     }
 
@@ -1731,6 +1763,15 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
   }
   auto ThreadState = CPUArea.ThreadState();
 
+#ifdef FEX_IOS_HOST
+  /* ml460 (#75): remove from the sweep registry and drain any in-flight
+   * sweep BEFORE tearing the thread down. Must be outside the
+   * ThreadCreationMutex scope above — the wait inside TCM would close an
+   * ABBA loop through a sweeper blocked on a map lock whose holder wants
+   * TCM via a memory notify. */
+  IosSweepUnregisterThread(ThreadState);
+#endif
+
   delete GetFrontendThreadData(ThreadState);
 
   // GDT and LDT are mirrored, only free one.
@@ -1740,7 +1781,14 @@ NTSTATUS ThreadTerm(HANDLE Thread, LONG ExitCode) {
   CTX->DestroyThread(ThreadState);
   ::VirtualFree(reinterpret_cast<void*>(CPUArea.EmulatorStackLimit()), 0, MEM_RELEASE);
   if (ThreadTID == GetCurrentThreadId()) {
+    static std::atomic<uint32_t> DeinitCount;
+    LogMan::Msg::EFmt("[thr-term] rev=ml435 deinit #{} tid={:#x}", DeinitCount.fetch_add(1) + 1, ThreadTID);
     FEX::Windows::DeinitCRTThread();
+  } else {
+    // ml435 (#73): cross-thread termination cannot run the victim's TLS-based
+    // finalize — its rpmalloc heap leaks. Count these; if nonzero they are the
+    // remaining leak source after the registry-miss fix.
+    LogMan::Msg::EFmt("[thr-term] rev=ml435 CROSS-TERM tid={:#x} — victim heap not finalized", ThreadTID);
   }
 
   return STATUS_SUCCESS;

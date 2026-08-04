@@ -2285,7 +2285,66 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   // Lock code mutex during any SIGBUS handling that potentially changes code.
   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.
-  FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(&InlineTail->SpinLockFutex);
+  // iOS-Mythic ml472 (#80): the lock word carries no owner and lives in the
+  // code buffer; the holder's backpatch stores fault through the Mach RX-alias
+  // emulator, so a holder that dies or is unwound there orphans the lock and
+  // every later unaligned-atomic thread WFE-spun here forever (ml470/ml471
+  // post-BrowserReady livelocks). Bounded acquire that stamps the holder's
+  // thread identity into the word (waiters only ever test zero/nonzero); on
+  // timeout, emulate this one access with the same helpers the !IsJIT path
+  // uses and leave the code unpatched.
+  uint32_t* BPFutex = &InlineTail->SpinLockFutex;
+  const uint32_t BPStamp = 0x80000000u | (static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Thread) >> 4) & 0x7FFFFFFFu);
+  bool BPLocked = false;
+  for (int Attempt = 0; Attempt < 8; ++Attempt) {
+    uint32_t Expected = 0;
+    if (std::atomic_ref<uint32_t>(*BPFutex).compare_exchange_strong(Expected, BPStamp)) {
+      BPLocked = true;
+      break;
+    }
+    // 8 x 25ms = ~200ms worst case before giving up on the lock.
+    FEXCore::Utils::SpinWaitLock::Wait(BPFutex, static_cast<uint32_t>(0), std::chrono::milliseconds(25));
+  }
+  if (!BPLocked) {
+    static std::atomic<uint32_t> BPTimeoutLogs {};
+    if (BPTimeoutLogs.fetch_add(1) < 16) {
+      LogMan::Msg::EFmt("[bp-lock] acquire TIMEOUT lock=0x{:x} val=0x{:x} me=0x{:x} pc=0x{:x} instr=0x{:08x} rev=ml472",
+                        reinterpret_cast<uintptr_t>(BPFutex), std::atomic_ref<uint32_t>(*BPFutex).load(), BPStamp, ProgramCounter,
+                        Instr);
+    }
+    if ((Instr & LDAXR_MASK) == LDAR_INST || (Instr & LDAXR_MASK) == LDAPR_INST) {
+      if (ArchHelpers::Arm64::HandleAtomicLoad(Instr, GPRs, 0)) {
+        return 4;
+      }
+    } else if ((Instr & LDAXR_MASK) == STLR_INST) {
+      if (ArchHelpers::Arm64::HandleAtomicStore(Instr, GPRs, 0, StrictSplitLockMutex)) {
+        return 4;
+      }
+    } else if ((Instr & RCPC2_MASK) == LDAPUR_INST) {
+      int32_t Offset = static_cast<int32_t>(Instr) << 11 >> 23;
+      if (ArchHelpers::Arm64::HandleAtomicLoad(Instr, GPRs, Offset)) {
+        return 4;
+      }
+    } else if ((Instr & RCPC2_MASK) == STLUR_INST) {
+      int32_t Offset = static_cast<int32_t>(Instr) << 11 >> 23;
+      if (ArchHelpers::Arm64::HandleAtomicStore(Instr, GPRs, Offset, StrictSplitLockMutex)) {
+        return 4;
+      }
+    }
+    // Not an emulatable family. If the site no longer holds the faulting
+    // instruction it was backpatched while we waited: re-execute it, running
+    // the store barrier first when the patch was the DMB+STR form.
+    auto Now = std::atomic_ref<uint32_t>(PC[0]).load(std::memory_order_acquire);
+    if (Now != Instr) {
+      if ((Now & LDSTREGISTER_MASK) == STR_INST || (Now & LDSTUNSCALED_MASK) == STUR_INST) {
+        return -4;
+      }
+      return 0;
+    }
+    LogMan::Msg::EFmt("Unhandled JIT SIGBUS under bp-lock timeout: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
+    return std::nullopt;
+  }
+  FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(BPFutex, FEXCore::Utils::SpinWaitLock::adopt_lock);
 
   if ((Instr & LDAXR_MASK) == LDAR_INST ||  // LDAR*
       (Instr & LDAXR_MASK) == LDAPR_INST) { // LDAPR*

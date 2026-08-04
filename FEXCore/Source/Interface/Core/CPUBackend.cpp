@@ -20,8 +20,17 @@ namespace FEXCore {
 namespace CPU {
 
   static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
+#ifdef FEX_IOS_HOST
+  // iOS-Mythic ml437 (#74): the shared 896MB JIT pool's tail budget is ~188MB
+  // for ALL threads' code buffers; hot threads doubling 16->32->64->128MB
+  // exhausted it in ml436 (head 708MB of DLL copies + tail collided; 10 honest
+  // refusals, 123 degraded threads). Cap growth at 32MB — hot threads clear
+  // and recompile more often, but every thread gets a REAL buffer.
+  static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 32;
+#else
   // We don't want to move above 128MB atm because that means we will have to encode longer jumps
   static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
+#endif
 
   constexpr static uint64_t NamedVectorConstants[FEXCore::IR::NamedVectorConstant::NAMED_VECTOR_CONST_POOL_MAX][2] = {
     {0x0003'0002'0001'0000ULL, 0x0007'0006'0005'0004ULL}, // NAMED_VECTOR_INCREMENTAL_U16_INDEX
@@ -317,7 +326,32 @@ namespace CPU {
 
   CPUBackend::~CPUBackend() = default;
 
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml460 (#75): every C++ toucher of CurrentCodeBuffer /
+   * SignalHandlerCodeBuffers holds this while the sweeper may run (see the
+   * header comment). Plain test-and-set spin — all critical sections are a
+   * few pointer ops. NOT recursive: RegisterForSignalHandler is only called
+   * from already-guarded scopes and must not re-acquire. */
+  namespace {
+    struct IosMigrateLockGuard {
+      std::atomic<uint32_t>& Lock;
+      explicit IosMigrateLockGuard(std::atomic<uint32_t>& Lock)
+        : Lock(Lock) {
+        while (Lock.exchange(1, std::memory_order_acquire) != 0) {
+          __asm volatile("yield");
+        }
+      }
+      ~IosMigrateLockGuard() {
+        Lock.store(0, std::memory_order_release);
+      }
+    };
+  } // namespace
+#endif
+
   auto CPUBackend::GetEmptyCodeBuffer() -> CodeBuffer* {
+#ifdef FEX_IOS_HOST
+    IosMigrateLockGuard g {IosMigrateLock};
+#endif
     auto PrevCodeBuffer = CurrentCodeBuffer;
 
     // Resize the code buffer and reallocate our code size
@@ -332,6 +366,27 @@ namespace CPU {
       // We have signal handlers that have generated code
       // This means that we can not safely clear the code at this point in time
       // Keep a reference to the old code buffer to delay deallocation
+#ifdef FEX_IOS_HOST
+      /* iOS-Mythic ml459 (#75): old code buffers are the pool's TAIL, and the
+       * ml458 run ended with 12 carves (5 of them 32MB) but only ONE freed —
+       * 214MB of a 896MB pool pinned while the head needed 1MB more. A buffer
+       * lives until every strong ref drops; this vector is the one ref that can
+       * grow without bound, because it is only ever cleared by a LATER swap on
+       * a thread whose counter happens to be 0 by then. A thread that leaks a
+       * non-zero SignalHandlerRefCounter therefore pins EVERY generation it
+       * ever saw, forever. Name the pinner: tid, the counter that caused it,
+       * and how deep this thread's pin list now is. */
+      {
+        static std::atomic<int> PinLogCount {0};
+        uint64_t Teb = 0;
+        __asm volatile("mov %0, x18" : "=r"(Teb));
+        if (PinLogCount.fetch_add(1, std::memory_order_relaxed) < 40) {
+          LogMan::Msg::EFmt("[pool-tail] PIN old CodeBuffer size=0x{:x} refcnt={} pinned_now={} tid={:#x} rev=ml459",
+                            CodeBuffer ? CodeBuffer->AllocatedSize : 0, ThreadState->CurrentFrame->SignalHandlerRefCounter,
+                            SignalHandlerCodeBuffers.size() + 1, Teb ? *reinterpret_cast<uint32_t*>(Teb + 0x48) : 0);
+        }
+      }
+#endif
       SignalHandlerCodeBuffers.push_back(std::move(CodeBuffer));
     } else {
       SignalHandlerCodeBuffers.clear();
@@ -340,12 +395,60 @@ namespace CPU {
 
   fextl::shared_ptr<CodeBuffer> CPUBackend::CheckCodeBufferUpdate() {
     auto NewCodeBuffer = CodeBuffers.GetLatest();
+#ifdef FEX_IOS_HOST
+    IosMigrateLockGuard g {IosMigrateLock};
+#endif
     if (CurrentCodeBuffer != NewCodeBuffer) {
       RegisterForSignalHandler(CurrentCodeBuffer);
       return std::exchange(CurrentCodeBuffer, NewCodeBuffer);
     }
     return nullptr;
   }
+
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml460 (#75): remote-migrate a PARKED thread off a stale
+   * generation. Runs on the SWEEPER's thread; the caller has verified under
+   * the Dekker gate that the owner is outside emitted code (InSimulation==0)
+   * and cannot re-enter until the gate clears — so the owner cannot be inside
+   * any of its own guarded sections, and the only contender for
+   * IosMigrateLock is another C++ path on a third thread (exception-state
+   * queries), which the spin lock serializes. Mirrors the self-migration in
+   * JIT.cpp (CheckCodeBufferUpdate + ChangeGuestToHostMapping +
+   * callret-entry wipe); KeepAlive must outlive the map write lock because
+   * the lock lives INSIDE the CodeBuffer being dropped (the ClearCache
+   * lesson: "Holding on to the reference here is required"). */
+  int CPUBackend::IosRemoteMigrateStale(const fextl::shared_ptr<CodeBuffer>& LatestBuf) {
+    for (int Attempt = 0; Attempt < 4; Attempt++) {
+      fextl::shared_ptr<CodeBuffer> KeepAlive;
+      {
+        IosMigrateLockGuard g {IosMigrateLock};
+        KeepAlive = CurrentCodeBuffer;
+      }
+      if (!KeepAlive || KeepAlive == LatestBuf) {
+        return 0;
+      }
+      auto lk = KeepAlive->LookupCache->AcquireWriteLock();
+      IosMigrateLockGuard g {IosMigrateLock};
+      if (CurrentCodeBuffer != KeepAlive) {
+        continue; // owner-side state moved between the peek and the locks; retry
+      }
+      if (ThreadState->CurrentFrame->SignalHandlerRefCounter != 0) {
+        return -1; // interrupted JIT frames below this thread still reference old code
+      }
+      auto Prev = std::exchange(CurrentCodeBuffer, LatestBuf);
+      ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *LatestBuf->LookupCache, lk);
+      // Stale callret predictions pair (guest RIP, host addr into Prev); wipe
+      // the entries the same way the self-migration path does. SP itself
+      // stays — zeroed entries just mispredict into the slow path.
+      FEXCore::Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+      SignalHandlerCodeBuffers.clear();
+      return 1;
+      // Prev + KeepAlive drop after lk releases; the final ref frees the
+      // buffer to the pool tail on this (the sweeper's) thread.
+    }
+    return -2;
+  }
+#endif
 
   GuestToHostMap& GetLookupCache(const CodeBuffer& Buffer) {
     return *Buffer.LookupCache;
@@ -397,6 +500,15 @@ namespace CPU {
     FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
   }
 
+#ifdef FEX_IOS_HOST
+  /* ml460 (#75): process-wide generation counter; read by the deferred-sweep
+   * trigger (Core.cpp) and the sweeper (Module.cpp) via IosCodeBufferGeneration. */
+  std::atomic<uint64_t> IosCodeBufferGenCounter {0};
+  uint64_t IosCodeBufferGeneration() {
+    return IosCodeBufferGenCounter.load(std::memory_order_acquire);
+  }
+#endif
+
   auto CodeBufferManager::AllocateNew(size_t Size) -> fextl::shared_ptr<CodeBuffer> {
 #if defined(__linux__)
 // MDWE (Memory-Deny-Write-Execute) is a new Linux 6.3 feature.
@@ -425,8 +537,33 @@ namespace CPU {
 
     auto Buffer = fextl::make_shared<CodeBuffer>(Size);
 
+#ifdef FEX_IOS_HOST
+    /* ml460 (#75): generation bookkeeping. prev_use_count at swap time is the
+     * direct pinning measurement — 1 (the manager) + one per thread still
+     * holding the outgoing generation. The counter drives the deferred sweep
+     * (Core.cpp CompileBlock tail -> Module.cpp IosMaybeSweepCodeBuffers). */
+    {
+      static std::atomic<int> GenLogCount {0};
+      long PrevUseCount = 0;
+      size_t PrevSize = 0;
+      {
+        std::scoped_lock lk {LatestMutex};
+        if (Latest) {
+          PrevUseCount = Latest.use_count();
+          PrevSize = Latest->AllocatedSize;
+        }
+        Latest = Buffer;
+        LatestOffset = 0;
+      }
+      const uint64_t Gen = IosCodeBufferGenCounter.fetch_add(1, std::memory_order_release) + 1;
+      if (GenLogCount.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LogMan::Msg::EFmt("[gen] alloc#{} size=0x{:x} prev_size=0x{:x} prev_use_count={} rev=ml460", Gen, Size, PrevSize, PrevUseCount);
+      }
+    }
+#else
     Latest = Buffer;
     LatestOffset = 0;
+#endif
 
     OnCodeBufferAllocated(Buffer);
 
@@ -434,6 +571,25 @@ namespace CPU {
   }
 
   fextl::shared_ptr<CodeBuffer> CodeBufferManager::GetLatest() {
+#ifdef FEX_IOS_HOST
+    /* ml460: the sweeper reads Latest without CodeBufferWriteMutex; all reads
+     * and the AllocateNew assignment go through LatestMutex. First-allocation
+     * recursion is avoided by checking under the lock, allocating outside it
+     * (boot-time single-threaded in practice). */
+    {
+      std::scoped_lock lk {LatestMutex};
+      if (Latest) {
+        return Latest;
+      }
+    }
+    if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
+      AllocateNew(MAX_CODE_SIZE);
+    } else {
+      AllocateNew(INITIAL_CODE_SIZE);
+    }
+    std::scoped_lock lk {LatestMutex};
+    return Latest;
+#else
     if (!Latest) {
       if (FEXCore::Config::Get_ENABLECODECACHINGWIP()) {
         // Start with a larger code buffer to avoid resizes that would discard
@@ -444,6 +600,7 @@ namespace CPU {
       }
     }
     return Latest;
+#endif
   }
 
   fextl::shared_ptr<CodeBuffer> CodeBufferManager::StartLargerCodeBuffer() {
@@ -458,7 +615,142 @@ namespace CPU {
   }
 
 
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+  /* iOS-Mythic ml460 (#75): the pool-tail sweep. ml459 proved the 208MB tail
+   * is 13 live generations where steady state needs ~2 — each pinned by the
+   * CurrentCodeBuffer ref of threads parked in wine waits, which never run
+   * the compile-path self-migration. This sweep remote-migrates them.
+   *
+   * Safety model:
+   *  - IosCodeBufferSweepGate is the asm-side Dekker flag. The JIT entry
+   *    funnels (Module.S enter_jit / BeginSimulation) store InSimulation=1,
+   *    dmb ish, then spin while the gate is set. The sweeper stores the gate,
+   *    fences, then reads InSimulation per target: the fenced store->load
+   *    pairs guarantee at least one side observes the other, so the sweeper
+   *    never migrates a thread that is (or is entering) emitted code.
+   *  - C++ paths that touch CurrentCodeBuffer on a native-side thread
+   *    (exception queries) are serialized by IosMigrateLock instead.
+   *  - IosSweepBusy makes ThreadTerm's unregister block until an in-flight
+   *    sweep drains, so a snapshotted ThreadState cannot be destroyed under
+   *    the sweeper. The unregister wait runs with NO locks held (Module.cpp
+   *    calls it outside the ThreadCreationMutex scope).
+   *  - The sweeper runs from a synchronous CompileBlock tail (WPM-shared
+   *    held). Lock order WPM -> map-write -> IosMigrateLock matches every
+   *    other taker; gate-spinners hold nothing; map-write holders are in-JIT
+   *    threads that always drain. VirtualDontNeed inside the migrate is
+   *    notify-free (bzero semantics), proven by the identical call in the
+   *    self-migration path under an even richer lock context. */
+  extern "C" {
+  __attribute__((used)) uint64_t IosCodeBufferSweepGate = 0;
+  }
+
+  namespace {
+    struct IosSweepSlot {
+      FEXCore::Core::InternalThreadState* Thread;
+      volatile uint8_t* InSim;
+    };
+    constexpr size_t IosSweepSlotMax = 512;
+    IosSweepSlot IosSweepSlots[IosSweepSlotMax];
+    size_t IosSweepSlotHighWater = 0;
+    std::atomic<uint32_t> IosSweepBusy {0};
+    std::atomic<uint64_t> IosSweepLastGen {0};
+    // Meyers singleton: arm64ec-mingw does not reliably run global C++ ctors
+    // (the Module.cpp lesson), so no namespace-scope std::mutex object.
+    std::mutex& IosSweepRegistryLock() {
+      static std::mutex M;
+      return M;
+    }
+  } // namespace
+
+  extern "C" void IosSweepRegisterThread(FEXCore::Core::InternalThreadState* Thread, volatile uint8_t* InSimPtr) {
+    std::scoped_lock lk {IosSweepRegistryLock()};
+    for (size_t i = 0; i < IosSweepSlotMax; i++) {
+      if (!IosSweepSlots[i].Thread) {
+        IosSweepSlots[i] = {Thread, InSimPtr};
+        if (i + 1 > IosSweepSlotHighWater) {
+          IosSweepSlotHighWater = i + 1;
+        }
+        return;
+      }
+    }
+    LogMan::Msg::EFmt("[gen-sweep] registry FULL — thread unswept rev=ml460");
+  }
+
+  extern "C" void IosSweepUnregisterThread(FEXCore::Core::InternalThreadState* Thread) {
+    {
+      std::scoped_lock lk {IosSweepRegistryLock()};
+      for (size_t i = 0; i < IosSweepSlotMax; i++) {
+        if (IosSweepSlots[i].Thread == Thread) {
+          IosSweepSlots[i] = {nullptr, nullptr};
+          break;
+        }
+      }
+    }
+    // An in-flight sweep may have snapshotted this ThreadState before the
+    // erase; hold destruction until it drains. Caller holds no locks here.
+    while (IosSweepBusy.load(std::memory_order_acquire) != 0) {
+      __asm volatile("yield");
+    }
+  }
+
+  extern "C" void IosMaybeSweepCodeBuffers(FEXCore::Core::InternalThreadState* CallerThread) {
+    const uint64_t Gen = IosCodeBufferGenCounter.load(std::memory_order_acquire);
+    if (Gen == IosSweepLastGen.load(std::memory_order_relaxed)) {
+      return;
+    }
+    if (IosSweepBusy.exchange(1, std::memory_order_acq_rel) != 0) {
+      return; // another sweep in flight; it covers this generation or the next trigger will
+    }
+    auto Latest = CallerThread->CPUBackend->GetCodeBufferManager().GetLatest();
+
+    IosSweepSlot Snap[IosSweepSlotMax];
+    size_t SnapCount = 0;
+    {
+      std::scoped_lock lk {IosSweepRegistryLock()};
+      for (size_t i = 0; i < IosSweepSlotHighWater; i++) {
+        if (IosSweepSlots[i].Thread && IosSweepSlots[i].Thread != CallerThread) {
+          Snap[SnapCount++] = IosSweepSlots[i];
+        }
+      }
+    }
+
+    __atomic_store_n(&IosCodeBufferSweepGate, 1, __ATOMIC_SEQ_CST);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+
+    int Migrated = 0, InSimSkip = 0, SigPinSkip = 0, Raced = 0;
+    for (size_t i = 0; i < SnapCount; i++) {
+      if (*Snap[i].InSim != 0) {
+        InSimSkip++;
+        continue;
+      }
+      switch (Snap[i].Thread->CPUBackend->IosRemoteMigrateStale(Latest)) {
+      case 1: Migrated++; break;
+      case -1: SigPinSkip++; break;
+      case -2: Raced++; break;
+      default: break;
+      }
+    }
+
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    __atomic_store_n(&IosCodeBufferSweepGate, 0, __ATOMIC_SEQ_CST);
+    IosSweepLastGen.store(Gen, std::memory_order_relaxed);
+    IosSweepBusy.store(0, std::memory_order_release);
+
+    static std::atomic<int> SweepLogCount {0};
+    if ((Migrated || SigPinSkip || Raced) && SweepLogCount.fetch_add(1, std::memory_order_relaxed) < 64) {
+      LogMan::Msg::EFmt("[gen-sweep] gen={} threads={} migrated={} in_sim={} sig_pin={} raced={} rev=ml460", Gen, SnapCount, Migrated,
+                        InSimSkip, SigPinSkip, Raced);
+    }
+  }
+#endif
+
   bool CPUBackend::IsAddressInCodeBuffer(uintptr_t Address) const {
+#ifdef FEX_IOS_HOST
+    /* ml460: exception paths call this on threads that are native-side
+     * (InSimulation==0) — exactly the threads the sweeper may be migrating.
+     * Serialize against the CurrentCodeBuffer exchange. */
+    IosMigrateLockGuard g {IosMigrateLock};
+#endif
     auto CheckCodeBuffer = [](CodeBuffer& Buffer, uintptr_t Address) {
       // The last page of the code buffer is protected, so we need to exclude it from the valid range
       // when checking if the address is in the code buffer.

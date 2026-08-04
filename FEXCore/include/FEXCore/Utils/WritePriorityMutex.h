@@ -48,9 +48,16 @@ public:
   Mutex& operator=(Mutex&&) = delete;
 
   void lock() {
-    // Try a non-blocking lock first.
+    /* ml451: the ml450 write→write self-grant REVERTED — its nest accounting
+     * leaked on steam's boot path (SELF-WRITE nest climbed 1→3+ from paired
+     * try_lock/lock call sites; a leaked count makes the outermost unlock
+     * consume a nested decrement instead of releasing the futex ⇒ permanent
+     * hold ⇒ the ml450-era early-boot loader wedge).  The write→write case
+     * needs a reland with call-site-exact pairing; see task #69. */
+
+    // Try a non-blocking lock first.  (ml442: try_lock stamps the owner
+    // itself now, so direct try_lock callers are attributed too.)
     if (try_lock()) {
-      NoteWriteAcquired();
       return;
     }
 
@@ -128,6 +135,17 @@ public:
   }
 
   void lock_shared() {
+    /* iOS-Mythic ml442 (#74 ROOT FIX): the class forbids recursive locking,
+     * but the invalidation paths hold this WRITE-locked while a fault taken
+     * on the same thread re-enters the compiler, which asks for SHARED — the
+     * thread then parks forever behind itself (ml441 run: tid 00e4 write-owned
+     * 0x7ca7173500 and read-waited on it; the whole webhelper cascaded behind
+     * that one park).  A write owner already has exclusive access, which is a
+     * strict superset of shared — grant it with a nest counter instead. */
+    if (IosWriterSelfShared()) {
+      return;
+    }
+
     // Try an uncontended lock first.
     if (try_lock_shared()) {
       return;
@@ -212,6 +230,11 @@ public:
   }
 
   void unlock_shared() {
+    /* ml442: matching release for a write-owner's nested shared grant */
+    if (IosWriterSelfSharedRelease()) {
+      return;
+    }
+
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
 
     NoteReadReleased();
@@ -241,6 +264,30 @@ public:
     }
   }
 
+  /* ml452 (#74): token-scoped nested-aware write acquire.  The ml450 in-mutex
+   * nest counter leaked (try/lock double-entry); doing it HERE with the RAII
+   * token as the unit makes pairing structural: returns whether this call
+   * actually locked — the token unlocks only if it did.  Self-test is the
+   * OwnerTeb stamp (only the true owner can see its own teb there).  Stale
+   * stamp from a dead owner + recycled TEB yields a false no-lock, which is
+   * strictly better than the guaranteed self-park (and the reapers clear the
+   * corpse's hold). */
+  bool ios_lock_write_nested_aware() {
+#if defined(_WIN32)
+    const uint64_t Teb = IosSelfTeb();
+    if (Teb && OwnerTeb == Teb) {
+      static std::atomic<int> NestedTokenLog {0};
+      if (NestedTokenLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+        LogMan::Msg::EFmt("[fexlock] NESTED-TOKEN write grant mutex={} ra={} rev=ml452", static_cast<void*>(&Futex),
+                          __builtin_return_address(0));
+      }
+      return false;
+    }
+#endif
+    lock();
+    return true;
+  }
+
   bool try_lock() {
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
 
@@ -250,11 +297,20 @@ public:
     uint32_t Desired = WRITE_OWNED_BIT;
 
     // try to CAS immediately.
-    return AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
+    const bool Acquired = AtomicFutex.compare_exchange_strong(Expected, Desired, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (Acquired) {
+      NoteWriteAcquired();
+    }
+    return Acquired;
   }
 
   // Can race with other threads trying to lock shared!
   bool try_lock_shared() {
+    /* ml442: write owner asking for shared always succeeds (see lock_shared) */
+    if (IosWriterSelfShared()) {
+      return true;
+    }
+
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
     uint32_t Expected = AtomicFutex.load(std::memory_order_relaxed);
 
@@ -489,6 +545,9 @@ private:
   uint64_t OwnerTeb {};
   uint32_t OwnerTid {};
   uint32_t OwnerDepth {};
+  /* ml442: count of shared grants the write owner holds nested inside its
+   * write hold.  Touched only by the owning thread — plain stores suffice. */
+  uint32_t OwnerSharedNest {};
 
   void NoteWriteAcquired() {
     uint64_t Teb = 0;
@@ -501,8 +560,82 @@ private:
   }
 
   void NoteWriteReleased() {
+    if (OwnerSharedNest) {
+      /* Badly-nested release order (write-unlock before nested shared-unlock).
+       * Scoped RAII guards can't produce this; log loudly if something does. */
+      static std::atomic<int> WarnCount {0};
+      if (WarnCount.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LogMan::Msg::EFmt("[fexlock] WARN write-unlock with nested-shared={} mutex={} rev=ml442", OwnerSharedNest,
+                          static_cast<void*>(&Futex));
+      }
+      OwnerSharedNest = 0;
+    }
+    if (OwnerWriteNest) {
+      static std::atomic<int> WarnCount2 {0};
+      if (WarnCount2.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LogMan::Msg::EFmt("[fexlock] WARN write-unlock with nested-write={} mutex={} rev=ml450", OwnerWriteNest,
+                          static_cast<void*>(&Futex));
+      }
+      OwnerWriteNest = 0;
+    }
     OwnerTeb = 0;
     OwnerTid = 0;
+  }
+
+  /* ml442 (#74 ROOT FIX): if the calling thread already write-owns this mutex,
+   * grant shared access by nesting instead of parking behind ourselves.  Safe
+   * against races: OwnerTeb can only equal OUR teb if we are the owner (no
+   * other thread can store our teb), and while we own it nobody else clears
+   * the stamp. */
+  bool IosWriterSelfShared() {
+    const uint64_t Teb = IosSelfTeb();
+    if (!Teb || OwnerTeb != Teb) {
+      return false;
+    }
+    OwnerSharedNest++;
+    static std::atomic<int> LogCount {0};
+    if (LogCount.fetch_add(1, std::memory_order_relaxed) < 20) {
+      LogMan::Msg::EFmt("[fexlock] SELF-SHARED write-owner re-entry mutex={} nest={} ra={} rev=ml442",
+                        static_cast<void*>(&Futex), OwnerSharedNest, __builtin_return_address(0));
+    }
+    return true;
+  }
+
+  bool IosWriterSelfSharedRelease() {
+    const uint64_t Teb = IosSelfTeb();
+    if (!Teb || OwnerTeb != Teb || !OwnerSharedNest) {
+      return false;
+    }
+    OwnerSharedNest--;
+    return true;
+  }
+
+  /* ml450: write→write recursion (nested compile's buffer-swap re-locks the
+   * L' it already write-owns).  Same OwnerTeb==self race-freedom argument as
+   * the shared grant; nest counter pairs lock()/unlock() LIFO. */
+  uint32_t OwnerWriteNest {};
+
+  bool IosWriterSelfWrite() {
+    const uint64_t Teb = IosSelfTeb();
+    if (!Teb || OwnerTeb != Teb) {
+      return false;
+    }
+    OwnerWriteNest++;
+    static std::atomic<int> WriteNestLog {0};
+    if (WriteNestLog.fetch_add(1, std::memory_order_relaxed) < 20) {
+      LogMan::Msg::EFmt("[fexlock] SELF-WRITE write-owner re-entry mutex={} nest={} ra={} rev=ml450",
+                        static_cast<void*>(&Futex), OwnerWriteNest, __builtin_return_address(0));
+    }
+    return true;
+  }
+
+  bool IosWriterSelfWriteRelease() {
+    const uint64_t Teb = IosSelfTeb();
+    if (!Teb || OwnerTeb != Teb || !OwnerWriteNest) {
+      return false;
+    }
+    OwnerWriteNest--;
+    return true;
   }
 
   /* iOS-Mythic ml413: the ml413 wedge was read-owners=1 with the writer parked
@@ -567,6 +700,64 @@ private:
   void NoteWriteReleased() {}
   void NoteReadAcquired() {}
   void NoteReadReleased() {}
+  bool IosWriterSelfShared() {
+    return false;
+  }
+  bool IosWriterSelfSharedRelease() {
+    return false;
+  }
+  bool IosWriterSelfWrite() {
+    return false;
+  }
+  bool IosWriterSelfWriteRelease() {
+    return false;
+  }
 #endif
 };
+
+/* iOS-Mythic ml455 (#74 delivery-under-locks): every stall flavor left after
+ * ml454 is one shape — a fault delivered while THIS thread's interrupted frame
+ * holds emission locks (WPM shared / CodeBufferWriteMutex / lookup write), and
+ * the guest SEH machinery then re-enters the compiler, which parks on those
+ * same locks.  Detection is unambiguous at compiler ENTRY points: slot 7
+ * (0x16f0, WPM shared-hold depth) and slot 6 (0x16e8, CodeBufferWriteMutex
+ * stamp) are always zero there on synchronous paths (ExitFunctionLink releases
+ * its brief shared scope before calling CompileBlock), so nonzero means an
+ * interrupted frame below us.  Slot 3 (0x16d0, previously unused — slots 4-10
+ * are taken, 0x1710 is past the Instrumentation array) carries the
+ * "unpublished compile" mode as a DEPTH from CompileBlock down into the
+ * backend, so the emission section can refuse buffer swaps (the ml452
+ * TAIL-REFUSED lesson) without misreading its OWN normal-path holds. */
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+static inline uint64_t IosDeliveryProbeTeb() {
+  uint64_t Teb = 0;
+  __asm volatile("mov %0, x18" : "=r"(Teb));
+  return Teb;
+}
+static inline bool IosEmissionLocksHeldBySelf() {
+  const uint64_t Teb = IosDeliveryProbeTeb();
+  if (!Teb) {
+    return false;
+  }
+  return *reinterpret_cast<const uint32_t*>(Teb + 0x16f0) != 0 || *reinterpret_cast<const uint64_t*>(Teb + 0x16e8) != 0;
+}
+static inline void IosAdjustUnpublishedCompileDepth(int64_t Delta) {
+  const uint64_t Teb = IosDeliveryProbeTeb();
+  if (Teb) {
+    *reinterpret_cast<uint64_t*>(Teb + 0x16d0) += static_cast<uint64_t>(Delta);
+  }
+}
+static inline bool IosUnpublishedCompileActive() {
+  const uint64_t Teb = IosDeliveryProbeTeb();
+  return Teb && *reinterpret_cast<const uint64_t*>(Teb + 0x16d0) != 0;
+}
+#else
+static inline bool IosEmissionLocksHeldBySelf() {
+  return false;
+}
+static inline void IosAdjustUnpublishedCompileDepth(int64_t) {}
+static inline bool IosUnpublishedCompileActive() {
+  return false;
+}
+#endif
 } // namespace FEXCore::Utils::WritePriorityMutex

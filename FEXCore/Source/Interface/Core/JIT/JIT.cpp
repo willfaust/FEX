@@ -579,6 +579,21 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     Frame->State.rip = GuestRip;
     return Frame->Pointers.DispatcherLoopTop;
   } else {
+#ifdef FEX_IOS_HOST
+    /* iOS-Mythic ml455 (#74 delivery-under-locks): guest SEH delivery running
+     * while an interrupted frame on this thread holds emission locks.  Both
+     * FindBlock and the link patch below take locks that frame may own —
+     * bounce to the dispatcher loop instead, which compiles unpublished
+     * (Core.cpp) with no linking at all. */
+    if (FEXCore::Utils::WritePriorityMutex::IosEmissionLocksHeldBySelf()) {
+      static std::atomic<int> UnpubLinkLogCount {0};
+      if (UnpubLinkLogCount.fetch_add(1, std::memory_order_relaxed) < 20) {
+        LogMan::Msg::EFmt("[fexlock] UNPUB-LINK bounce rip=0x{:x} rev=ml455", GuestRip);
+      }
+      Frame->State.rip = GuestRip;
+      return Frame->Pointers.DispatcherLoopTop;
+    }
+#endif
     {
       // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
       auto lk_inval =
@@ -741,6 +756,34 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
   CurrentCodeBuffer = CodeBuffers.GetLatest();
   ThreadState->LookupCache->Shared = CurrentCodeBuffer->LookupCache.get();
 }
+
+#ifdef FEX_IOS_HOST
+#ifdef _WIN32
+extern "C" int32_t NtTerminateProcess(void* ProcessHandle, int32_t ExitStatus);
+#endif
+
+/* iOS-Mythic ml460 (#75): the ml455 bail paths return a null code pointer,
+ * which the dispatcher then executes -> c0000005 at address 0 -> guest SEH
+ * re-enters the compiler under delivery -> bails again. At pool exhaustion
+ * this looped 69,902 times in the ml459 run, burning minutes of CPU and
+ * pushing phys from 3.9 to 4.07GB before jetsam. Bails are legitimate only
+ * as a rare transient (a handful per run when delivery races a swap); a
+ * process that has bailed hundreds of times is dead and cannot deliver its
+ * own exception — end it honestly with STATUS_COMMITMENT_LIMIT. */
+static void IosCountUnpubBailOrTerminate() {
+  static std::atomic<uint32_t> BailCount {0};
+  const uint32_t Count = BailCount.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (Count == 64) {
+    LogMan::Msg::EFmt("[fexlock] UNPUB bail count reached 64 — storm forming rev=ml460");
+  }
+  if (Count >= 256) {
+    LogMan::Msg::EFmt("[fexlock] UNPUB bail count {} — terminating process (undeliverable exception at exhaustion) rev=ml460", Count);
+#ifdef _WIN32
+    NtTerminateProcess(reinterpret_cast<void*>(-1), static_cast<int32_t>(0xC000012D)); // STATUS_COMMITMENT_LIMIT
+#endif
+  }
+}
+#endif
 
 void Arm64JITCore::EmitDetectionString() {
   const char JITString[] = "FEXJIT::Arm64JITCore::";
@@ -1172,7 +1215,65 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   // Migrate the compile output from temporary storage to the actual CodeBuffer.
   // This can block progress in other compiling threads, so the duration of the lock should be as small as possible.
   {
+#ifdef FEX_IOS_HOST
+    /* iOS-Mythic ml446 (#74): stamp ownership of this std::mutex (an SRWLOCK
+     * underneath, anonymous by design) in TEB Instrumentation[6] so the
+     * monitor's dead-holder reaper can spot a cross-terminated thread that
+     * died inside this section and release the lock.  Cleared at scope end.
+     *
+     * ml449: the ml448 run caught Chrome_InProcRendererThread HOLDING this
+     * mutex while parked waiting for it — the compile path re-entered this
+     * section on the same thread (non-recursive mutex ⇒ permanent self-park,
+     * the #74 stall's live-holder flavor).  The stamp doubles as a perfect
+     * self-ownership test: grant nested entry instead of parking.  The outer
+     * hold already has exclusive access; the nested section's LatestOffset
+     * use is same-thread-sequenced.  Loud capped log names the re-entry. */
+    uint64_t IosStampTeb = 0;
+    bool IosNestedS = false;
+    __asm volatile("mov %0, x18" : "=r"(IosStampTeb));
+    if (IosStampTeb && *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) ==
+                         reinterpret_cast<uint64_t>(&CodeBuffers.CodeBufferWriteMutex)) {
+      IosNestedS = true;
+      static std::atomic<int> NestLogCount {0};
+      if (NestLogCount.fetch_add(1, std::memory_order_relaxed) < 20) {
+        LogMan::Msg::EFmt("[fexlock] SELF-NESTED CodeBufferWriteMutex ra={} rev=ml449", __builtin_return_address(0));
+      }
+    }
+    /* ml455 (#74 delivery-under-locks): Core.cpp marks a delivery compile via
+     * TEB slot 3 depth.  In that mode this section must never park (another
+     * thread can hold S while itself waiting on a lookup lock our interrupted
+     * frame write-owns — a 3-way cycle no reaper can break) and must never
+     * swap buffers (the ml452 TAIL-REFUSED storm). */
+    const bool IosUnpubMode = IosStampTeb && *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16d0) != 0;
+    std::unique_lock<std::remove_reference_t<decltype(CodeBuffers.CodeBufferWriteMutex)>> CodeBufferLock;
+    if (!IosNestedS) {
+      if (IosUnpubMode) {
+        /* Bounded acquire: tens of ms of yield-spins, then fail this ONE
+         * compile (dispatcher faults one thread) instead of parking forever. */
+        bool Acquired = false;
+        for (uint64_t Spin = 0; Spin < 4000000; Spin++) {
+          if (CodeBuffers.CodeBufferWriteMutex.try_lock()) {
+            Acquired = true;
+            break;
+          }
+          __asm volatile("yield");
+        }
+        if (!Acquired) {
+          LogMan::Msg::EFmt("[fexlock] UNPUB-COMPILE bail: S unavailable (possible cycle via our held locks) rev=ml455");
+          IosCountUnpubBailOrTerminate();
+          return {};
+        }
+        CodeBufferLock = std::unique_lock {CodeBuffers.CodeBufferWriteMutex, std::adopt_lock};
+      } else {
+        CodeBufferLock = std::unique_lock {CodeBuffers.CodeBufferWriteMutex};
+      }
+      if (IosStampTeb) {
+        *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = reinterpret_cast<uint64_t>(&CodeBuffers.CodeBufferWriteMutex);
+      }
+    }
+#else
     auto CodeBufferLock = std::unique_lock {CodeBuffers.CodeBufferWriteMutex};
+#endif
 
     // Query size of generated code
     const auto TempSize = GetCursorOffset();
@@ -1181,6 +1282,23 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     {
       LOGMAN_THROW_A_FMT(CurrentCodeBuffer->LookupCache.get() == ThreadState->LookupCache->Shared, "INVARIANT VIOLATED: SharedLookupCache "
                                                                                                    "doesn't match up!\n");
+#ifdef FEX_IOS_HOST
+      /* ml455: a delivery compile must not rewire buffers — the interrupted
+       * frame below may be mid-swap and write-own the lookup lock (the very
+       * park this path exists to avoid).  Torn state (side-effect-free checks;
+       * CheckCodeBufferUpdate() itself exchanges CurrentCodeBuffer) ⇒ fail
+       * this one compile. */
+      if (IosUnpubMode) {
+        if (ThreadState->LookupCache->Shared != CurrentCodeBuffer->LookupCache.get() || CodeBuffers.GetLatest() != CurrentCodeBuffer) {
+          LogMan::Msg::EFmt("[fexlock] UNPUB-COMPILE bail: buffer swap in flight below us rev=ml455");
+          IosCountUnpubBailOrTerminate();
+          if (IosStampTeb && !IosNestedS) {
+            *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = 0;
+          }
+          return {};
+        }
+      } else
+#endif
       if (auto Prev = CheckCodeBufferUpdate()) {
         Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
         auto lk = ThreadState->LookupCache->AcquireWriteLock();
@@ -1197,6 +1315,19 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       SetCursorOffset(CodeBuffers.LatestOffset);
       Align16B();
       if ((GetCursorOffset() + TempSize) > CurrentCodeBuffer->UsableSize()) {
+#ifdef FEX_IOS_HOST
+        /* ml455: NEVER swap buffers under a delivery compile — ClearCodeCache
+         * from beneath a live outer emission is the ml452 TAIL-REFUSED storm,
+         * and its lookup-lock writes are the park.  Fail this one compile. */
+        if (IosUnpubMode) {
+          LogMan::Msg::EFmt("[fexlock] UNPUB-COMPILE bail: buffer full, refusing swap mid-delivery rev=ml455");
+          IosCountUnpubBailOrTerminate();
+          if (IosStampTeb && !IosNestedS) {
+            *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = 0;
+          }
+          return {};
+        }
+#endif
         CTX->ClearCodeCache(ThreadState);
       }
 
@@ -1242,6 +1373,14 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     SetCursorOffset(CodeBuffers.LatestOffset + TempSize);
 
     CodeBuffers.LatestOffset = GetCursorOffset();
+
+#ifdef FEX_IOS_HOST
+    /* ml446: clear the ownership stamp before the lock releases at scope end
+     * (ml449: outer hold only — a nested grant must leave the stamp intact) */
+    if (IosStampTeb && !IosNestedS) {
+      *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = 0;
+    }
+#endif
   }
   /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] Arm64JIT: CompileCode done, returning");
 

@@ -28,9 +28,31 @@ struct LookupCacheWriteLockToken : public LookupCacheBaseLockToken {
 private:
   // Only constructible by GuestToHostMap
   friend struct GuestToHostMap;
+  /* iOS-Mythic ml452 (#74): manual RAII instead of lock_guard so a token
+   * constructed while this thread ALREADY write-owns the mutex no-ops (the
+   * fault-handler re-entry chain: outer swap holds L'-write → nested compile
+   * → nested swap re-acquires — the write→write self-park that stalled
+   * ml449/ml451 runs).  Pairing is per-token: unlock iff this token locked. */
+  /* ml453: nested-aware acquire DISABLED — the ml452 grant let the nested
+   * emission reach its buffer-full branch, whose ClearCodeCache swap loops
+   * against the outer emission's state: 196k tail refusals + 65k AV retries
+   * in 2 minutes, phys to 4085MB (jetsam kill).  The self-park it replaced is
+   * the lesser harm until the re-entry path (ra=0x1369f718c, task #69) gets a
+   * nested-safe buffer-full strategy. */
   LookupCacheWriteLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex)
-    : Lock {Mutex} {}
-  std::lock_guard<FEXCore::Utils::WritePriorityMutex::Mutex> Lock;
+    : LockRef {Mutex}
+    , Locked {(Mutex.lock(), true)} {}
+  FEXCore::Utils::WritePriorityMutex::Mutex& LockRef;
+  bool Locked;
+
+public:
+  ~LookupCacheWriteLockToken() {
+    if (Locked) {
+      LockRef.unlock();
+    }
+  }
+  LookupCacheWriteLockToken(const LookupCacheWriteLockToken&) = delete;
+  LookupCacheWriteLockToken& operator=(const LookupCacheWriteLockToken&) = delete;
 };
 
 struct LookupCacheReadLockToken : public LookupCacheBaseLockToken {

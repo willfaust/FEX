@@ -16,6 +16,10 @@ $end_info$
 #include <FEXCore/fextl/map.h>
 
 #include <cstdint>
+#ifdef FEX_IOS_HOST
+#include <atomic>
+#include <mutex>
+#endif
 
 namespace FEXCore::CPU {
 union Relocation;
@@ -41,6 +45,12 @@ namespace CodeSerialize {
 struct GuestToHostMap;
 
 namespace CPU {
+#ifdef FEX_IOS_HOST
+  // ml460 (#75): monotonically increasing CodeBuffer generation number,
+  // bumped on every AllocateNew. Drives the deferred pool-tail sweep.
+  uint64_t IosCodeBufferGeneration();
+#endif
+
   struct CodeBuffer {
     uint8_t* Ptr;
     size_t AllocatedSize; // including guard page; see UsableSize()
@@ -87,6 +97,15 @@ namespace CPU {
     FEXCore::ForkableUniqueMutex CodeBufferWriteMutex;
 
     virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
+
+#ifdef FEX_IOS_HOST
+    /* iOS-Mythic ml460 (#75): the pool-tail sweeper (Module.cpp) reads Latest
+     * WITHOUT holding CodeBufferWriteMutex, racing AllocateNew's assignment.
+     * A shared_ptr copy concurrent with an assignment is UB, so both go
+     * through this small leaf mutex. Never held while acquiring any other
+     * lock (assignment + copy only). */
+    std::mutex LatestMutex;
+#endif
 
   private:
     fextl::shared_ptr<CodeBuffer> Latest;
@@ -181,6 +200,30 @@ namespace CPU {
     // The returned reference should be kept alive carefully to avoid early deletion of resources.
     [[nodiscard]]
     fextl::shared_ptr<CodeBuffer> CheckCodeBufferUpdate();
+
+#ifdef FEX_IOS_HOST
+    /* iOS-Mythic ml460 (#75 pool exhaustion): CurrentCodeBuffer pins a whole
+     * generation for as long as this thread holds the ref, and the ONLY
+     * release sites are compile-path self-migrations — so a thread parked in
+     * a wine wait pins its generation for the entire park (ml459 census: 13
+     * 16MB generations live, 0 free, 208MB of a 896MB pool, while steady
+     * state needs ~2). The sweeper (Module.cpp IosMaybeSweepCodeBuffers)
+     * remote-migrates parked threads. Concurrency: the asm-side Dekker gate
+     * (IosCodeBufferSweepGate vs InSimulation) keeps the OWNER out of
+     * emitted-code use of L1/callret during a sweep; this per-thread spin
+     * lock serializes every C++ toucher of CurrentCodeBuffer /
+     * SignalHandlerCodeBuffers (self compile paths, exception-path queries,
+     * the sweeper). Lock order where nested: LookupCache write lock, THEN
+     * IosMigrateLock. LatestMutex is never held around either. */
+    mutable std::atomic<uint32_t> IosMigrateLock {0};
+    // Returns 1 = migrated, 0 = nothing to do, -1 = skipped (signal frames
+    // in flight), -2 = raced out. Caller must have established via the sweep
+    // gate that this thread is outside emitted code (InSimulation == 0).
+    int IosRemoteMigrateStale(const fextl::shared_ptr<CodeBuffer>& LatestBuf);
+    CodeBufferManager& GetCodeBufferManager() {
+      return CodeBuffers;
+    }
+#endif
 
   protected:
     // Max spill slot size in bytes. We need at most 32 bytes

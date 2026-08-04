@@ -105,6 +105,13 @@ static volatile uint64_t g_mythic_thr_last_rip[4] = {0,0,0,0};
 static volatile uint64_t g_cb_total = 0;
 static volatile uint64_t g_cb_real_compiles = 0;
 
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+/* iOS-Mythic ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
+ * frontend (Module.cpp) which owns the thread registry. extern "C" so the
+ * cross-layer reference has no namespace in its linkage name. */
+extern "C" void IosMaybeSweepCodeBuffers(FEXCore::Core::InternalThreadState* CallerThread);
+#endif
+
 namespace FEXCore::Context {
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
@@ -891,7 +898,9 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   // We could lock CodeBufferWriteMutex earlier to prevent this from happening,
   // but this would increase lock contention. Redundant frontend runs aren't
   // as expensive and are easily reverted.
-  if (MaxInst != 1) {
+  /* ml455 (#74): skip the recheck under a delivery compile — FindBlock takes
+   * the lookup read lock our interrupted frame may write-own. */
+  if (MaxInst != 1 && !FEXCore::Utils::WritePriorityMutex::IosUnpublishedCompileActive()) {
     if (auto Block = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
       // Raced to compile, release the OpDispatcher IR.
       Thread->OpDispatcher->DelayedDisownBuffer();
@@ -1568,6 +1577,34 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
+#ifdef FEX_IOS_HOST
+  /* iOS-Mythic ml455 (#74 delivery-under-locks): if an interrupted frame on
+   * THIS thread already holds emission locks, this call can only be guest SEH
+   * delivery re-entering the compiler asynchronously.  Re-taking the
+   * invalidation shared lock risks the write-priority recursive-read park,
+   * FindBlock takes the lookup lock the frame below may write-own, and
+   * publication would do the same — so compile WITHOUT locks or publication
+   * and hand the block back for a one-shot execute.  It is re-compiled and
+   * published normally on the next synchronous miss.  CompileSingleStep
+   * proves the dispatcher happily consumes an unpublished pointer. */
+  const bool IosUnpublished = FEXCore::Utils::WritePriorityMutex::IosEmissionLocksHeldBySelf();
+  std::shared_lock<std::remove_reference_t<decltype(CodeInvalidationMutex)>> lk;
+  if (IosUnpublished) {
+    static std::atomic<int> UnpubLogCount {0};
+    if (UnpubLogCount.fetch_add(1, std::memory_order_relaxed) < 40) {
+      LogMan::Msg::EFmt("[fexlock] UNPUB-COMPILE rip=0x{:x} rev=ml455", GuestRIP);
+    }
+  } else {
+    // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
+    lk = std::shared_lock {CodeInvalidationMutex};
+
+    // Is the code in the cache?
+    // The backends only check L1 and L2, not L3
+    if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+      return HostCode;
+    }
+  }
+#else
   // Invalidate might take a unique lock on this, to guarantee that during invalidation no code gets compiled
   auto lk = GuardSignalDeferringSection<std::shared_lock>(CodeInvalidationMutex, Thread);
 
@@ -1576,6 +1613,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
     return HostCode;
   }
+#endif
 
   // iOS-Mythic: cache miss reached — count as true compile.
   __sync_add_and_fetch(&g_cb_real_compiles, 1);
@@ -1583,7 +1621,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
 
+#ifdef FEX_IOS_HOST
+  /* ml455: depth (not a flag) — a doubly-nested delivery must not clear the
+   * outer level's mode on its way out. */
+  if (IosUnpublished) {
+    FEXCore::Utils::WritePriorityMutex::IosAdjustUnpublishedCompileDepth(1);
+  }
+#endif
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+#ifdef FEX_IOS_HOST
+  if (IosUnpublished) {
+    FEXCore::Utils::WritePriorityMutex::IosAdjustUnpublishedCompileDepth(-1);
+  }
+#endif
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
   /* iOS-Mythic diag (Thumper desktop ILL 2026-07-06): three crashes branched
    * to BlockTail+0x18 instead of a code entry — the published entry itself
@@ -1653,6 +1703,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     Thread->CPUBackend->ClearRelocations();
   }
 
+#ifdef FEX_IOS_HOST
+  /* ml455: delivery-mode block — return for one-shot execution WITHOUT any
+   * publication.  Guest-range registration, the lookup insert and the codemap
+   * all take locks an interrupted frame below may own. */
+  if (IosUnpublished) {
+    return (uintptr_t)CodePtr;
+  }
+#endif
+
   fextl::vector<uint64_t> CodePages;
 
   if (NeedsAddGuestCodeRanges) {
@@ -1680,6 +1739,19 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       CodeMapWriter->AppendBlock(*Region, GuestRIP);
     }
   }
+
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+  /* iOS-Mythic ml460 (#75): deferred pool-tail sweep. A generation swap makes
+   * every parked thread's CurrentCodeBuffer ref a dead pin (ml459: 13 16MB
+   * generations live where steady state needs ~2). The frontend sweeper walks
+   * its thread registry and remote-migrates threads that are outside emitted
+   * code. Triggered here — a synchronous compile, past emission, holding only
+   * the shared CodeInvalidationMutex (sweep order WPM-shared -> map-write ->
+   * migrate-spin matches every other taker). Never from a delivery compile. */
+  if (!IosUnpublished) {
+    IosMaybeSweepCodeBuffers(Thread);
+  }
+#endif
 
   return (uintptr_t)CodePtr;
 }
