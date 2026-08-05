@@ -27,6 +27,26 @@ public:
     if (UnixLib::SetKernelUnalignedAtomicControl(Flags)) {
       LogMan::Msg::IFmt("FEX: Kernel unaligned atomics enabled!");
     }
+
+    /* iOS-Mythic ml512/ml513: report the EFFECTIVE TSO configuration at
+     * runtime. A compiled-in config default is invisible to binary greps, so
+     * this line is the only way to know what the JIT is actually doing.
+     *
+     * ml512 flipped VectorTSOEnabled/MemcpySetTSOEnabled to true and the
+     * Chromium raster corruption was UNCHANGED; ml513 reverted both to the
+     * upstream default (false). KNOWN ACCURACY GAP, deliberately accepted:
+     * x86 orders SSE/AVX and rep-movs accesses under TSO and FEX emits them
+     * unordered, so a guest relying on per-location vector ordering without
+     * a scalar release would misbehave. Nothing observed needs it, and
+     * ordering every vector access taxes exactly the vector-heavy game
+     * workloads that are the product (Thumper). Re-enable by flipping the
+     * two Config.json.in defaults; this line proves which way it shipped. */
+    {
+      FEX_CONFIG_OPT(VecTSO, VECTORTSOENABLED);
+      FEX_CONFIG_OPT(MemcpyTSO, MEMCPYSETTSOENABLED);
+      LogMan::Msg::IFmt("FEX: TSO config tso={} halfbar={} vector={} memcpyset={} rev=ml513",
+                        TSOEnabled(), HalfBarrierTSOEnabled(), VecTSO(), MemcpyTSO());
+    }
   }
 
   FEXCore::ArchHelpers::Arm64::UnalignedHandlerType GetUnalignedHandlerType() const {
