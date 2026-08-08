@@ -58,6 +58,25 @@ extern "C" {
 // this reason; this is that rule's missing twin on the FEX side. Tombstone
 // order matches wine's: Size = 0 first (a zero-size entry matches no range
 // query, including Module.S's inline asm walk), barrier, then reuse the slot.
+/* iOS-Mythic ml549: EXACT guest RIP from a host PC, for the unix-side fault probes.
+ *
+ * The Mach handlers in ntdll-unix read the guest RIP from CpuStateFrame+0x18, which FEX
+ * only syncs at BLOCK boundaries -- it names the calling block, not the instruction that
+ * ran. ml548 disassembled such a RIP and got call setup instead of the store it was
+ * hunting, which is why the render-corruption writer could never be identified.
+ *
+ * FEX already stores a host-PC -> guest-RIP table in every JIT block tail and walks it
+ * for exception reconstruction. ios_fex_rip_from_hostpc (Core.cpp) is that walk without
+ * the Thread dependency; this is its EC export so the unix side can reach it through the
+ * same bind-and-push path as BTCpu64IosAddAliasMapping.
+ *
+ * Zero runtime cost: nothing is instrumented, the table already exists. Returns 0 when
+ * the PC is outside the block, so a caller can distinguish "no answer" from a real RIP. */
+uint64_t BTCpu64IosRipFromHostPC(uint64_t BlockBegin, uint64_t HostPC) {
+  extern uint64_t ios_fex_rip_from_hostpc(uint64_t, uint64_t);
+  return ios_fex_rip_from_hostpc(BlockBegin, HostPC);
+}
+
 void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
   int count = g_EntryCount;
 

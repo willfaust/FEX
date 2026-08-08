@@ -46,6 +46,12 @@ public:
       FEX_CONFIG_OPT(MemcpyTSO, MEMCPYSETTSOENABLED);
       LogMan::Msg::IFmt("FEX: TSO config tso={} halfbar={} vector={} memcpyset={} rev=ml513",
                         TSOEnabled(), HalfBarrierTSOEnabled(), VecTSO(), MemcpyTSO());
+      /* ml538: and the EFFECTIVE host-feature set. A compiled-in default is
+       * invisible to binary greps, and the whole AVX experiment is worthless
+       * without proof of which way it shipped. */
+      FEX_CONFIG_OPT(HostFeat, HOSTFEATURES);
+      LogMan::Msg::IFmt("FEX: HostFeatures={} (ml538: DISABLEAVX expected; "
+                        "AVX off => Skia takes SSE paths) rev=ml538", HostFeat());
     }
   }
 

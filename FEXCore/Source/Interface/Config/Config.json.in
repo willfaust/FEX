@@ -39,6 +39,17 @@
       },
       "HostFeatures": {
         "Type": "strenum",
+        "_comment_ml538": [
+          "iOS-Mythic ml538 REVERTED: AVX is EXONERATED for the render corruption.",
+          "With HostFeatures=disableavx (shipped, proven by the runtime marker) the",
+          "corruption was UNCHANGED - and the writer census CHANGED (clear 816->1140,",
+          "content painter 1320->684, the +0x58d937 writer vanished entirely). So",
+          "different Skia vector routines ran and the bug survived identically, which",
+          "exonerates the vector blitter/raster paths generally, not just AVX.",
+          "It was NOT slower (webhelper spawn t+11.2s vs t+15.5s), so the 256-bit-as-two-",
+          "128-bit emulation was costing more than it bought - but an unproven change is",
+          "not kept (ml513 lesson). Flip to DISABLEAVX to reproduce."
+        ],
         "Default": "FEXCore::Config::HostFeatures::OFF",
         "Enums": {
           "ENABLESVE": "enablesve",

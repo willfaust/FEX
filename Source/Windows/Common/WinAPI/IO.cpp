@@ -114,39 +114,30 @@ DLLEXPORT_FUNC(WINBOOL, WriteFile,
   if (lpOverlapped) {
     UNIMPLEMENTED();
   }
-  /* iOS-Mythic: also dprintf to stderr (= mythic-log.txt) so we can SEE
-   * what x86_64 PE writes regardless of where hFile actually points. */
-  {
-    char dbg[8 + 64 + 16];
-    const char *hexd = "0123456789abcdef";
-    int i = 0;
-    const char *p = "[WriteFile h=0x";
-    while (p[i]) { dbg[i] = p[i]; i++; }
-    unsigned long long h = (unsigned long long)hFile;
-    for (int j = 60; j >= 0; j -= 4) dbg[i++] = hexd[(h >> j) & 0xf];
-    dbg[i++] = ' ';
-    dbg[i++] = 'b';
-    dbg[i++] = 'y';
-    dbg[i++] = 't';
-    dbg[i++] = 'e';
-    dbg[i++] = 's';
-    dbg[i++] = '=';
-    unsigned long n = nNumberOfBytesToWrite > 64 ? 64 : nNumberOfBytesToWrite;
-    for (unsigned long k = 0; k < n; ++k) {
-      unsigned char c = ((const unsigned char*)lpBuffer)[k];
-      if (c >= 0x20 && c < 0x7f) dbg[i++] = (char)c;
-      else if (c == '\n') { dbg[i++] = '\\'; dbg[i++] = 'n'; }
-      else { dbg[i++] = '?'; }
-    }
-    dbg[i++] = '\n';
-    HANDLE stderr_h = NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters
-                          ? reinterpret_cast<HANDLE>(reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters)->hStdError)
-                          : nullptr;
-    if (stderr_h && stderr_h != hFile) {
-      IO_STATUS_BLOCK sb;
-      NtWriteFile(stderr_h, nullptr, nullptr, nullptr, &sb, dbg, (ULONG)i, nullptr, nullptr);
-    }
-  }
+  /* iOS-Mythic ml572: WriteFile TRACING BLOCK REMOVED — it was a stack smash.
+   *
+   * It formatted into `char dbg[8 + 64 + 16]` (88 bytes) but wrote a 38-byte
+   * header plus up to 64 preview bytes, each of which could expand to 2 chars
+   * for '\n', plus a trailing newline: 103 bytes for ordinary text and 167 in
+   * the worst case. Any WriteFile whose payload was >= 50 bytes overflowed, and
+   * the compiler had placed the callee-saved registers immediately after it
+   * (dbg at sp+0x18, saved x19 at sp+0x70 — exactly 88 bytes later, x20 at
+   * sp+0x78). So the overflow wrote the log text straight onto the caller's
+   * saved x20, and on return the caller's `blr x20` jumped into ASCII.
+   *
+   * Proven byte-for-byte across four runs: ml571 faulted at pc=0xa336531373030,
+   * which is the little-endian bytes "0071e3\n\0" — the tail of the rpm-poison
+   * record being written at that moment. ml483a/ml484a/mlf show the same shape
+   * with 0071e0/0071e1/0071e2. Diagnosis by Sol.
+   *
+   * The fault then landed while FEX's CodeInvalidationMutex was held, and the
+   * guest redirect bypassed the RAII unlock — leaving one leaked reader and one
+   * waiting writer, which stops compilation dead. That is the [deliver-hold]
+   * "leaks the read hold" line and the whole-app freeze.
+   *
+   * Deleted rather than enlarged: this is a hot path on every guest write, the
+   * output was going to a guest stderr handle we rarely read, and a fixed-size
+   * formatter here has now cost more than it ever explained. */
   NTSTATUS Status = NtWriteFile(hFile, nullptr, nullptr, nullptr, &IOSB, lpBuffer, nNumberOfBytesToWrite, nullptr, nullptr);
   if (lpNumberOfBytesWritten) {
     *lpNumberOfBytesWritten = static_cast<DWORD>(IOSB.Information);

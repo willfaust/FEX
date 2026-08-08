@@ -221,6 +221,52 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
   return Frame->State.rip;
 }
 
+/* iOS-Mythic ml549: EXACT guest RIP from a host PC, callable from C.
+ *
+ * WHY: our fault probes (srcwatch, the bus/segv handlers) read the guest RIP out of
+ * CpuStateFrame+0x18, which FEX only syncs at BLOCK boundaries. That names the calling
+ * block, never the instruction that actually executed — ml548 disassembled such a RIP
+ * and found `movq %rbp,%rcx; callq` (call setup), not the store we were hunting. Every
+ * "which instruction wrote this pixel" question dies on that imprecision.
+ *
+ * FEX already carries the answer: each JIT block appends a host-PC -> guest-RIP table
+ * (JIT.cpp writes it as vl64pair entries in the block tail), and RestoreRIPFromHostPC
+ * walks it for exception reconstruction. This is the same walk, minus the Thread
+ * dependency, exported as plain C so ntdll-unix can call it with values it already has:
+ * the block header pointer lives at CPUState offset 0 (== x28+0), and the host PC comes
+ * straight from the Mach thread state.
+ *
+ * Zero runtime cost: no instrumentation, no extra faults, just a table walk at fault
+ * time using data FEX maintains anyway. Returns 0 when the PC is outside the block or
+ * the header is unusable, so the caller can tell "no answer" from a real RIP. */
+extern "C" uint64_t ios_fex_rip_from_hostpc(uint64_t BlockBegin, uint64_t HostPC) {
+  if (!BlockBegin) {
+    return 0;
+  }
+  const auto* InlineHeader = reinterpret_cast<const CPU::CPUBackend::JITCodeHeader*>(BlockBegin);
+  const auto* InlineTail = reinterpret_cast<const CPU::CPUBackend::JITCodeTail*>(BlockBegin + InlineHeader->OffsetToBlockTail);
+
+  if (HostPC < BlockBegin || HostPC >= (BlockBegin + InlineTail->Size)) {
+    return 0;
+  }
+
+  const auto* RIPEntry = reinterpret_cast<const uint8_t*>(BlockBegin + InlineHeader->OffsetToBlockTail + InlineTail->OffsetToRIPEntries);
+  uint64_t StartingHostPC = BlockBegin;
+  uint64_t StartingGuestRIP = InlineTail->RIP;
+
+  for (uint32_t i = 0; i < InlineTail->NumberOfRIPEntries; ++i) {
+    auto Offset = FEXCore::Utils::vl64pair::Decode(RIPEntry);
+    RIPEntry += Offset.Size;
+    if (HostPC >= (StartingHostPC + Offset.IntegerARMPC)) {
+      StartingHostPC += Offset.IntegerARMPC;
+      StartingGuestRIP += Offset.IntegerX86RIP;
+    } else {
+      break;
+    }
+  }
+  return StartingGuestRIP;
+}
+
 uint32_t ContextImpl::ReconstructCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, bool WasInJIT, const uint64_t* HostGPRs,
                                                  uint64_t PSTATE) {
   const auto Frame = Thread->CurrentFrame;
