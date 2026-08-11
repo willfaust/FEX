@@ -440,7 +440,7 @@ namespace CPU {
       // Stale callret predictions pair (guest RIP, host addr into Prev); wipe
       // the entries the same way the self-migration path does. SP itself
       // stays — zeroed entries just mispredict into the slow path.
-      FEXCore::Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+      FEXCore::Core::ResetCallRetStack(ThreadState, "cpubackend");
       SignalHandlerCodeBuffers.clear();
       return 1;
       // Prev + KeepAlive drop after lk releases; the final ref frees the

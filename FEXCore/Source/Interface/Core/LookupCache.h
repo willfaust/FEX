@@ -384,7 +384,11 @@ public:
     return L1PointerMask << FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry));
   }
   uintptr_t GetPagePointer() const {
-    return PagePointer;
+    // ml606: publish NULL when there is no L2 region. The JIT never loads
+    // Pointers.L2Pointer in this mode (Dispatcher.cpp:279), so a null here is
+    // inert — and if anything ever does dereference it, it faults at 0 rather
+    // than wandering into whatever now lives at the old address.
+    return L2Enabled ? PagePointer : 0;
   }
   uintptr_t GetVirtualMemorySize() const {
     return VirtualMemSize;
@@ -468,6 +472,27 @@ private:
   uintptr_t L1PointerMask;
 
   size_t TotalCacheSize;
+
+  // iOS-Mythic ml606: L1-ONLY LAYOUT when the L2 cache is disabled.
+  //
+  // The full layout is [L2 page table][CODE_SIZE arena][L1] contiguous — on iOS
+  // 16MB + 32MB + 2MB = 50MB per guest thread, and FEX_IOS_HOST COMMITS it all
+  // up front (the auto-commit-on-AV path doesn't work here). DisableL2Cache
+  // defaults to TRUE and Dispatcher.cpp:279 emits `b(&NoBlock)` instead of any
+  // L2 lookup when it is set, so on the shipping config those 48MB per thread
+  // were allocated, committed and scrubbed but never read. ml605 had ~100 live
+  // caches when it was jetsam-killed at 4080/4096MB with fex=1234MB dirty.
+  //
+  // L2Enabled is snapshotted ONCE here. Do not re-consult the config later:
+  // Dispatcher and each LookupCache would otherwise sample it independently and
+  // could disagree, which would emit an L2 lookup against an L1-only allocation.
+  //
+  // AllocationBase/AllocationSize describe what was ACTUALLY mapped, so the
+  // destructor and the clear paths stay correct in both layouts rather than
+  // operating on PagePointer/TotalCacheSize which only describe the full one.
+  bool L2Enabled;
+  uintptr_t AllocationBase;
+  size_t AllocationSize;
 
   // Start with 8k entries in L1 to give 128KB of L1 cache to each thread.
   // Max out at 1 million entries to give each thread 16MB of L1 cache maximum.

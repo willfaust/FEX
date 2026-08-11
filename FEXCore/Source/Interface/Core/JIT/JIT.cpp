@@ -1300,7 +1300,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       } else
 #endif
       if (auto Prev = CheckCodeBufferUpdate()) {
-        Allocator::VirtualDontNeed(ThreadState->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+        FEXCore::Core::ResetCallRetStack(ThreadState, "jit-rollover");
         auto lk = ThreadState->LookupCache->AcquireWriteLock();
         ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
       }

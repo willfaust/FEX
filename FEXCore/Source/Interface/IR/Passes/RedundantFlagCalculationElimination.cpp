@@ -7,7 +7,9 @@ $end_info$
 
 #include "Interface/IR/IR.h"
 #include "Interface/IR/IREmitter.h"
+#include "Interface/IR/IRTopologyCheck.h"
 #include "Interface/IR/PassManager.h"
+#include "Utils/AllocWatch.h"
 
 #include <FEXCore/Core/X86Enums.h>
 #include <FEXCore/IR/IR.h>
@@ -117,16 +119,61 @@ struct ControlFlowGraph {
       Info.Predecessors.reserve(2);
 
       BlockMap[ID] = std::move(Info);
+      /* ⛔ ml621: the ml611 AllocWatch registration was REMOVED here. See
+       * AllocWatch.h — it produced 71.9M events / 17.2M slot collisions and its
+       * 512-line drain corrupted the exception record, killing ml620. */
       Worklist.push_back(ID);
     }
   }
 
+  // iOS-Mythic ml605: EVERY BlockMap lookup is bounds-checked, and an out-of-range
+  // ID lands on this sentinel instead of past the end of the vector.
+  //
+  // ml604 (db 7276) died here: switching Steam to Library gave the in-process
+  // renderer new libcef code to translate, and DFE::Run+0x378 —
+  //     AddWorklist -> Get(Pred) -> ldrb w9,[x8,#0x21]   (Info->InWorklist)
+  // computed x8 = BlockMap.data() + Pred*40 = 0x97d8c32280 and faulted. That
+  // address is outside EVERY legal band (guest <=0x73ffff0000, PA pools
+  // [0x74,0x7c)G, FEX [0x7c,0x80)G), i.e. it was never a pointer — it is a bogus
+  // *block ID* scaled by sizeof(BlockInfo). So the defect is an invalid CFG index,
+  // NOT a wild IR-node pointer, and pointer-band heuristics would not have caught it.
+  //
+  // Note the structural hazard this guards: Init() sizes BlockMap from
+  // IR header BlockCount, while Get() indexes by each block's own Block->ID.
+  // If those ever disagree the very first Get(Block->ID) is already out of range.
+  //
+  // Sentinel semantics are deliberately CONSERVATIVE, so degrading is always safe:
+  //   Flags = FLAG_ALL  -> readers believe every flag is live => nothing eliminated
+  //   InWorklist = true -> AddWorklist never re-queues it => no infinite requeue
+  BlockInfo Sentinel {{}, nullptr, FLAG_ALL, true};
+  uint32_t BadIDs {0};
+  uint32_t FirstBadID {~0u};
+  uint32_t BadIDReports {0};
+
+  bool IDValid(uint32_t Block) const {
+    return Block < BlockMap.size();
+  }
+
   BlockInfo* Get(uint32_t Block) {
+    if (Block >= BlockMap.size()) [[unlikely]] {
+      ++BadIDs;
+      if (FirstBadID == ~0u) {
+        FirstBadID = Block;
+      }
+      if (BadIDReports++ < 4) {
+        LogMan::Msg::EFmt("[dfe-cfg] ml605 OUT-OF-RANGE block id {} (BlockMap.size()={}) "
+                          "rip=0x{:x} -- returning conservative sentinel instead of "
+                          "dereferencing BlockMap.data()+{}",
+                          Block, BlockMap.size(), IR.GetHeader()->OriginalRIP,
+                          (uint64_t)Block * sizeof(BlockInfo));
+      }
+      return &Sentinel;
+    }
     return &BlockMap[Block];
   }
 
   BlockInfo* Get(IROp_CodeBlock* Block) {
-    return &BlockMap[Block->ID];
+    return Get(Block->ID);
   }
 
   BlockInfo* Get(OrderedNodeWrapper Block) {
@@ -135,15 +182,68 @@ struct ControlFlowGraph {
 
   void RecordEdge(uint32_t From, OrderedNodeWrapper To) {
     auto Info = Get(To);
+    if (Info == &Sentinel) {
+      return; // invalid edge target: drop the edge rather than record into scratch
+    }
+
+    // ml607: validate the value we push AND re-read it immediately afterwards.
+    //
+    // This is the discriminator ml606 needed. Every From here is a Block->ID and
+    // ml606 confirmed all block IDs were valid (bad_block_ids=0, max_id=257 <
+    // blockmap=258) — yet a predecessor slot came out holding 0xa8953b50, which
+    // has the shape of a truncated pointer into the vector's own allocator slab
+    // (data=0x7ca8950020). If From is valid going in and the slot is wrong
+    // coming out, the writer is FOREIGN (allocator/heap corruption), not CFG
+    // construction. That distinction decides which subsystem to chase.
+    const bool FromValid = IDValid(From);
+    if (!FromValid && EdgeReports < 4) {
+      ++EdgeReports;
+      LogMan::Msg::EFmt("[dfe-edge] ml607 PUSHING INVALID From={} (blockmap={}) rip=0x{:x} "
+                        "-- CFG construction itself supplied a bad id",
+                        From, BlockMap.size(), IR.GetHeader()->OriginalRIP);
+    }
+
+    const size_t Idx = Info->Predecessors.size();
     Info->Predecessors.push_back(From);
+
+    if (FromValid && Info->Predecessors[Idx] != From && EdgeReports < 4) {
+      ++EdgeReports;
+      LogMan::Msg::EFmt("[dfe-edge] ml607 SLOT CHANGED UNDER US: pushed {} read back {} at index {} "
+                        "(size={} cap={} data={}) rip=0x{:x} -- the value was VALID going in, so a "
+                        "FOREIGN WRITER corrupted the vector, not CFG construction",
+                        From, Info->Predecessors[Idx], Idx, Info->Predecessors.size(), Info->Predecessors.capacity(),
+                        (void*)Info->Predecessors.data(), IR.GetHeader()->OriginalRIP);
+    }
+
   }
 
+  uint32_t EdgeReports {0};
+
   void AddWorklist(fextl::deque<uint32_t>& Worklist, uint32_t Block) {
+    if (!IDValid(Block)) [[unlikely]] {
+      Get(Block); // accounts + reports; never dereferences out of range
+      return;     // skip this edge; the block keeps its conservative flags
+    }
     auto Info = Get(Block);
     if (!Info->InWorklist) {
       Info->InWorklist = true;
       Worklist.push_front(Block);
     }
+  }
+
+  // Cheap order-sensitive digest of every predecessor list. Taken right after CFG
+  // construction and again at the end: if it changes, something MUTATED the
+  // predecessor vectors during the pass. That distinguishes "the CFG was built
+  // wrong" from "the CFG was fine and DFE (or another writer) corrupted it".
+  uint64_t PredecessorDigest() const {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t b = 0; b < BlockMap.size(); ++b) {
+      h = (h ^ (b + 0x9e3779b9ull)) * 1099511628211ull;
+      for (uint32_t p : BlockMap[b].Predecessors) {
+        h = (h ^ p) * 1099511628211ull;
+      }
+    }
+    return h;
   }
 };
 
@@ -526,6 +626,23 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
   // Reverse iteration is not yet working with the iterators
   auto BlockIROp = CurrentIR.GetOp<IR::IROp_CodeBlock>(Block);
 
+  // iOS-Mythic ml599: VALIDATE BEFORE MUTATING.
+  //
+  // ml597 bounded the reverse walk below and ml598 saw it fire (block 405,
+  // 13,183 steps). But that bound trips only AFTER the walk has already called
+  // IREmit->Remove() thousands of times, so "skip the rest" left half-optimized
+  // IR behind and the register allocator then hung on the same block. Checking
+  // the structure up front means we either fix it or never touch it.
+  // ml599b: the CHEAP check on the healthy path. The full diagnostic (forward
+  // walk + Floyd + reciprocity) runs only when this one trips, because ml599
+  // proved the full version on every block is ruinously expensive.
+  IRTopoNoteChecked();
+  if (!QuickBackwardOK(CurrentIR, Block)) {
+    if (HandleSuspectBlock("dfe-entry", CurrentIR, Block) == IRTopoAction::Skip) {
+      return false;
+    }
+  }
+
   // We grab these nodes this way so we can iterate easily
   auto CodeBegin = CurrentIR.at(BlockIROp->Begin);
   auto CodeLast = CurrentIR.at(BlockIROp->Last);
@@ -542,8 +659,29 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
     FlagsRead = CFG.Get(ExitOp->Args[0])->Flags;
   }
 
+  // iOS-Mythic ml597/ml599: BOUND THE REVERSE WALK (backstop).
+  //
+  // This walk terminates only by reaching CodeBegin, so a cyclic or truncated
+  // Previous chain spins forever holding a fexlock read reference and stalls
+  // every other FEX thread. That was the ml594/ml598 hang.
+  //
+  // As of ml599 the entry check above has already PROVEN this chain reaches
+  // CodeBegin, so this bound should now be unreachable. That makes it a
+  // discriminator rather than a duplicate: entry validated clean but the walk
+  // still ran away means DFE's own IREmit->Remove() calls are what corrupt the
+  // list -- which would make this pass the corrupter, not a victim of it.
+  const uint32_t IRNodeBudget = CurrentIR.GetSSACount() + 16;
+  uint32_t StepsTaken = 0;
+
   // Iterate the block in reverse
   while (true) {
+    if (++StepsTaken > IRNodeBudget) {
+      LogMan::Msg::EFmt("[dfe-guard] ml599: reverse walk exceeded {} steps in block {} AFTER a "
+                        "clean entry validation -- DFE ITSELF corrupted the Previous/Next chain "
+                        "while removing nodes; skipping the rest of this block",
+                        IRNodeBudget, BlockIROp->ID);
+      return false;
+    }
     auto [CodeNode, IROp] = CodeLast();
 
     // Optimizing flags can cause earlier flag reads to become dead but dead
@@ -707,19 +845,184 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
     CFG.Get(Block->ID)->Node = BlockNode;
   }
 
+  // iOS-Mythic ml605: SEMANTIC CFG VALIDATION, once, right after construction.
+  //
+  // Answers the question the ml604 crash could not: was the CFG born invalid
+  // (emitter / block-ID gather supplied bad IDs) or did it become invalid while
+  // the pass ran? Everything below is O(blocks + edges) and only logs on failure.
+  const uint64_t PredDigestAtBuild = CFG.PredecessorDigest();
+  {
+    const uint32_t HeaderBlockCount = CurrentIR.GetHeader()->BlockCount;
+    uint32_t MaxSeenID = 0, Enumerated = 0, BadPreds = 0, BadBlockIDs = 0;
+
+    for (auto [BlockNode, BlockHeader] : CurrentIR.GetBlocks()) {
+      auto Block = BlockHeader->C<IROp_CodeBlock>();
+      ++Enumerated;
+      if (Block->ID > MaxSeenID) {
+        MaxSeenID = Block->ID;
+      }
+      if (!CFG.IDValid(Block->ID)) {
+        ++BadBlockIDs;
+      }
+    }
+    for (size_t b = 0; b < CFG.BlockMap.size(); ++b) {
+      for (uint32_t p : CFG.BlockMap[b].Predecessors) {
+        if (!CFG.IDValid(p)) {
+          if (!BadPreds) {
+            const auto& V = CFG.BlockMap[b].Predecessors;
+            LogMan::Msg::EFmt("[dfe-cfg] ml605 BAD PREDECESSOR pred={} in block={} "
+                              "blockmap={} header_blockcount={} enumerated={} max_id={} "
+                              "rip=0x{:x} predvec(size={} cap={} data={})",
+                              p, b, CFG.BlockMap.size(), HeaderBlockCount, Enumerated, MaxSeenID,
+                              CurrentIR.GetHeader()->OriginalRIP, V.size(), V.capacity(), (void*)V.data());
+          }
+          ++BadPreds;
+        }
+      }
+    }
+
+    // ml611 (3): the old test (Enumerated == HeaderBlockCount && MaxSeenID <
+    // size) does NOT prove the IDs are a unique 0..N-1 permutation — a set with
+    // one duplicate and one gap passes it. Check uniqueness, gaps, and the Node
+    // pointer that ProcessBlock will actually dereference.
+    uint32_t DupIDs = 0, MissingIDs = 0, NullNodes = 0, BadWorklistIDs = 0;
+    {
+      fextl::vector<uint8_t> Seen(CFG.BlockMap.size(), 0);
+      for (auto [BlockNode, BlockHeader] : CurrentIR.GetBlocks()) {
+        auto Block = BlockHeader->C<IROp_CodeBlock>();
+        if (CFG.IDValid(Block->ID)) {
+          if (Seen[Block->ID]) {
+            ++DupIDs;
+          }
+          Seen[Block->ID] = 1;
+        }
+      }
+      for (size_t b = 0; b < CFG.BlockMap.size(); ++b) {
+        if (!Seen[b]) {
+          ++MissingIDs;
+        }
+        // THE field that killed ml610: Get() hands a caller Info->Node, and the
+        // out-of-range sentinel's Node is nullptr.
+        if (CFG.BlockMap[b].Node == nullptr) {
+          ++NullNodes;
+        }
+      }
+      // ml611: the worklist is a separate container (deque) from BlockMap, so it
+      // can be corrupted independently. Validate every entry now, so a later
+      // failure can be attributed to propagation rather than to gather.
+      for (uint32_t W : Worklist) {
+        if (!CFG.IDValid(W)) {
+          ++BadWorklistIDs;
+        }
+      }
+    }
+
+    if (BadBlockIDs || BadPreds || Enumerated != HeaderBlockCount || MaxSeenID >= CFG.BlockMap.size() || DupIDs || MissingIDs ||
+        NullNodes || BadWorklistIDs) {
+      // ml607: DO NOT say "born bad" here. This check runs immediately after
+      // gather, so all it establishes is "already bad by then" — it cannot tell
+      // an invalid EDGE from memory corrupted DURING gathering. ml606 showed the
+      // difference matters: every pushed From was a valid block ID, yet a
+      // predecessor slot held pointer debris, and the digest ALSO changed during
+      // propagation. That is a foreign writer, not bad CFG construction.
+      LogMan::Msg::EFmt("[dfe-cfg] ml611 CFG INVALID BY END OF GATHER: bad_block_ids={} bad_preds={} "
+                        "dup_ids={} missing_ids={} null_nodes={} bad_worklist_ids={} "
+                        "enumerated={} header_blockcount={} max_id={} blockmap={} rip=0x{:x} "
+                        "-- ABANDONING this DFE invocation before touching IR (true no-op: gather "
+                        "is read-only, so the block simply keeps every flag calculation)",
+                        BadBlockIDs, BadPreds, DupIDs, MissingIDs, NullNodes, BadWorklistIDs, Enumerated, HeaderBlockCount,
+                        MaxSeenID, CFG.BlockMap.size(), CurrentIR.GetHeader()->OriginalRIP);
+      FEXCore::Utils::AllocWatch::Clear();  // ml621: no drain — see AllocWatch.h
+      return;
+    }
+  }
+
   // After processing a block, if we made progress, we must process its
   // predecessors to propagate globally. A block will be reprocessed only if
   // there is a loop backedge.
+  // iOS-Mythic ml597: BOUND THE WORKLIST TOO — the second way this pass can fail
+  // to terminate. Blocks are re-queued whenever their flag set changes, so if the
+  // dataflow never reaches a fixed point the queue refills forever even though the
+  // per-block walk above is healthy. Bounding both separates the two causes: a
+  // [dfe-guard] "reverse walk" message means a corrupt intrusive list, a "worklist"
+  // message means non-converging dataflow. Same fail-open rule.
+  const uint64_t WorklistBudget = (uint64_t)CurrentIR.GetSSACount() * 64 + 4096;
+  uint64_t WorklistSteps = 0;
+
   for (; !Worklist.empty(); Worklist.pop_back()) {
     auto Block = Worklist.back();
+
+    // ml611 (2): RE-VALIDATE AT EVERY POP, and ABORT THE WHOLE INVOCATION on any
+    // failure — do not merely skip the bad entry.
+    //
+    // This is the ml610 crash. CFG.Get() returns &Sentinel for an out-of-range id,
+    // Sentinel.Node is nullptr, and the old code passed Info->Node straight into
+    // ProcessBlock(), which dereferences it at its 7th instruction
+    // (libarm64ecfex.dll+0xfe608, `ldr w10,[x3]`, x3=0). The ml605 sentinel did not
+    // contain that failure, it CONVERTED an out-of-bounds read into a null deref.
+    //
+    // Skipping the entry is not good enough: once any id or Node is invalid the
+    // whole CFG is untrustworthy, and continuing could eliminate flags on the
+    // strength of propagation that never completed.
+    //
+    // ⚠️ HONEST SCOPE: unlike the end-of-gather bail this is NOT a true no-op.
+    // Earlier ProcessBlock() calls in this same invocation may already have removed
+    // instructions, and returning cannot undo them. It prevents the crash and stops
+    // further damage; it does not restore the block. A proper recovery would
+    // re-compile this guest block from fresh IR with DFE disabled, which the
+    // compiler cannot currently be asked to do from here.
+    if (!CFG.IDValid(Block) || CFG.Get(Block)->Node == nullptr) {
+      LogMan::Msg::EFmt("[dfe-cfg] ml611 INVALID WORKLIST ENTRY at pop: block={} (blockmap={}) "
+                        "node={} slot_addr={} steps={} rip=0x{:x} -- the CFG passed end-of-gather "
+                        "validation, so this was corrupted DURING propagation; ABANDONING "
+                        "(⚠️ not a no-op: {} blocks were already processed and any flag "
+                        "calculations they removed stay removed)",
+                        Block, CFG.BlockMap.size(), (void*)(CFG.IDValid(Block) ? CFG.Get(Block)->Node : nullptr),
+                        (void*)&Worklist.back(), WorklistSteps, CurrentIR.GetHeader()->OriginalRIP, WorklistSteps);
+      FEXCore::Utils::AllocWatch::Clear();  // ml621: no drain — see AllocWatch.h
+      return;
+    }
+
     auto Info = CFG.Get(Block);
     Info->InWorklist = false;
+
+    if (++WorklistSteps > WorklistBudget) {
+      LogMan::Msg::EFmt("[dfe-guard] ml597: CFG worklist exceeded {} iterations "
+                        "(last block {}) -- flag dataflow is not converging; abandoning "
+                        "global propagation (fail-open)",
+                        WorklistBudget, Block);
+      break;
+    }
 
     if (ProcessBlock(IREmit, CurrentIR, Info->Node, CFG)) {
       for (auto Pred : Info->Predecessors) {
         CFG.AddWorklist(Worklist, Pred);
       }
     }
+  }
+
+  // ml605: did the predecessor lists change under us? Built-valid + changed-here
+  // means DFE (or something running concurrently) corrupted them; built-invalid
+  // was already reported above. Either way the sentinel kept us alive.
+  if (CFG.PredecessorDigest() != PredDigestAtBuild) {
+    LogMan::Msg::EFmt("[dfe-cfg] ml605 PREDECESSOR LISTS MUTATED during propagation "
+                      "(rip=0x{:x} blocks={}) -- the CFG was valid at build and something "
+                      "wrote to it while the pass ran",
+                      CurrentIR.GetHeader()->OriginalRIP, CFG.BlockMap.size());
+    // ml611: this is the case the allocation trace exists for — the CFG was born
+    // clean and changed underneath us. Dump who touched those buffers.
+    FEXCore::Utils::AllocWatch::Clear();  // ml621: no drain — see AllocWatch.h
+  } else {
+    // Uneventful run: drop the watches silently so the table does not accumulate
+    // stale entries across compilations.
+    FEXCore::Utils::AllocWatch::Clear();
+  }
+  if (CFG.BadIDs) {
+    LogMan::Msg::EFmt("[dfe-cfg] ml605 summary: {} out-of-range block id(s), first={}, "
+                      "blockmap={} rip=0x{:x} -- all served the conservative sentinel, "
+                      "so flags stayed FLAG_ALL and nothing was eliminated for them",
+                      CFG.BadIDs, CFG.FirstBadID, CFG.BlockMap.size(),
+                      CurrentIR.GetHeader()->OriginalRIP);
   }
 
   // Fold compares into branches now that we're otherwise optimized. This needs

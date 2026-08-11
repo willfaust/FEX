@@ -61,6 +61,21 @@ $end_info$
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
+
+/* iOS-Mythic ml622: mirror of rpmalloc's POD snapshot (rpmalloc.c). Declared here
+ * rather than in a shared header because rpmalloc is C and vendored; keep the two
+ * definitions in sync — the drain below is the only consumer. */
+extern "C" {
+struct rpm_cas_snapshot {
+  unsigned long long page_addr, block_addr, heap_addr, owner_teb;
+  unsigned long long prev_token, cur_token, ret_addr, atomic_addr;
+  unsigned int size_class, page_type, block_index, list_size;
+  unsigned int fail_changed, fail_unchanged, fail_invalid, quarantined;
+  unsigned int block_count, block_used, is_full, which_loop;
+};
+int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
+}
 #include <condition_variable>
 #include <fcntl.h>
 #include <functional>
@@ -600,8 +615,172 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
     auto lk = Thread->LookupCache->AcquireWriteLock();
     Thread->LookupCache->ClearCache(lk);
   }
-  Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+  FEXCore::Core::ResetCallRetStack(Thread, "core");
 }
+
+/* iOS-Mythic ml610: THE ONLY place the callret predictor is reset.
+ *
+ * ml609 clipped this to the [base+2MB, base+6MB) window on the theory that the
+ * rest of the 16MB was unreachable, so decommitting it was pure waste. Both
+ * halves of that premise were wrong and the build regressed (+388MB of `fex`
+ * band at a matched cycle), so the full clear is restored here.
+ *
+ *  1. "UNREACHABLE" IS FALSE. BranchOps.cpp's CALL/RET guard does bound sp to
+ *     [base+2MB, base+6MB) (`add 0x200000` then `lsr #22`), but the JITCallback
+ *     sentinel push in Dispatcher.cpp only tests (sp - base) >> 24 -- the WHOLE
+ *     16MB reservation. The callback path can therefore push outside the window
+ *     the other path enforces. (How MUCH of the 16MB it actually touches is not
+ *     established; that is what the unix-side census below measures.)
+ *
+ *  2. THE CLEAR RECLAIMS -- IT DOES NOT DIRTY. VirtualDontNeed() here is
+ *     VirtualFree(MEM_DECOMMIT) + VirtualAlloc(MEM_COMMIT). This stack is not
+ *     pool-aliased, so wine's decommit_pages() (virtual_ios.c) takes the
+ *     anon_mmap_fixed() branch: a fresh MAP_ANON|MAP_FIXED over the range, which
+ *     DROPS the old physical pages and installs zero-fill-on-demand. The
+ *     MEM_COMMIT that follows only restores access; it does not touch pages.
+ *     So the full clear was RETURNING up to 16MB per reset, and ml609's 4MB
+ *     version left the rest of each stack resident.
+ *
+ * Resetting the predictor costs prediction quality only, never correctness: a
+ * zeroed entry fails the `sub TMP1, TMP1, RipReg` compare and falls through to
+ * the L1 lookup, which is always right.
+ *
+ * The counters stay, and now carry the one real finding ml609 did produce --
+ * the expensive axis is FREQUENCY (10,240 resets, every one from
+ * site=cpubackend). They break down by site and by CodeBuffer generation so a
+ * later frequency fix has a baseline to beat, and so a redundant migration
+ * (same thread cleared twice for one generation) becomes visible rather than
+ * assumed absent.
+ *
+ * How many bytes a clear actually RETURNS is deliberately NOT measured here:
+ * this TU compiles into an arm64ec PE under llvm-mingw, where __APPLE__ is
+ * undefined and mincore/mach_vm_region/task_info do not exist. That
+ * measurement lives at the reclaim site itself -- [dc-census] in
+ * decommit_pages(), build/ntdll-unix/virtual_ios.c.
+ */
+} // namespace (ml609: reopened below)
+namespace FEXCore::Core {
+namespace {
+  // Keep in sync with the literals passed by the three call sites.
+  constexpr const char* CallRetSiteNames[] = {"core", "cpubackend", "jit-rollover"};
+  constexpr size_t CallRetSiteCount = sizeof(CallRetSiteNames) / sizeof(CallRetSiteNames[0]);
+} // namespace
+
+static std::atomic<uint64_t> CallRetResets {0};
+static std::atomic<uint64_t> CallRetBytesReset {0};
+static std::atomic<uint64_t> CallRetResetsBySite[CallRetSiteCount] {};
+
+#ifdef FEX_IOS_HOST
+/* Per-generation attribution. A plain spin lock is enough: ~10k resets across a
+ * whole run, and the critical section is a bounded scan of a 256-entry table.
+ * Nothing is logged while holding it -- the sweeper calls this with the
+ * code-buffer migration gate active, so the section stays as short as possible.
+ */
+static std::atomic<uint32_t> CallRetGenLock {0};
+static constexpr uint32_t CallRetGenSeenSlots = 256;
+static uint64_t CallRetGenCur {~0ULL};
+static uint64_t CallRetGenResets {0};
+static uint64_t CallRetGenerations {0};
+static uint32_t CallRetGenThreads {0};
+static bool CallRetGenSaturated {false};
+static void* CallRetGenSeen[CallRetGenSeenSlots] {};
+#endif
+
+void ResetCallRetStack(FEXCore::Core::InternalThreadState* Thread, const char* Site) {
+  if (!Thread || !Thread->CallRetStackBase) {
+    return;
+  }
+  using TS = FEXCore::Core::InternalThreadState;
+
+  // The FULL reservation -- see the note above. This decommit is what returns
+  // the pages; clipping it strands the remainder resident.
+  FEXCore::Allocator::VirtualDontNeed(Thread->CallRetStackBase, TS::CALLRET_STACK_SIZE);
+
+  for (size_t i = 0; i < CallRetSiteCount; ++i) {
+    if (Site && strcmp(Site, CallRetSiteNames[i]) == 0) {
+      CallRetResetsBySite[i].fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+  }
+
+  const uint64_t N = CallRetResets.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t B = CallRetBytesReset.fetch_add(TS::CALLRET_STACK_SIZE, std::memory_order_relaxed) + TS::CALLRET_STACK_SIZE;
+
+#ifdef FEX_IOS_HOST
+  // Closing summary for the generation we just left, filled under the lock and
+  // emitted after releasing it.
+  bool ClosedGen = false;
+  uint64_t ClosedGenId = 0, ClosedGenResets = 0;
+  uint32_t ClosedGenThreads = 0;
+  bool ClosedGenSaturated = false;
+  {
+    const uint64_t Gen = FEXCore::CPU::IosCodeBufferGeneration();
+    uint32_t Expected = 0;
+    while (!CallRetGenLock.compare_exchange_weak(Expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+      Expected = 0;
+    }
+
+    if (Gen != CallRetGenCur) {
+      if (CallRetGenCur != ~0ULL) {
+        ClosedGen = true;
+        ClosedGenId = CallRetGenCur;
+        ClosedGenResets = CallRetGenResets;
+        ClosedGenThreads = CallRetGenThreads;
+        ClosedGenSaturated = CallRetGenSaturated;
+      }
+      CallRetGenCur = Gen;
+      CallRetGenResets = 0;
+      CallRetGenThreads = 0;
+      CallRetGenSaturated = false;
+      memset(CallRetGenSeen, 0, sizeof(CallRetGenSeen));
+      ++CallRetGenerations;
+    }
+    ++CallRetGenResets;
+
+    /* Open-addressed set of threads already cleared for this generation.
+     * CPUBackend's `KeepAlive == LatestBuf` early-out should make a repeat
+     * impossible, so resets > unique_threads is the signal that it isn't
+     * holding -- and ml609 had no way to see that either way. */
+    const uintptr_t H = reinterpret_cast<uintptr_t>(Thread) >> 12;
+    bool Found = false, Inserted = false;
+    for (uint32_t Probe = 0; Probe < CallRetGenSeenSlots; ++Probe) {
+      const uint32_t Slot = static_cast<uint32_t>(H + Probe) & (CallRetGenSeenSlots - 1);
+      if (CallRetGenSeen[Slot] == Thread) {
+        Found = true;
+        break;
+      }
+      if (CallRetGenSeen[Slot] == nullptr) {
+        CallRetGenSeen[Slot] = Thread;
+        Inserted = true;
+        break;
+      }
+    }
+    if (Inserted) {
+      ++CallRetGenThreads;
+    } else if (!Found) {
+      // Table full: unique-thread count is now a floor, so say so rather than
+      // letting the number quietly under-report.
+      CallRetGenSaturated = true;
+    }
+
+    CallRetGenLock.store(0, std::memory_order_release);
+  }
+
+  if (ClosedGen) {
+    LogMan::Msg::EFmt("[callret-gen] ml610 gen={} resets={} unique_threads={}{} redundant={}", ClosedGenId, ClosedGenResets,
+                      ClosedGenThreads, ClosedGenSaturated ? "+ (table saturated)" : "",
+                      ClosedGenResets > ClosedGenThreads ? ClosedGenResets - ClosedGenThreads : 0);
+  }
+#endif
+
+  if ((N & 0x3ff) == 0) {
+    LogMan::Msg::EFmt("[callret] ml610 resets={} bytes={}MB per_reset={}KB site={} by_site core={} cpubackend={} jit-rollover={}", N,
+                      B >> 20, TS::CALLRET_STACK_SIZE >> 10, Site, CallRetResetsBySite[0].load(std::memory_order_relaxed),
+                      CallRetResetsBySite[1].load(std::memory_order_relaxed), CallRetResetsBySite[2].load(std::memory_order_relaxed));
+  }
+}
+} // namespace FEXCore::Core
+namespace FEXCore::Context {
 
 static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter* IREmitter, uint64_t GuestRIP) {
   FEXCore::File::File FD = FEXCore::File::File::GetStdERR();
@@ -615,9 +794,20 @@ bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Th
   return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
 }
 
+/* iOS-Mythic ml623: targeted IR capture (PassManager.cpp). FEX_MythicIRCapTarget is the
+ * absolute guest address of the ONE instruction under investigation, published by the
+ * Windows-side InvalidationTracker at module load. The decode loop below marks the
+ * compile when the block CONTAINS that address -- containment, not entry RIP, because
+ * with multiblock a block routinely starts hundreds of bytes earlier. */
+extern "C" uint64_t FEX_MythicIRCapTarget;
+extern "C" void FEX_MythicIRCapMark(uint64_t GuestRIP);
+extern "C" void FEX_MythicIRCapClear();
+extern "C" uint64_t FEX_MythicIRCapCurrentRIP();
+
 ContextImpl::GenerateIRResult
 ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("GenerateIR");
+  FEX_MythicIRCapClear(); // ml623: never inherit a previous compile's mark
 
   /* iOS-Mythic ml250: Thread->OpDispatcher has been observed NULL here, faulting as
    * `str xzr,[x0,#0x378]` with x0=0 inside IREmitter::ResetWorkingList and killing the
@@ -730,6 +920,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
+
+        // ml623: does THIS block contain the instruction under investigation?
+        if (FEX_MythicIRCapTarget && InstAddress == FEX_MythicIRCapTarget) {
+          FEX_MythicIRCapMark(GuestRIP);
+        }
         const FEXCore::X86Tables::X86InstInfo* TableInfo {nullptr};
         const FEXCore::X86Tables::DecodedInst* DecodedInfo {nullptr};
 
@@ -964,6 +1159,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
   if (!IRView) {
     // OpDispatcher IR already released in this case.
+    FEX_MythicIRCapClear(); // ml623
     return {{}, nullptr, 0, 0, false};
   }
 
@@ -977,6 +1173,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   if (MaxInst != 1 && !FEXCore::Utils::WritePriorityMutex::IosUnpublishedCompileActive()) {
     if (auto Block = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
       // Raced to compile, release the OpDispatcher IR.
+      FEX_MythicIRCapClear(); // ml623
       Thread->OpDispatcher->DelayedDisownBuffer();
       return {.CompiledCode = {.BlockBegin = reinterpret_cast<uint8_t*>(Block), .EntryPoints = {{GuestRIP, reinterpret_cast<uint8_t*>(Block)}}},
               .DebugData = nullptr,
@@ -992,6 +1189,57 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
 
   auto CompiledCode = Thread->CPUBackend->CompileCode(GuestRIP, Length, TotalInstructions == 1, &*IRView, DebugData.get(), TFSet);
+
+  /* ml623: the final arm of the capture -- the host bytes actually emitted for the
+   * target instruction, bounded to [its HostEntryOffset, the next one). This is the
+   * arm that separates "the emitter dropped it" from "SMC/cache/alias lifetime rewrote
+   * it later": the hash printed here is of the bytes AT COMPILE TIME, so a runtime
+   * disassembly that disagrees convicts something after codegen. */
+  if (const uint64_t CapRIP = FEX_MythicIRCapCurrentRIP()) {
+    const uint64_t Target = FEX_MythicIRCapTarget;
+    if (Target >= CapRIP && CompiledCode.BlockBegin && DebugData) {
+      const uint64_t WantOffset = Target - CapRIP;
+      const auto& GO = DebugData->GuestOpcodes;
+      size_t Idx = GO.size();
+      for (size_t i = 0; i < GO.size(); ++i) {
+        if (GO[i].GuestEntryOffset == WantOffset) {
+          Idx = i;
+          break;
+        }
+      }
+      if (Idx == GO.size()) {
+        LogMan::Msg::EFmt("[ircap] ml623 HOST: no GuestOpcode entry for offset {:#x} among {} entries "
+                          "(rip={:#x} hostsize={})",
+                          WantOffset, GO.size(), CapRIP, DebugData->HostCodeSize);
+      } else {
+        const ptrdiff_t HostFrom = GO[Idx].HostEntryOffset;
+        const ptrdiff_t HostTo = (Idx + 1 < GO.size()) ? GO[Idx + 1].HostEntryOffset : static_cast<ptrdiff_t>(DebugData->HostCodeSize);
+        // Neighbours give the `or al,0x44` that shares the clobbered register.
+        for (size_t i = (Idx > 1 ? Idx - 2 : 0); i < GO.size() && i <= Idx + 1; ++i) {
+          LogMan::Msg::EFmt("[ircap] ml623 HOST map guest+{:#x} -> host+{:#x}{}", GO[i].GuestEntryOffset, GO[i].HostEntryOffset,
+                            i == Idx ? "   <== TARGET" : "");
+        }
+        if (HostTo > HostFrom && (HostTo - HostFrom) < 4096) {
+          const uint32_t* Words = reinterpret_cast<const uint32_t*>(CompiledCode.BlockBegin + HostFrom);
+          const size_t NumWords = static_cast<size_t>(HostTo - HostFrom) / 4;
+          uint64_t Hash = 1469598103934665603ull; // FNV-1a
+          for (size_t i = 0; i < NumWords; ++i) {
+            for (int b = 0; b < 4; ++b) {
+              Hash = (Hash ^ ((Words[i] >> (b * 8)) & 0xff)) * 1099511628211ull;
+            }
+          }
+          LogMan::Msg::EFmt("[ircap] ml623 HOST bytes blockbegin={} host+{:#x}..{:#x} words={} fnv1a={:#x}",
+                            static_cast<void*>(CompiledCode.BlockBegin), HostFrom, HostTo, NumWords, Hash);
+          for (size_t i = 0; i < NumWords; ++i) {
+            LogMan::Msg::EFmt("[ircap]   +{:#06x}  {:08x}", HostFrom + static_cast<ptrdiff_t>(i * 4), Words[i]);
+          }
+        } else {
+          LogMan::Msg::EFmt("[ircap] ml623 HOST bytes SKIPPED: implausible range host+{:#x}..{:#x}", HostFrom, HostTo);
+        }
+      }
+    }
+    FEX_MythicIRCapClear();
+  }
 
   // Release the IR
   Thread->OpDispatcher->DelayedDisownBuffer();
@@ -1522,6 +1770,31 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                         Frame ? Frame->State.L1Pointer : 0,
                         Frame ? Frame->State.L1Mask : 0,
                         (T && T->LookupCache) ? T->LookupCache->GetL1Pointer() : 0);
+
+      /* iOS-Mythic ml622: drain the rpmalloc remote-free CAS snapshot HERE —
+       * outside rpmalloc, where formatting is safe. The allocator side only ever
+       * copies scalars into a POD and sets a flag; it must never format, because
+       * LogMan/fmt can allocate and re-enter the very allocator that is stuck
+       * (that is how ml620 killed itself).
+       *
+       * Read the counters, not the total: fail_changed vs fail_unchanged is the
+       * discriminator, and fail_invalid outranks both. ⚠️ A changed token is NOT
+       * automatically healthy contention — it can equally be page reuse or a
+       * foreign writer, so check block_index/list_size against block_count before
+       * concluding anything. */
+      {
+        rpm_cas_snapshot Snap;
+        if (rpm_cas_snapshot_take(&Snap)) {
+          LogMan::Msg::EFmt("[rpm-cas] ml622 loop={} {} page=0x{:x} block=0x{:x} heap=0x{:x} atomic=0x{:x} "
+                            "teb=0x{:x} ret=0x{:x} class={} ptype={} idx={}/{} list_size={} used={} is_full={} "
+                            "prev_token=0x{:x} cur_token=0x{:x} | fail changed={} unchanged={} invalid={}",
+                            Snap.which_loop, Snap.quarantined ? "QUARANTINED (block leaked, spin abandoned)" : "spinning",
+                            Snap.page_addr, Snap.block_addr, Snap.heap_addr, Snap.atomic_addr, Snap.owner_teb,
+                            Snap.ret_addr, Snap.size_class, Snap.page_type, Snap.block_index, Snap.block_count,
+                            Snap.list_size, Snap.block_used, Snap.is_full, Snap.prev_token, Snap.cur_token,
+                            Snap.fail_changed, Snap.fail_unchanged, Snap.fail_invalid);
+        }
+      }
     }
   }
 
@@ -1878,7 +2151,7 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
     FEXCORE_PROFILE_SCOPED("InvalidateCallRet");
 
     // This may cause access violations in the thread on Windows as zeroing is not atomic, this is handled by the frontend
-    Allocator::VirtualDontNeed(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
+    FEXCore::Core::ResetCallRetStack(Thread, "core");
   }
 }
 

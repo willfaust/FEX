@@ -337,6 +337,15 @@ public:
   }
 #endif
 
+  /* iOS-Mythic ml612: identity of the address NoteReadAcquired() stamps into
+   * TEB Instrumentation[8]. The thread-exit cleanup MUST verify a stamped
+   * address against this before releasing anything — the stamp is a diagnostic
+   * value written by whichever mutex was held, and acting on it blindly (or
+   * poking its futex word directly) would corrupt an unrelated lock. */
+  uint64_t IosStampAddress() const {
+    return reinterpret_cast<uint64_t>(&Futex);
+  }
+
 private:
 
 #if defined(__linux__)

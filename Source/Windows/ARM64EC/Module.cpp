@@ -1317,6 +1317,113 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
   }
 }
 
+/* iOS-Mythic ml612: RELEASE FEX LOCKS A DYING THREAD STILL HOLDS.
+ *
+ * ml611's whole-app freeze: CrBrowserMain (00b0) blew FEX's 256KB emulator stack
+ * inside a recursive fextl::set tree deleter, the fault was misclassified as
+ * STATUS_DATATYPE_MISALIGNMENT, dispatch DID occur, nothing handled it, and the
+ * thread ran pthread_exit while owning one READ hold of CodeInvalidationMutex
+ * ([exit-hold] said exactly that). A writer then queued behind the dead reader;
+ * write-priority blocks every later reader, so JIT compilation stopped process-
+ * wide -- 11 minutes of an alive app repainting one frozen frame.
+ *
+ * Called from wine's pthread_exit_wrapper BEFORE it clears TSD slot 275, while
+ * x18/TEB and FEX thread state are still reachable.
+ *
+ * ⚠️ THREE RULES, each of which was a way to make this worse:
+ *  1. NEVER trust the stamped address alone and NEVER poke its futex word. The
+ *     stamp in Instrumentation[8] is a diagnostic written by whichever mutex was
+ *     held; releasing on that basis could unlock a completely different lock.
+ *     Verify it equals THIS context's CodeInvalidationMutex, then go through the
+ *     mutex API so the futex/wake protocol stays intact.
+ *  2. Release exactly the recorded per-thread depth (Instrumentation[7]) -- the
+ *     mutex is non-recursive for writers but shared holds nest, and one unlock
+ *     for an N-deep hold leaves the wedge in place.
+ *  3. Instrumentation[9] means BTCpu64NotifyReadFile is mid-flight, which holds
+ *     CodeInvalidationMutex EXCLUSIVELY *and* ThreadCreationMutex. Both must be
+ *     dropped, in the same order its After path uses.
+ *
+ * Returns a bitmask of what was actually released so the caller can log it;
+ * every branch is reported, so silence never has to be interpreted.
+ */
+/* ml618: TEB is passed EXPLICITLY rather than read from x18.
+ *
+ * This is invoked from wine's pthread_exit_wrapper on a dying thread, so the
+ * caller is the authority on which TEB is being torn down. A SELF-TEST call
+ * (TebPtr == nullptr) returns REL_SELFTEST and echoes nothing — registration
+ * uses it to prove the pointer it bound is the redirected ARM64 alias and not a
+ * raw x64 entry thunk, which is exactly what ml613 shipped by mistake. */
+extern "C" uint32_t BTCpu64IosReleaseThreadHolds(void* TebPtr, uint64_t* OutStamp, uint32_t* OutDepth, uint32_t* OutFlags) {
+  enum : uint32_t {
+    REL_NOTHING = 0,
+    REL_SHARED = 1 << 0,      // dropped N shared holds
+    REL_RWX_EXCLUSIVE = 1 << 1, // dropped the NotifyReadFile exclusive pair
+    REL_STAMP_FOREIGN = 1 << 2, // stamp did not match our mutex -- refused
+    REL_NO_CTX = 1 << 3,      // context already gone
+  };
+
+  enum : uint32_t { REL_SELFTEST = 1u << 4 };
+  if (!TebPtr) {
+    /* Registration self-test: reaching here at all proves the callback was
+     * entered with a correct ARM64 ABI. */
+    return REL_SELFTEST;
+  }
+  auto* Teb = reinterpret_cast<TEB*>(TebPtr);
+
+  auto* Depth = reinterpret_cast<volatile uint32_t*>(reinterpret_cast<uintptr_t>(Teb) + 0x16f0);
+  auto* Stamp = reinterpret_cast<volatile uint64_t*>(reinterpret_cast<uintptr_t>(Teb) + 0x16f8);
+  auto* InLockedRead = IosInLockedRWXReadSlot();
+
+  const uint64_t StampVal = *Stamp;
+  const uint32_t DepthVal = *Depth;
+  const bool RWXRead = InLockedRead && *InLockedRead;
+
+  if (OutStamp) {
+    *OutStamp = StampVal;
+  }
+  if (OutDepth) {
+    *OutDepth = DepthVal;
+  }
+  if (OutFlags) {
+    *OutFlags = RWXRead ? 1 : 0;
+  }
+
+  if (!StampVal && !RWXRead) {
+    return REL_NOTHING; // clean exit, nothing held
+  }
+  if (!CTX) {
+    return REL_NO_CTX;
+  }
+
+  auto& CodeMutex = CTX->GetCodeInvalidationMutex();
+  uint32_t Result = REL_NOTHING;
+
+  // Rule 3 first: the exclusive pair, in NotifyReadFile's own release order.
+  if (RWXRead) {
+    *InLockedRead = false;
+    auto* ThreadState = GetCPUArea().ThreadState();
+    if (ThreadState) {
+      GetFrontendThreadData(ThreadState)->InLockedRWXRead = false;
+    }
+    CodeMutex.unlock();
+    ThreadCreationMutex.unlock();
+    Result |= REL_RWX_EXCLUSIVE;
+  }
+
+  // Rule 1 + 2: shared holds, only after proving the stamp is ours.
+  if (StampVal && DepthVal) {
+    if (StampVal != CodeMutex.IosStampAddress()) {
+      return Result | REL_STAMP_FOREIGN;
+    }
+    for (uint32_t i = 0; i < DepthVal; ++i) {
+      CodeMutex.unlock_shared(); // clears the stamp/depth via NoteReadReleased()
+    }
+    Result |= REL_SHARED;
+  }
+
+  return Result;
+}
+
 #ifdef FEX_IOS_HOST
 /* iOS-Mythic: step markers through ThreadInit. Two runs have died with a
  * fresh post-detach thread's "ThreadInit() entered" as the last FEX log

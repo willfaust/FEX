@@ -8,6 +8,7 @@ $end_info$
 #include "Interface/IR/Passes/RegisterAllocationPass.h"
 #include "Interface/IR/IR.h"
 #include "Interface/IR/IREmitter.h"
+#include "Interface/IR/IRTopologyCheck.h"
 #include "Interface/IR/RegisterAllocationData.h"
 #include "Interface/IR/Passes.h"
 #include "Interface/Core/CPUID.h"
@@ -586,14 +587,48 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
 
     auto BlockIROp = BlockHeader->CW<IR::IROp_CodeBlock>();
 
+    // iOS-Mythic ml599: THIS is where ml598 hung.
+    //
+    // The backwards pass below walks `--CodeLast` and exits only on reaching
+    // CodeBegin. When Steam's store page failed to render,
+    // Chrome_InProcRendererThread sat at 97-100% CPU for minutes with its PC
+    // inside this function (libarm64ecfex.dll RVA 0x100b0c/0x100cb4/0x100cc4/
+    // 0x100cdc, all within [Run, Run+0xcd8)) on exactly this loop's Previous
+    // back edge. The compile never returned, so no frame was ever presented.
+    //
+    // Validate the chain first. If the forward chain is intact we can rebuild
+    // Previous from it and run normally. If it is not, SKIP the backwards pass
+    // rather than bound it partway: stopping early merely leaves some kill bits
+    // unset and some SRA hints missing, which is conservative and correct,
+    // whereas walking a cyclic chain would set kill bits on nodes belonging to
+    // other blocks and free their registers early -- a miscompile.
+    // ml599b: cheap backward-only check here; full diagnosis only when it trips.
+    bool BackwardPassSafe = true;
+    IRTopoNoteChecked();
+    if (!QuickBackwardOK(*IR, BlockNode)) {
+      BackwardPassSafe = HandleSuspectBlock("ra-entry", *IR, BlockNode) == IRTopoAction::Proceed;
+    }
+
     // Backwards pass: analyze kill bits and SRA affinities
-    {
+    if (BackwardPassSafe) {
       // Reverse iteration is not yet working with the iterators
       // We grab these nodes this way so we can iterate easily
       auto CodeBegin = IR->at(BlockIROp->Begin);
       auto CodeLast = IR->at(BlockIROp->Last);
 
+      // Backstop. The check above proves this walk terminates, so tripping this
+      // would mean the validator itself is wrong -- worth a loud line rather
+      // than another unkillable client.
+      const uint32_t IRNodeBudget = IR->GetSSACount() + 16;
+      uint32_t StepsTaken = 0;
+
       while (1) {
+        if (++StepsTaken > IRNodeBudget) {
+          LogMan::Msg::EFmt("[ir-topo] ml599 ra-walk exceeded {} steps in block {} AFTER a clean "
+                            "validation -- the topology checker is wrong; abandoning the backwards pass",
+                            IRNodeBudget, BlockIROp->ID);
+          break;
+        }
         auto [CodeNode, IROp] = CodeLast();
         // End of iteration gunk
 

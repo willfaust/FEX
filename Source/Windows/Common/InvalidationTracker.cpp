@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
 #include <atomic>
+#include <cstdlib>  // ml623: getenv/strtoull for the IR-capture target
+#include <cstring>  // ml623: strlen
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/TypeDefines.h>
 #include <FEXCore/Utils/SignalScopeGuards.h>
@@ -10,6 +12,10 @@
 #include "InvalidationTracker.h"
 #include <windef.h>
 #include <winternl.h>
+
+/* ml623: targeted IR capture target (defined in FEXCore PassManager.cpp). File scope on
+ * purpose -- an extern "C" at block scope is a compile error and cost a build earlier. */
+extern "C" uint64_t FEX_MythicIRCapTarget;
 
 namespace FEX::Windows {
 InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
@@ -188,17 +194,87 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
   }
 
   FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
-  if (MonoHacks && (Name == "mono-2.0-bdwgc.dll" || Name == "mono.dll")) {
-    FEX_CONFIG_OPT(MaxInst, MAXINST);
-    FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
-    if (Multiblock && MaxInst() >= 500) {
+  FEX_CONFIG_OPT(MaxInst, MAXINST);
+  FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
+
+  const bool IsMono = (Name == "mono-2.0-bdwgc.dll" || Name == "mono.dll");
+  if (IsMono) {
+    /* ml623: report the EFFECTIVE settings at EFmt on every branch.
+     *
+     * MonoHacks defaults to true and is gated on Multiblock && MaxInst >= 500, but
+     * MarkMonoDetected() logs nothing and the refusal message is IFmt, which
+     * MYTHIC_QUIET eats -- so the ULTRAKILL log could not distinguish "hooks armed"
+     * from "hooks refused". That ambiguity also decides whether a later
+     * block-splitting A/B is interpretable at all, because the hook explicitly
+     * requires all SMC sites to land in ONE block. Never leave this unfalsifiable. */
+    const bool Armed = MonoHacks && Multiblock && MaxInst() >= 500;
+    LogMan::Msg::EFmt("[mono-cfg] ml623 module={} base={:#x} xend={:#x} | MonoHacks={} Multiblock={} MaxInst={} => {}", Name,
+                      Address, LastExecutableSectionEnd, MonoHacks() ? 1 : 0, Multiblock() ? 1 : 0, MaxInst(),
+                      Armed          ? "HOOKS ARMED (MarkMonoDetected)" :
+                      !MonoHacks()   ? "off: MonoHacks disabled" :
+                                       "off: needs Multiblock && MaxInst>=500");
+    if (Armed) {
       // Require these settings to ensure we can safely hook all SMC sites in a single block
       CTX.MarkMonoDetected();
       MonoBackpatcherDetectionPending = true;
       MonoBase = Address;
       MonoEnd = LastExecutableSectionEnd;
-    } else {
-      LogMan::Msg::IFmt("Not applying mono hacks, Multiblock with MaxInst >= 500 required");
+    }
+  }
+
+  /* ml623: arm the targeted IR capture (PassManager.cpp) once the module that owns the
+   * instruction under investigation is mapped. Module + RVA come from the environment so
+   * chasing a different miscompile never needs a rebuild; the defaults are the ULTRAKILL
+   * Mono emitter store `mov byte ptr [rcx+2], al`.
+   *
+   * setenv() in WineProcessBridge.m does NOT reach GetEnvironmentVariableW, but it DOES
+   * reach FEX's own getenv (proven by MYTHIC_NO_DFE in ml597/598), which is what this uses. */
+  {
+    const char* CapRVA = getenv("MYTHIC_IRCAP_RVA");
+    const char* CapMod = getenv("MYTHIC_IRCAP_MODULE");
+
+    /* ml623b: THE ENV CHANNEL DOES NOT REACH THIS CODE.
+     *
+     * ml623 shipped env-gated and never armed -- yet [mono-cfg] printed from this very
+     * function in the same run, so the function ran and getenv simply returned null.
+     * (get_initial_environment copies all of unix `environ` into the Windows block, so
+     * the loss is somewhere later: the PE CRT's copy, or the pseudo-process PEB clone.)
+     * Rather than theorise, the target is now COMPILED IN and env is only an override.
+     * The probe line below reports what getenv actually returned, so the channel
+     * question gets settled for free instead of costing another run. */
+    {
+      static bool Reported = false;
+      if (!Reported) {
+        Reported = true;
+        LogMan::Msg::EFmt("[ircap] ml623b env probe: MYTHIC_IRCAP_RVA={} MYTHIC_IRCAP_MODULE={}", CapRVA ? CapRVA : "(null)",
+                          CapMod ? CapMod : "(null)");
+      }
+    }
+    if (!CapRVA || !*CapRVA) {
+      CapRVA = "0x4db25b"; // mono-2.0-bdwgc.dll: mov byte ptr [rcx+2], al
+    }
+    if (CapRVA && *CapRVA) {
+      if (!CapMod || !*CapMod) {
+        CapMod = "mono-2.0-bdwgc.dll";
+      }
+      // Case-insensitive: the loader logs both "VERSION.dll" and "version.dll".
+      const size_t ModLen = strlen(CapMod);
+      bool Match = (Name.size() == ModLen);
+      for (size_t i = 0; Match && i < ModLen; ++i) {
+        const char A = Name[i] | 0x20;
+        const char B = CapMod[i] | 0x20;
+        Match = (A == B);
+      }
+      if (Match) {
+        const uint64_t RVA = strtoull(CapRVA, nullptr, 0);
+        if (RVA) {
+          FEX_MythicIRCapTarget = Address + RVA;
+          LogMan::Msg::EFmt("[ircap] ml623b ARMED: module={} base={:#x} rva={:#x} => target guest addr {:#x}", Name, Address,
+                            RVA, FEX_MythicIRCapTarget);
+        } else {
+          LogMan::Msg::EFmt("[ircap] ml623b DISARMED by MYTHIC_IRCAP_RVA=0 (module={})", Name);
+        }
+      }
     }
   }
 }

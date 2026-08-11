@@ -117,6 +117,37 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   // hundred per-thread caught faults. Real fix: callret-aware SEH unwind.
   static constexpr size_t CALLRET_STACK_SIZE {0x1000000};
 
+  // iOS-Mythic ml609/ml610: NAMED bounds for the window the CALL/RET guard enforces.
+  //
+  // The default sp sits at base + SIZE/4 = base+4MB and the predictor grows DOWN
+  // from there; BranchOps.cpp bounds sp to [base+2MB, base+6MB).
+  //
+  // ⚠️ These are NAMED because several sites derive their own bounds from
+  // CALLRET_STACK_SIZE (/4 for the default location, +SIZE for the end). Changing
+  // CALLRET_STACK_SIZE alone does NOT move the window — fix these together.
+  //
+  // ⛔ THIS WINDOW IS NOT THE LIVE SET, AND MUST NOT BE USED TO SIZE A CLEAR.
+  // ml609 assumed it was and clipped ResetCallRetStack() to it; the build
+  // regressed by ~388MB of `fex` band at a matched cycle and still died of
+  // jetsam. Two reasons, both checkable in source:
+  //
+  //   (a) Dispatcher.cpp's JITCallback sentinel push tests only
+  //       (sp - base) >> 24 — the WHOLE 16MB — so the callback path is not
+  //       bounded by this window at all. (What fraction of the 16MB it really
+  //       touches is measured by [dc-census] in wine's decommit_pages().)
+  //
+  //   (b) The clear RECLAIMS rather than dirties. VirtualDontNeed() is
+  //       MEM_DECOMMIT + MEM_COMMIT, and on this (non-pool-aliased) range wine's
+  //       decommit_pages() does anon_mmap_fixed() — a fresh MAP_ANON|MAP_FIXED
+  //       that drops the physical pages and installs zero-fill-on-demand. The
+  //       recommit only restores access. So a full-size clear RETURNS memory,
+  //       and shrinking it strands the remainder resident.
+  //
+  // Clear CALLRET_STACK_SIZE. These constants describe the guard, not the cost.
+  static constexpr size_t CALLRET_DEFAULT_OFFSET {CALLRET_STACK_SIZE / 4};        // 4MB: initial sp
+  static constexpr size_t CALLRET_LIVE_OFFSET {CALLRET_STACK_SIZE / 8};           // 2MB: guard low bound
+  static constexpr size_t CALLRET_LIVE_SIZE {CALLRET_STACK_SIZE / 4};             // 4MB: guard window [2MB,6MB)
+
   // The low address of the call-ret stack allocation (not including guard pages)
   void* CallRetStackBase {};
 
@@ -140,5 +171,11 @@ static_assert(
   (offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState)) <= 65520,
   "Fault page is outside of immediate range from CPU state");
 #endif
+
+// ml609/ml610: THE single callret reset path, shared by Core.cpp/CPUBackend.cpp/JIT.cpp.
+// Defined in Core.cpp. Clears the FULL [base, base+CALLRET_STACK_SIZE) reservation —
+// see the ⛔ note above for why a smaller clear is a regression, not an optimisation.
+// Site must be one of the literals in Core.cpp's CallRetSiteNames[] to be counted.
+void ResetCallRetStack(InternalThreadState* Thread, const char* Site);
 
 } // namespace FEXCore::Core

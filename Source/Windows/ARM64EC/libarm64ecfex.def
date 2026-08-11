@@ -4,6 +4,7 @@ EXPORTS
   BTCpu64FlushInstructionCache
   BTCpu64IosAddAliasMapping
   BTCpu64IosRipFromHostPC
+  BTCpu64IosReleaseThreadHolds
   BTCpu64IsProcessorFeaturePresent
   BTCpu64NotifyMemoryDirty
   BTCpu64NotifyReadFile
