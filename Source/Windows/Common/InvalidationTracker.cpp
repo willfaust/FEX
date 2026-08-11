@@ -17,6 +17,13 @@
  * purpose -- an extern "C" at block scope is a compile error and cost a build earlier. */
 extern "C" uint64_t FEX_MythicIRCapTarget;
 
+/* ml648: defined in the ARM64EC alias TU. Declared at FILE scope — an
+ * extern "C" declaration is illegal at block scope, and declaring it inside
+ * namespace FEX::Windows would mangle it as FEX::Windows::ios_fex_mono_arm. */
+#ifdef FEX_IOS_HOST
+extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
+#endif
+
 namespace FEX::Windows {
 InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads)
   : CTX {CTX}
@@ -219,6 +226,15 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
       MonoBackpatcherDetectionPending = true;
       MonoBase = Address;
       MonoEnd = LastExecutableSectionEnd;
+#ifdef FEX_IOS_HOST
+      /* ml648: arm the native bridge HERE, not at FEX startup — Mono is not
+       * loaded then. The Mach handler declines to capture while mono_base is 0,
+       * so the ordering is enforced by construction rather than by discipline.
+       * This is the last of the three one-time liveness lines; without it a run
+       * with no activations cannot be told apart from one where the bridge was
+       * never wired up at all. */
+      ios_fex_mono_arm(MonoBase, MonoEnd);
+#endif
     }
   }
 
@@ -418,7 +434,14 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
 
   uint64_t BlockEntry = CTX.GetGuestBlockEntry(Thread);
   LogMan::Msg::DFmt("Detected mono backpatcher at: {:X}", BlockEntry);
+#ifndef FEX_IOS_HOST
+  /* ml648: SKIPPED ON iOS. DisableSMCDetection() reprotects every RWX interval
+   * as WRITABLE, and iOS will never grant write on the guest VA — that is the
+   * entire reason the RW alias exists. On iOS it can only churn protections
+   * that cannot change. The win here comes purely from MarkMonoBackpatcherBlock
+   * plus the alias-directed MonoBackpatcherWrite. */
   DisableSMCDetection();
+#endif
   {
     std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
     CTX.MarkMonoBackpatcherBlock(BlockEntry);

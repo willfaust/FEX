@@ -18,6 +18,9 @@
 // their own TU sidesteps the issue.
 
 #include <cstdint>
+#include <windows.h>
+#include <winternl.h>
+#include "IosMonoBridge.h"
 
 #ifdef FEX_IOS_HOST
 
@@ -76,6 +79,134 @@ uint64_t BTCpu64IosRipFromHostPC(uint64_t BlockBegin, uint64_t HostPC) {
   extern uint64_t ios_fex_rip_from_hostpc(uint64_t, uint64_t);
   return ios_fex_rip_from_hostpc(BlockBegin, HostPC);
 }
+
+/* ============================ ml648 MONO BRIDGE ============================
+ * Owned here rather than in Module.cpp for the same reason the alias table is:
+ * reaching global storage from ARM64EC class methods there produced misaligned
+ * ldr/str link errors. Kept in a DIFFERENT table from IosAliasEntries — see
+ * IosMonoBridge.h. */
+ios_mono_bridge* g_MonoBridge = nullptr;
+
+extern void ios_fex_mono_bridge_publish(void* Bridge);      // Core.cpp: has the types
+extern void ios_fex_mono_report_armed(uint64_t, uint64_t);  // Core.cpp: has LogMan
+
+void BTCpu64IosSetMonoBridge(uint64_t BridgeAddr) {
+  auto* B = reinterpret_cast<ios_mono_bridge*>(BridgeAddr);
+  if (!B || B->abi_version != IOS_MONO_ABI_VERSION) {
+    // Refuse rather than arm a struct whose layout we cannot trust — the native
+    // side reads it inside a Mach fault handler.
+    return;
+  }
+  g_MonoBridge = B;
+  ios_fex_mono_bridge_publish(B);
+}
+
+/* Resolve a guest RX address to its writable alias. Sequence-lock read exactly
+ * as the writer publishes: sample the generation, read, sample again, and
+ * accept only when both are equal and ODD. A retired-and-reused slot therefore
+ * misses instead of returning a stale mapping — which would put a guest code
+ * write into memory that no longer backs it. Returns 0 on miss; the caller
+ * counts it and falls back rather than guessing. */
+uint64_t IosMonoResolveRW(uint64_t GuestAddr, uint64_t Size) {
+  auto* B = g_MonoBridge;
+  if (!B) {
+    return 0;
+  }
+  const uint32_t Count = __atomic_load_n(&B->alias_count, __ATOMIC_ACQUIRE);
+  for (uint32_t i = 0; i < Count && i < IOS_MONO_MAX_ALIASES; i++) {
+    const uint32_t G1 = __atomic_load_n(&B->aliases[i].generation, __ATOMIC_ACQUIRE);
+    if (!(G1 & 1)) {
+      continue;  // retired or mid-update
+    }
+    const uint64_t Base = B->aliases[i].guest_rx;
+    const uint64_t Sz = B->aliases[i].size;
+    const uint64_t RW = B->aliases[i].host_rw;
+    const uint32_t G2 = __atomic_load_n(&B->aliases[i].generation, __ATOMIC_ACQUIRE);
+    if (G1 != G2) {
+      continue;  // changed under us
+    }
+    if (GuestAddr >= Base && GuestAddr + Size <= Base + Sz) {
+      return RW + (GuestAddr - Base);
+    }
+  }
+  return 0;
+}
+/* Called from InvalidationTracker the moment the Mono module is recognised.
+ * Until this runs, mono_base is 0 and the native Mach handler declines every
+ * capture — the ordering the design depends on, enforced by construction. */
+void ios_fex_mono_arm(uint64_t Base, uint64_t End) {
+  auto* B = g_MonoBridge;
+  if (!B) {
+    return;
+  }
+  B->mono_end = End;
+  __atomic_store_n(&B->mono_base, Base, __ATOMIC_RELEASE);  // publish LAST: it is the gate
+  ios_fex_mono_report_armed(Base, End);
+}
+
+/* Take this context's pending event, if any. One-shot: the slot moves to state 2
+ * and never fires again for this process, so a mis-detection cannot loop.
+ *
+ * Keyed by PEB because pseudo-processes share one address space — a global slot
+ * would let one process's fault mark another process's block. */
+int ios_fex_mono_take_pending(uint64_t* BlockBegin, uint64_t* HostPC, uint64_t* FaultAddr) {
+  auto* B = g_MonoBridge;
+  if (!B) {
+    return 0;
+  }
+  const uint64_t Context = reinterpret_cast<uint64_t>(NtCurrentTeb()->ProcessEnvironmentBlock);
+  if (!Context) {
+    return 0;
+  }
+  for (uint32_t i = 0; i < IOS_MONO_MAX_CONTEXTS; i++) {
+    auto& P = B->pending[i];
+    if (__atomic_load_n(&P.context, __ATOMIC_ACQUIRE) != Context) {
+      continue;
+    }
+    uint32_t Want = 1;
+    if (!__atomic_compare_exchange_n(&P.state, &Want, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      return 0;  // empty, or already consumed
+    }
+    *BlockBegin = P.block_begin;
+    *HostPC = P.host_pc;
+    *FaultAddr = P.fault_addr;
+    return 1;
+  }
+  return 0;
+}
+
+/* One relaxed load. Keeps CompileBlock's added cost to a load+branch until the
+ * bridge is armed AND something is actually pending. */
+int ios_fex_mono_bridge_armed() {
+  auto* B = g_MonoBridge;
+  if (!B || !__atomic_load_n(&B->mono_base, __ATOMIC_ACQUIRE)) {
+    return 0;
+  }
+  return __atomic_load_n(&B->n_captured, __ATOMIC_RELAXED) != __atomic_load_n(&B->n_activated, __ATOMIC_RELAXED);
+}
+
+void ios_fex_mono_count_activated() {
+  if (g_MonoBridge) {
+    __atomic_add_fetch(&g_MonoBridge->n_activated, 1, __ATOMIC_RELAXED);
+  }
+}
+
+uint64_t ios_fex_mono_captured_count() {
+  return g_MonoBridge ? __atomic_load_n(&g_MonoBridge->n_captured, __ATOMIC_RELAXED) : 0;
+}
+
+/* Counters live with the table, off the caller's hot path. */
+void ios_fex_mono_count_helper(int Miss) {
+  auto* B = g_MonoBridge;
+  if (!B) {
+    return;
+  }
+  __atomic_add_fetch(&B->n_helper_calls, 1, __ATOMIC_RELAXED);
+  if (Miss) {
+    __atomic_add_fetch(&B->n_alias_miss, 1, __ATOMIC_RELAXED);
+  }
+}
+/* ========================== end ml648 MONO BRIDGE ========================= */
 
 void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
   int count = g_EntryCount;

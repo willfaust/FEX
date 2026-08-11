@@ -1265,6 +1265,98 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
 extern "C" uint64_t IosFfsBypassLog[4];
 #endif
 
+#ifdef FEX_IOS_HOST
+/* ml648: publish the struct offsets the native Mach handler needs.
+ *
+ * NEVER hardcoded on the native side. It reads CpuStateFrame and the JIT block
+ * header/tail from inside a fault handler, so a silent field reshuffle here
+ * would turn that into a wild read at the worst possible moment. Publishing
+ * makes the capture self-calibrating: zero offsets mean "not published", and
+ * the native side then declines to capture at all.
+ *
+ * mono_base/mono_end are deliberately NOT set here — Mono is not loaded at FEX
+ * startup. InvalidationTracker publishes them when it recognises the module,
+ * and capture stays inert until it does. */
+extern "C" void ios_fex_mono_bridge_publish(void* BridgeRaw) {
+  struct BridgeHead {
+    uint32_t abi_version, off_frame_hdr, off_block_tail, off_tail_rip;
+  };
+  auto* B = reinterpret_cast<BridgeHead*>(BridgeRaw);
+  B->off_frame_hdr = static_cast<uint32_t>(offsetof(FEXCore::Core::CpuStateFrame, State) +
+                                           offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader));
+  B->off_block_tail = static_cast<uint32_t>(offsetof(FEXCore::CPU::CPUBackend::JITCodeHeader, OffsetToBlockTail));
+  B->off_tail_rip = static_cast<uint32_t>(offsetof(FEXCore::CPU::CPUBackend::JITCodeTail, RIP));
+  LogMan::Msg::EFmt("[mono-bridge] ml648 OFFSETS PUBLISHED bridge={} frame_hdr={} block_tail={} tail_rip={}"
+                    " -- capture still inert until Mono is armed",
+                    BridgeRaw, B->off_frame_hdr, B->off_block_tail, B->off_tail_rip);
+}
+
+extern "C" uint64_t IosMonoResolveRW(uint64_t GuestAddr, uint64_t Size);
+extern "C" void ios_fex_mono_count_helper(int Miss);
+extern "C" int ios_fex_mono_take_pending(uint64_t* BlockBegin, uint64_t* HostPC, uint64_t* FaultAddr);
+extern "C" void ios_fex_mono_count_activated();
+extern "C" uint64_t ios_fex_mono_captured_count();
+extern "C" int ios_fex_mono_bridge_armed();
+
+/* Liveness line 3 of 3. Lives here because LogMan is not available in the
+ * ARM64EC alias TU. */
+extern "C" void ios_fex_mono_report_armed(uint64_t Base, uint64_t End) {
+  LogMan::Msg::EFmt("[mono-bridge] ml648 MONO ARMED base={:#x} end={:#x} -- native capture is now live", Base, End);
+}
+
+/* ml648: consume a pending Mono-backpatcher event.
+ *
+ * ⚠️ THE TWO RIPs ARE NOT INTERCHANGEABLE, and getting them the wrong way round
+ * makes the whole optimisation compile, ship, and silently do nothing:
+ *   ios_fex_rip_from_hostpc() -> the EXACT instruction RIP. Used ONLY to prove
+ *       the faulting instruction is inside Mono and really is an XCHG (0x87).
+ *   JITCodeTail.RIP           -> the BLOCK ENTRY. This is what
+ *       MarkMonoBackpatcherBlock() must receive, because FEX compares it against
+ *       the compilation's starting GuestRIP.
+ *
+ * Use the standalone ios_fex_rip_from_hostpc(BlockBegin, HostPC), never
+ * RestoreRIPFromHostPC(Thread, HostPC) — the latter reads the thread's CURRENT
+ * block header, which may have moved on since the fault was recorded. */
+static inline bool MonoBackpatcherBridgeArmed() {
+  return ios_fex_mono_bridge_armed() != 0;
+}
+
+static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadState* Thread) {
+  uint64_t BlockBegin = 0, HostPC = 0, FaultAddr = 0;
+  if (!ios_fex_mono_take_pending(&BlockBegin, &HostPC, &FaultAddr)) {
+    return;
+  }
+
+  const uint64_t InsnRIP = ios_fex_rip_from_hostpc(BlockBegin, HostPC);
+  auto* Header = reinterpret_cast<const FEXCore::CPU::CPUBackend::JITCodeHeader*>(BlockBegin);
+  auto* Tail = reinterpret_cast<const FEXCore::CPU::CPUBackend::JITCodeTail*>(BlockBegin + Header->OffsetToBlockTail);
+  const uint64_t BlockEntry = Tail->RIP;
+
+  LogMan::Msg::EFmt("[mono-bridge] ml648 PENDING block_begin={:#x} host_pc={:#x} fault={:#x} "
+                    "insn_rip={:#x} block_entry={:#x} captured={}",
+                    BlockBegin, HostPC, FaultAddr, InsnRIP, BlockEntry, ios_fex_mono_captured_count());
+
+  if (!InsnRIP || !BlockEntry) {
+    LogMan::Msg::EFmt("[mono-bridge] ml648 REJECT: rip reconstruction failed");
+    return;
+  }
+  static constexpr uint8_t XChgOp = 0x87;
+  const uint8_t* Code = reinterpret_cast<const uint8_t*>(InsnRIP);
+  if (Code[0] != XChgOp && Code[1] != XChgOp) {
+    LogMan::Msg::EFmt("[mono-bridge] ml648 REJECT: not an XCHG at {:#x} ({:#x} {:#x})", InsnRIP, Code[0], Code[1]);
+    return;
+  }
+
+  {
+    std::scoped_lock CodeLock(CTX->GetCodeInvalidationMutex());
+    CTX->MarkMonoBackpatcherBlock(BlockEntry);
+  }
+  CTX->SyscallHandler->InvalidateGuestCodeRange(Thread, BlockEntry, FEXCore::Utils::FEX_PAGE_SIZE);
+  ios_fex_mono_count_activated();
+  LogMan::Msg::EFmt("[mono-bridge] ml648 ACTIVATED mono backpatcher block {:#x} -- SWPAL storm should collapse", BlockEntry);
+}
+#endif
+
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.
@@ -1280,6 +1372,30 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   auto Thread = Frame->Thread;
   FEXCORE_PROFILE_SCOPED("CompileBlock");
   FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedJITTime);
+
+#ifdef FEX_IOS_HOST
+  /* ml648: consume any pending Mono-backpatcher event.
+   *
+   * ⚠️ HONEST LIMITATION. Sol asked for a safe point guaranteed on the NEXT block
+   * transition. There isn't a free one: the per-block LookupCache probe is
+   * emitted assembly, and ExitFunctionLink only runs on an edge's FIRST
+   * traversal, so the only zero-cost C++ hooks are compile-time. Adding a check
+   * to the dispatcher's emitted path would tax every block transition forever to
+   * save a one-shot activation.
+   *
+   * Why CompileBlock is nonetheless prompt here: the capture happens the first
+   * time Mono PATCHES code, which is precisely when Mono is also EMITTING code,
+   * so compiles are dense at exactly that moment (179,415 in the ml647 run).
+   * Capture and compilation are correlated by construction, not by luck.
+   *
+   * This is measurable rather than assumed — the [mono-bridge] PENDING line
+   * prints n_captured at activation, so the number of faults paid while waiting
+   * is in the log. If that gap is large, the answer is a dispatcher hook and the
+   * log will say so outright. */
+  if (MonoBackpatcherBridgeArmed()) {
+    IosMonoTryActivate(this, Thread);
+  }
+#endif
 
   /* iOS-Mythic ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.
    *
@@ -2247,16 +2363,36 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
   SyscallHandler->InvalidateGuestCodeRange(Thread, Entrypoint, 1);
 }
 
+
 void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
   auto Thread = Frame->Thread;
   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
   {
     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
 
+    uint64_t Dest = Address;
+#ifdef FEX_IOS_HOST
+    /* ml648: THE STORE MUST GO TO THE WRITABLE ALIAS.
+     *
+     * The whole point of this helper is to replace a faulting write with a
+     * direct one. On iOS the guest VA is R+X only -- iOS will not grant RWX --
+     * so a plain store to `Address` Mach-faults straight back and we would have
+     * swapped one fault for another, gaining nothing. Resolve through the
+     * anonymous alias table (NOT IosAliasEntries) and write the RW view.
+     *
+     * A miss is counted and falls through to the direct store, which faults and
+     * is emulated as before: degraded, never wrong. */
+    const uint64_t RW = IosMonoResolveRW(Address, Size);
+    if (RW) {
+      Dest = RW;
+    }
+    ios_fex_mono_count_helper(RW ? 0 : 1);
+#endif
+
     if (Size == 8) {
-      *reinterpret_cast<uint64_t*>(Address) = Value;
+      *reinterpret_cast<uint64_t*>(Dest) = Value;
     } else if (Size == 4) {
-      *reinterpret_cast<uint32_t*>(Address) = Value;
+      *reinterpret_cast<uint32_t*>(Dest) = Value;
     } else {
       ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
     }
