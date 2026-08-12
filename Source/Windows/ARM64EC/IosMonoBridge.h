@@ -16,7 +16,7 @@
 #pragma once
 #include <cstdint>
 
-#define IOS_MONO_ABI_VERSION 1
+#define IOS_MONO_ABI_VERSION 2
 #define IOS_MONO_MAX_ALIASES 4096
 #define IOS_MONO_MAX_CONTEXTS 64
 
@@ -39,6 +39,7 @@ struct ios_mono_pending {
 
 struct ios_mono_bridge {
   uint32_t abi_version;
+  uint32_t diag_enabled;  // ml649: runtime diagnostic switch
   uint32_t off_inline_jit_block_header;
   uint32_t off_block_tail;
   uint32_t off_tail_rip;
