@@ -1032,6 +1032,41 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
         NativeContext->X17 = reinterpret_cast<uint64_t>(CPUArea.Area); // Set EC_ENTRY_CPUAREA_REG
       } else {
         LogMan::Msg::DFmt("Handled self-modifying code: pc: {:X} fault: {:X}", NativeContext->Pc, FaultAddress);
+#ifdef FEX_IOS_HOST
+        /* ml657: ON iOS THE SMC RETRY CAN NEVER SUCCEED, SO PERFORM THE ACCESS HERE.
+         *
+         * This path claims the fault and returns without advancing Pc, because on
+         * Windows HandleRWXAccessViolation has just unprotected the page and the
+         * re-executed store will land. On iOS the guest mapping stays RX BY DESIGN —
+         * that is the whole reason the RW alias exists — so the retry re-faults at the
+         * identical Pc forever.
+         *
+         * Book of the Dead died exactly here: 1,999 iterations of
+         *   Detected mono backpatcher at: 71F7680F64
+         *   Handled self-modifying code: pc: 154839E18 fault: 7045F901E6
+         * until the 2,000-redelivery guard killed the process. Note the unaligned
+         * handler below at the EXCEPTION_DATATYPE_MISALIGNMENT check is unreachable in
+         * this state, because SMC claims the fault first.
+         *
+         * So run the atomic through the RW alias here and let Pc advance. That also
+         * un-wedges the Mono optimisation: MarkMonoBackpatcherBlock has already marked
+         * this block, but a marked block is only recompiled once execution LEAVES it,
+         * and execution never left. Advancing past the store is what lets the
+         * MonoBackpatcherWrite recompile actually happen.
+         *
+         * Safe by construction: HandleUnalignedAccess only claims encodings it
+         * recognises. If it declines we fall through to the previous behaviour
+         * unchanged. ⚠️ An ALIGNED store trapped by SMC would still loop — not observed,
+         * and it would need a different fix rather than a wider net here. */
+        const uint64_t SmcPc = NativeContext->Pc;
+        if (Exception::HandleUnalignedAccess(CPUArea, *NativeContext, CTX->IsAddressInCodeBuffer(Thread, SmcPc))) {
+          static unsigned SmcAtomicCount;
+          if (SmcAtomicCount < 16) {
+            LogMan::Msg::EFmt("[smc-atomic] ml657 #{} handled pc {:X} -> {:X} fault {:X}", ++SmcAtomicCount, SmcPc,
+                              NativeContext->Pc, FaultAddress);
+          }
+        }
+#endif
       }
 
       return true;
