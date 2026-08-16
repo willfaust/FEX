@@ -6,6 +6,14 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 
+/* iOS-Mythic ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
+ * (the earliest allocator in the process) and followed here. C linkage: it is
+ * chosen from C. */
+extern "C" {
+extern uintptr_t ios_fex_band_base;
+extern uintptr_t ios_fex_band_end;
+}
+
 namespace FEX::Windows::CallRetStack {
 struct CallRetStackInfo {
   uint64_t AllocationBase;
@@ -39,16 +47,23 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
   {
     MEM_ADDRESS_REQUIREMENTS AddrReq {};
     MEM_EXTENDED_PARAMETER AddrParam {};
-    AddrReq.LowestStartingAddress = reinterpret_cast<void*>(0x7C00000000ULL);
-    AddrReq.HighestEndingAddress = reinterpret_cast<void*>(0x7FFFFFFFFFULL);
+    /* ml706: follow the band rpmalloc selected, do not hardcode it. */
+    AddrReq.LowestStartingAddress = reinterpret_cast<void*>(ios_fex_band_base);
+    AddrReq.HighestEndingAddress = reinterpret_cast<void*>(ios_fex_band_end);
     AddrParam.Type = MemExtendedParameterAddressRequirements;
     AddrParam.Pointer = &AddrReq;
-    CallRetStackAlloc = ::VirtualAlloc2(nullptr, nullptr, CallRetStackAllocSize, MEM_RESERVE, PAGE_NOACCESS, &AddrParam, 1);
+    if (ios_fex_band_base) {
+      CallRetStackAlloc = ::VirtualAlloc2(nullptr, nullptr, CallRetStackAllocSize, MEM_RESERVE, PAGE_NOACCESS, &AddrParam, 1);
+    }
   }
-#endif
+  /* ml706: NO unconstrained fallback here. Each 16-byte frame holds a HOST
+   * code label, so a guest over-read yields exactly the bogus branch targets
+   * of ml316 -- guest-band placement is worse than failing outright. */
+#else
   if (!CallRetStackAlloc) {
     CallRetStackAlloc = ::VirtualAlloc(nullptr, CallRetStackAllocSize, MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
   }
+#endif
 
   FEXCore::Allocator::VirtualName("FEXMem_CallRetStacks", CallRetStackAlloc,
                                   FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE);

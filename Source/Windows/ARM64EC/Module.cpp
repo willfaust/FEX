@@ -838,7 +838,12 @@ NTSTATUS ProcessInit() {
    * compile time, so changing only another .cpp leaves the stamp stale and the ambiguity
    * half-returns. The MYTHIC_REV tag below fixes that: bump it for every deploy, which
    * necessarily edits this file and so refreshes the timestamp too. Self-enforcing. */
-#define MYTHIC_REV "ml466"
+/* ml706: this tag went stale -- an ml705 binary still reported ml466, which is
+ * exactly the "self-enforcing marker" failure it exists to prevent. The
+ * __DATE__/__TIME__ below is compiler-generated and therefore the
+ * authoritative identity; if the two disagree, the tag is wrong, not the
+ * build. */
+#define MYTHIC_REV "ml706"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MYTHIC_REV " compiled " __DATE__ " " __TIME__);
 #endif
 

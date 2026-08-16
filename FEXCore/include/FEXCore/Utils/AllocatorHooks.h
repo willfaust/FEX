@@ -55,6 +55,14 @@ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
 FEX_DEFAULT_VISIBILITY void ClearHooks();
 
 #ifdef _WIN32
+/* iOS-Mythic ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
+ * (the earliest allocator in the process) and followed by every other
+ * consumer. C linkage: it is chosen from C. */
+extern "C" {
+extern uintptr_t ios_fex_band_base;
+extern uintptr_t ios_fex_band_end;
+}
+
 inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Commit = true) {
   // Allocate top-down to avoid polluting the lower VA space, as even on 64-bit some programs (i.e. LuaJIT) require allocations below 4GB.
   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
@@ -87,11 +95,24 @@ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Co
    * hardening, never a new fatal (#43).
    * Exec allocations are excluded: EC_CODE buffers have their own JIT-pool
    * steering that must keep control of placement. */
+  /* iOS-Mythic ml706: use the band rpmalloc selected at process start.
+   *
+   * This is not the earliest allocator -- rpmalloc runs before
+   * arm64ec_process_init and before SetupHooks -- so it cannot choose the
+   * band, only follow it. Choosing here (as ml705 did) was too late to matter:
+   * rpmalloc had already made its own hardcoded request, failed, retried
+   * unconstrained, and placed heap metadata in guest memory. */
   if (!Base && !Execute) {
+    if (!ios_fex_band_base) {
+      /* No host-only band on this device. Falling through to the
+       * unconstrained path is exactly what corrupts a constrained device, so
+       * fail visibly instead of moving into guest address space. */
+      return nullptr;
+    }
     MEM_ADDRESS_REQUIREMENTS AddrReq {};
     MEM_EXTENDED_PARAMETER AddrParam {};
-    AddrReq.LowestStartingAddress = reinterpret_cast<void*>(0x7C00000000ULL);
-    AddrReq.HighestEndingAddress = reinterpret_cast<void*>(0x7FFFFFFFFFULL);
+    AddrReq.LowestStartingAddress = reinterpret_cast<void*>(ios_fex_band_base);
+    AddrReq.HighestEndingAddress = reinterpret_cast<void*>(ios_fex_band_end);
     AddrParam.Type = MemExtendedParameterAddressRequirements;
     AddrParam.Pointer = &AddrReq;
     // No MEM_TOP_DOWN here: Windows rejects it in combination with address requirements.
@@ -99,6 +120,8 @@ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Co
     if (Ret) {
       return Ret;
     }
+    /* Band exists but is exhausted: a different failure from "no band", and
+     * the pre-existing ml321 hardening (#43) still applies below. */
   }
 #endif
   MEM_EXTENDED_PARAMETER Parameter {};
