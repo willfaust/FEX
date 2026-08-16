@@ -94,10 +94,19 @@ constexpr size_t CPU_AREA_EMULATOR_DATA_OFFSET = 0x30;
 // canonical TEB-pointer source and emit a 3-instruction read at every site
 // that would otherwise touch x18.
 //
-// Must match TSD_TEB_SLOT_OFFSET in our Wine ntdll-unix x18 patcher. Defined
-// at build time via -DFEX_IOS_HOST=1 since we cross-compile to a Windows PE
-// (so __APPLE__ is not defined even though the host OS is iOS).
-constexpr size_t IOS_TEB_TSD_OFFSET = 0x898;
+// The slot is NOT a compile-time constant. It is whichever raw TSD slot backs
+// the pthread key wine's ntdll-unix creates for the TEB, which varies by device
+// and by what has already allocated keys. We used to hardcode slot 275
+// (0x898); that is a dynamic key we never owned, and on an M4 iPad its real
+// owner -- something in the Metal stack, brought up by the first nextDrawable
+// -- reclaimed it and reset it to NULL, after which every one of these reads
+// produced TEB=0 and the process died dereferencing TEB->PEB.
+//
+// Wine discovers the offset at process init and publishes it as the ntdll data
+// export `ios_teb_tsd_offset`; ARM64EC/Module.cpp imports it into this variable
+// before any code is emitted. It is zero until then, and emitting a read
+// against zero is a bug, not a fallback -- see the check at its import site.
+extern "C" uint32_t IosTebTsdOffset;
 #endif
 
 constexpr uint64_t EC_CODE_BITMAP_MAX_ADDRESS = 1ULL << 47;

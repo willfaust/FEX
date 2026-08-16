@@ -23,6 +23,12 @@
 #include <tuple>
 #include <utility>
 
+#ifdef FEX_IOS_HOST
+// Published by wine's ntdll (data export `ios_teb_tsd_offset`), imported in
+// ARM64EC/Module.cpp at process init. See IosTebTsdOffset in Arm64Emitter.h.
+extern "C" uint32_t IosTebTsdOffset = 0;
+#endif
+
 namespace FEXCore::CPU {
 
 // LLVM's preserve_all doc, this is used throughout this file and reproduced
@@ -828,7 +834,7 @@ void Arm64Emitter::FillStaticRegs(FillStaticRegOptions Options) {
   // iOS clobbers x18 — read TEB from TPIDRRO_EL0+TSD slot 275 instead.
   mrs(TmpReg.X(), ARMEmitter::SystemRegister::TPIDRRO_EL0);
   and_(ARMEmitter::Size::i64Bit, TmpReg.X(), TmpReg.X(), ~7ULL);
-  ldr(TmpReg.X(), TmpReg.X(), IOS_TEB_TSD_OFFSET);
+  ldr(TmpReg.X(), TmpReg.X(), IosTebTsdOffset);
   ldr(TmpReg.X(), TmpReg.X(), TEB_CPU_AREA_OFFSET);
 #else
   ldr(TmpReg.X(), ARMEmitter::Reg::r18, TEB_CPU_AREA_OFFSET);

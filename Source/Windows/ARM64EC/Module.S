@@ -1,11 +1,22 @@
 .text
 .balign 16
 
-// iOS clobbers x18 on context switches. Read TEB from TPIDRRO_EL0+TSD slot 275
-// (set up by our Wine ntdll-unix x18 patcher) instead of trusting x18 directly.
-// TPIDRRO_EL0 is preserved by iOS across context switches, and the AND #~7 +
-// ldr at TSD slot 275 (offset 0x898) is the canonical pthread TLS pattern.
-// Must match IOS_TEB_TSD_OFFSET in Arm64Emitter.h.
+// iOS clobbers x18 on context switches. Read TEB from TPIDRRO_EL0 + the raw
+// pthread TSD slot that wine's ntdll-unix publishes the TEB in, instead of
+// trusting x18 directly. TPIDRRO_EL0 IS preserved by iOS across context
+// switches, and AND #~7 + ldr is the canonical pthread TLS pattern.
+//
+// The #0x898 below is a PLACEHOLDER, not the slot. The real slot is whichever
+// one backs ntdll-unix's TEB pthread key in this process, which is not knowable
+// at assembly time and differs per device and per load order. Wine's x18
+// binary patcher recognises this exact three-instruction triplet and rewrites
+// the immediate through the .text RW alias, before this code is ever executed
+// (see the "retarget hand-written TEB-from-TSD reads" pass in virtual_ios.c).
+//
+// Do NOT "correct" this constant, and do NOT break the triplet apart or
+// reorder it -- the patcher matches all three instructions with matching
+// registers, and an unmatched sequence silently keeps reading the wrong slot.
+// The JIT emitters read the same offset at runtime via IosTebTsdOffset.
 #ifdef FEX_IOS_HOST
 .macro IOS_LOAD_TEB reg
   mrs \reg, TPIDRRO_EL0

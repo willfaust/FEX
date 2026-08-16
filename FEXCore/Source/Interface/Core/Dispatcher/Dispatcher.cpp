@@ -114,7 +114,7 @@ void Dispatcher::EmitDispatcher() {
    * strictly safer and matches the rest of the iOS dispatcher. */
   mrs(TMP1, ARMEmitter::SystemRegister::TPIDRRO_EL0);
   and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, ~7ULL);
-  ldr(TMP1, TMP1, IOS_TEB_TSD_OFFSET);
+  ldr(TMP1, TMP1, IosTebTsdOffset);
   ldr(TMP1, TMP1, TEB_CPU_AREA_OFFSET);
   ldr(STATE, TMP1, CPU_AREA_EMULATOR_DATA_OFFSET);
 #else
@@ -218,7 +218,7 @@ void Dispatcher::EmitDispatcher() {
   // iOS clobbers x18 — read TEB from TPIDRRO_EL0+TSD slot 275 instead.
   mrs(TMP1, ARMEmitter::SystemRegister::TPIDRRO_EL0);
   and_(ARMEmitter::Size::i64Bit, TMP1, TMP1, ~7ULL);
-  ldr(TMP1, TMP1, IOS_TEB_TSD_OFFSET);
+  ldr(TMP1, TMP1, IosTebTsdOffset);
   ldr(TMP1, TMP1, TEB_PEB_OFFSET);
 #else
   ldr(TMP1, ARMEmitter::XReg::x18, TEB_PEB_OFFSET);
@@ -364,7 +364,7 @@ void Dispatcher::EmitDispatcher() {
     // iOS x18 quirk: TEB read via TPIDRRO_EL0+TSD slot 275.
     mrs(TMP2, ARMEmitter::SystemRegister::TPIDRRO_EL0);
     and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, ~7ULL);
-    ldr(TMP2, TMP2, IOS_TEB_TSD_OFFSET);
+    ldr(TMP2, TMP2, IosTebTsdOffset);
     ldr(TMP2, TMP2, TEB_CPU_AREA_OFFSET);
 #else
     ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
@@ -379,7 +379,7 @@ void Dispatcher::EmitDispatcher() {
 #ifdef FEX_IOS_HOST
     mrs(TMP2, ARMEmitter::SystemRegister::TPIDRRO_EL0);
     and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, ~7ULL);
-    ldr(TMP2, TMP2, IOS_TEB_TSD_OFFSET);
+    ldr(TMP2, TMP2, IosTebTsdOffset);
     ldr(TMP2, TMP2, TEB_CPU_AREA_OFFSET);
 #else
     ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);

@@ -75,6 +75,14 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
  * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
  * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
 extern "C" uint64_t IosFfsBypassLog[4];
+
+/* Raw TSD byte offset (from TPIDRRO_EL0 & ~7) of the slot holding the TEB.
+ * Discovered and published by wine's ntdll-unix; imported in ProcessInit.
+ * Defined in FEXCore Arm64Emitter.cpp, where the JIT emitters also read it. */
+extern "C" uint32_t IosTebTsdOffset;
+/* uint32_t, not bool: a 1-byte global here misaligned the adrp/ldr pair
+ * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
+static uint32_t IosTebTsdImportFound = 0;
 uint64_t IosFfsBypassLog[4] {};
 #endif // FEX_IOS_HOST
 
@@ -208,7 +216,9 @@ static inline _TEB* IOSLoadTEB() {
   uintptr_t tpidrro;
   __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tpidrro));
   tpidrro &= ~uintptr_t(7);
-  _TEB* via_tsd = *reinterpret_cast<_TEB**>(tpidrro + 0x898);  // IOS_TEB_TSD_OFFSET
+  /* Offset zero means ProcessInit has not imported it yet -- read nothing
+   * rather than dereferencing TSD slot 0, which belongs to libpthread. */
+  _TEB* via_tsd = IosTebTsdOffset ? *reinterpret_cast<_TEB**>(tpidrro + IosTebTsdOffset) : nullptr;
   if (via_tsd) return via_tsd;
   /* 2026-05-19: TSD slot 275 isn't always populated by the time ThreadInit
    * runs on FMOD worker threads (Wine thread bootstrap race). Fall back to
@@ -246,7 +256,9 @@ ThreadCPUArea GetCPUArea() {
 static void IosLogCPUArea(const char* tag) {
   uintptr_t tpidrro;
   __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(tpidrro));
-  void* tsd275 = *reinterpret_cast<void**>((tpidrro & ~uintptr_t(7)) + 0x898);
+  void* tsd275 = IosTebTsdOffset
+                     ? *reinterpret_cast<void**>((tpidrro & ~uintptr_t(7)) + IosTebTsdOffset)
+                     : nullptr;
   _TEB* teb = IOSLoadTEB();
   auto* area = *reinterpret_cast<CHPE_V2_CPU_AREA_INFO**>(reinterpret_cast<uintptr_t>(teb) + ThreadCPUArea::TEBCPUAreaOffset);
 
@@ -798,6 +810,35 @@ NTSTATUS ProcessInit() {
    * The old hardcode corrupted the JIT pool on runs where the offset
    * differed. See FEXBridge.mm (setenv) + env_ios.c (forwarding). */
 
+#ifdef FEX_IOS_HOST
+  /* Import the raw TSD slot offset for the TEB before anything reads a TEB or
+   * emits code. It is published by wine's ntdll as a data export because the
+   * slot is not knowable at build time: it is whichever slot backs the pthread
+   * key ntdll-unix creates, which differs per device and per load order.
+   *
+   * We used to assemble slot 275 (0x898) into every one of these reads. That
+   * is a dynamic pthread key nobody guaranteed us, and when its real owner
+   * showed up -- Metal, on an M4 iPad, at the first nextDrawable -- it reset
+   * the slot and every TEB read in the process started returning zero.
+   *
+   * A missing or zero export is fatal, not a reason to fall back: the old
+   * constant is exactly the value that is wrong. */
+  {
+    const auto NtDllForTsd = GetModuleHandle("ntdll.dll");
+    const auto Published = reinterpret_cast<uint32_t*>(GetProcAddress(NtDllForTsd, "ios_teb_tsd_offset"));
+    if (Published && *Published) {
+      IosTebTsdOffset = *Published;
+    }
+    /* Report via LogMan next to [build-id], not here: at this point
+     * ProcessParameters->hStdError is not usable yet, so the ml707 build's
+     * WriteFile report never reached the log at all. */
+    IosTebTsdImportFound = Published != nullptr ? 1u : 0u;
+    if (!IosTebTsdOffset) {
+      return STATUS_UNSUCCESSFUL;
+    }
+  }
+#endif
+
   InitSyscalls();
 
   FEX::Windows::InitCRTProcess();
@@ -843,8 +884,16 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MYTHIC_REV "ml706"
+#define MYTHIC_REV "ml708"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MYTHIC_REV " compiled " __DATE__ " " __TIME__);
+#ifdef FEX_IOS_HOST
+  {
+    const uint32_t Off = IosTebTsdOffset;
+    const bool Found = IosTebTsdImportFound != 0;
+    LogMan::Msg::EFmt("[fex-tsd] imported offset={:#x} (ntdll export {})", Off,
+                      Found ? "found" : "MISSING");
+  }
+#endif
 #endif
 
   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, "1");

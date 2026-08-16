@@ -343,7 +343,7 @@ DEF_OP(MonoBackpatcherWrite) {
   // iOS x18 quirk: TEB read via TPIDRRO_EL0+TSD slot 275.
   mrs(TMP2, ARMEmitter::SystemRegister::TPIDRRO_EL0);
   and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, ~7ULL);
-  ldr(TMP2, TMP2, IOS_TEB_TSD_OFFSET);
+  ldr(TMP2, TMP2, IosTebTsdOffset);
   ldr(TMP2, TMP2, TEB_CPU_AREA_OFFSET);
 #else
   ldr(TMP2, ARMEmitter::XReg::x18, TEB_CPU_AREA_OFFSET);
