@@ -204,7 +204,39 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
   FEX_CONFIG_OPT(MaxInst, MAXINST);
   FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
 
-  const bool IsMono = (Name == "mono-2.0-bdwgc.dll" || Name == "mono.dll");
+  /* ml712: wine-mono ships its runtime as libmono-2.0-x86_64.dll (the file mscoree's
+   * find_mono_dll() looks for on an x86_64/ARM64EC host), which matched neither name
+   * above -- so on Marvel Cosmic Invasion the hooks stayed inert and Mono startup paid
+   * the full W^X tax: ~735,000 emulated stores from one hot site during init.
+   *
+   * Recognised, but activation is OPT-IN via MYTHIC_WINEMONO_BRIDGE=1, default OFF, for a
+   * correctness reason rather than caution about perf: the bridge reclassifies a detected
+   * XCHG from a true atomic exchange into an alias-directed plain write. Deciding that by
+   * FILENAME alone would let any unrelated lock-free XCHG in this DLL be treated as a
+   * backpatch site and silently lose its atomicity -- and wine-mono's thread-suspend
+   * machinery is exactly the kind of lock-free code that would break. The existing two
+   * names are Unity's embedded Mono, where the hook has been field-proven since ml648.
+   *
+   * Verification is deliberately incomplete: wine-mono ships no PDB (its debug directory
+   * points at a build-server path) and its exports are ~195KB apart around the hot RIP, so
+   * the faulting site CANNOT be symbolized offline to prove it is a code-patching routine.
+   * Until it is, this stays off by default and the detected RIP is logged for inspection.
+   *
+   * NOTE: this storm is a STARTUP cost and is NOT why the game shows no window. Measured
+   * between matched checkpoints the rate is ~91/sec by the time FNA3D loads, not the
+   * thousands/sec a cumulative-total-over-runtime average suggests. The current stall is
+   * thread 007c holding a Mono critical section while workers queue behind it. */
+  const bool IsUnityMono = (Name == "mono-2.0-bdwgc.dll" || Name == "mono.dll");
+  const bool IsWineMono = (Name == "libmono-2.0-x86_64.dll" || Name == "libmono-2.0-x86.dll");
+  bool WineMonoOptIn = false;
+  if (IsWineMono) {
+    const char* Env = getenv("MYTHIC_WINEMONO_BRIDGE");
+    WineMonoOptIn = Env && Env[0] == '1';
+    LogMan::Msg::EFmt("[mono-winemono] ml712 module={} base={:#x} opt-in={} (MYTHIC_WINEMONO_BRIDGE={})", Name, Address,
+                      WineMonoOptIn ? 1 : 0, Env ? Env : "unset");
+  }
+
+  const bool IsMono = IsUnityMono || (IsWineMono && WineMonoOptIn);
   if (IsMono) {
     /* ml623: report the EFFECTIVE settings at EFmt on every branch.
      *
@@ -434,6 +466,27 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
 
   uint64_t BlockEntry = CTX.GetGuestBlockEntry(Thread);
   LogMan::Msg::DFmt("Detected mono backpatcher at: {:X}", BlockEntry);
+
+  /* ml712: name the site at EFmt, once, with module-relative RVAs and the bytes.
+   *
+   * The DFmt line above is eaten by MYTHIC_QUIET, so a run could neither confirm which
+   * guest instruction was reclassified nor let it be checked afterwards. That matters more
+   * for wine-mono than for Unity's Mono: this reclassifies an XCHG from a true atomic
+   * exchange into an alias-directed plain write, wine-mono ships no PDB, and its exports
+   * sit ~195KB apart around the hot region -- so the RVA printed here is the ONLY evidence
+   * available for deciding whether the site is a genuine code-patching routine or an
+   * unrelated lock-free exchange that must keep its atomicity. Print it before marking. */
+  {
+    static bool Reported = false;
+    if (!Reported) {
+      Reported = true;
+      const auto* Bytes = reinterpret_cast<const uint8_t*>(RIP);
+      LogMan::Msg::EFmt("[mono-site] ml712 FIRST detect rip={:#x} (mono+{:#x}) block={:#x} (mono+{:#x}) "
+                        "bytes={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                        RIP, RIP - MonoBase, BlockEntry, BlockEntry - MonoBase, Bytes[0], Bytes[1], Bytes[2], Bytes[3],
+                        Bytes[4], Bytes[5], Bytes[6], Bytes[7]);
+    }
+  }
 #ifndef FEX_IOS_HOST
   /* ml648: SKIPPED ON iOS. DisableSMCDetection() reprotects every RWX interval
    * as WRITABLE, and iOS will never grant write on the guest VA — that is the

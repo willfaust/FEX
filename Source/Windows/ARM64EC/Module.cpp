@@ -884,7 +884,7 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MYTHIC_REV "ml708"
+#define MYTHIC_REV "ml712"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MYTHIC_REV " compiled " __DATE__ " " __TIME__);
 #ifdef FEX_IOS_HOST
   {
@@ -1266,6 +1266,54 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
     if (!Status) {
       InvalidationTracker->HandleMemoryProtectionNotification(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), NewProt);
     }
+  }
+}
+
+/* iOS-Mythic ml710: LOADER-SAFE EXECUTABLE-INTERVAL REGISTRATION.
+ *
+ * This is a FALLBACK, not a second full registration path. It exists because in a child
+ * pseudo-process the syscall notification never arrives -- enter_syscall_callback()
+ * refuses, InSyscallCallback having been left set -- so no module except the main image
+ * and ntdll is ever marked executable and the first x86-64 instruction the loader enters
+ * decodes as NOEXEC, raises NoExecOp and takes the GuestSignal_SIGSEGV trampoline.
+ *
+ * Wine calls this from its loader once a module is mapped, relocated and imported, before
+ * any DllMain runs. It must therefore be safe to call from a thread that is EXECUTING
+ * TRANSLATED CODE, and that constraint is what makes it distinct from
+ * NotifyMapViewOfSection():
+ *
+ *   NotifyMapViewOfSection -> HandleImageMap() -> ImageTracker::HandleImageMap(), which
+ *   opens with std::scoped_lock(CTX.GetCodeInvalidationMutex()) -- EXCLUSIVE. A thread
+ *   running translated code already holds that mutex SHARED, there is no read-to-write
+ *   upgrade, and it blocks on itself forever while holding wine's loader lock. That is
+ *   exactly how Book of the Dead froze on an unload and Marvel Cosmic Invasion froze on
+ *   cryptbase.dll's load, 88s parked with the [iOS-xins] lines as the last output.
+ *
+ * So this touches ONLY InvalidationTracker, which takes just its own IntervalsLock.
+ *
+ * WHAT THIS DOES NOT DO, and why that is still a gap: ImageTracker owns image relocation
+ * and code-cache information plus extended volatile/ForceTSO metadata. Skipping it keeps
+ * execution correct -- the intervals are what gate decoding -- but leaves that metadata
+ * incomplete for any module whose syscall notification was genuinely missed. The durable
+ * fix is to repair the pseudo-process notification gate, or to defer the ImageTracker half
+ * to a dispatcher point where no shared code-invalidation hold exists. Neither is done.
+ *
+ * Idempotent: re-registering the same intervals is harmless, and the syscall path still
+ * fires for the same module whenever its gate does let it through. */
+extern "C" void NotifyImageMap(void* Address) {
+  if (!InvalidationTracker || !Address) {
+    return;
+  }
+
+  static std::atomic<uint32_t> Count {0};
+  const auto N = ++Count;
+
+  fextl::string ModulePath = FEX::Windows::GetSectionFilePath(reinterpret_cast<uint64_t>(Address));
+  fextl::string ModuleName = fextl::string {FEX::Windows::BaseName(ModulePath)};
+  InvalidationTracker->HandleImageMap(ModuleName, reinterpret_cast<uint64_t>(Address));
+
+  if (N <= 64) {
+    LogMan::Msg::EFmt("[img-map] ml710 #{} intervals-only {} base={}", N, ModuleName, Address);
   }
 }
 
