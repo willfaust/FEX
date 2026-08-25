@@ -26,7 +26,7 @@ GuestToHostMap::GuestToHostMap()
   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
 }
 
-// iOS-Mythic ml606: live/cumulative census for the L1-only A/B. `live` is what
+// iOS-Madeira ml606: live/cumulative census for the L1-only A/B. `live` is what
 // matters — footprints must be compared at equal live-cache counts, not at equal
 // elapsed time, because caches are created and destroyed throughout a run.
 static std::atomic<uint64_t> LookupCacheLive {0};
@@ -79,7 +79,7 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   } else {
     AllocationSize = TotalCacheSize;
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic: commit upfront. The auto-commit-on-access-violation path
+    /* iOS-Madeira: commit upfront. The auto-commit-on-access-violation path
      * (OvercommitTracker.HandleAccessViolation) doesn't take effect cleanly
      * on iOS — pages stay faulting after VirtualAlloc(MEM_COMMIT) returns.
      * Pre-commit the whole region; physical pages are still demand-faulted
@@ -137,7 +137,7 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   }
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: L2/L1 must start all-zero — nonzero stale bytes (the 0x69
+  /* iOS-Madeira: L2/L1 must start all-zero — nonzero stale bytes (the 0x69
    * pattern observed during JIT-pool dumps, or recycled-arena content) make
    * the dispatcher's cbz miss and BR to garbage. The original fix was two
    * unconditional memsets, but those commit 32MB of private-dirty pages per

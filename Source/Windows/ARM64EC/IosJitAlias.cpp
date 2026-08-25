@@ -61,7 +61,7 @@ extern "C" {
 // this reason; this is that rule's missing twin on the FEX side. Tombstone
 // order matches wine's: Size = 0 first (a zero-size entry matches no range
 // query, including Module.S's inline asm walk), barrier, then reuse the slot.
-/* iOS-Mythic ml549: EXACT guest RIP from a host PC, for the unix-side fault probes.
+/* iOS-Madeira ml549: EXACT guest RIP from a host PC, for the unix-side fault probes.
  *
  * The Mach handlers in ntdll-unix read the guest RIP from CpuStateFrame+0x18, which FEX
  * only syncs at BLOCK boundaries -- it names the calling block, not the instruction that

@@ -111,7 +111,7 @@ protected:
   // Convert an RX (executable) address to the RW (writable) address for memory writes.
   // On non-Apple platforms, WriteOffset is 0 and this is identity.
   //
-  // iOS-Mythic 2026-05-19: ARM64EC PE builds (xtajit64.dll) target Windows
+  // iOS-Madeira 2026-05-19: ARM64EC PE builds (xtajit64.dll) target Windows
   // so __APPLE__ is undefined, but they still need the dual-map offset
   // because the JIT pool they write to is iOS-allocated dual-mapped memory.
   // FEX_IOS_HOST is defined for those PE builds and switches in a global

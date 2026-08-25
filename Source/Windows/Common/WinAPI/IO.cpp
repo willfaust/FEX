@@ -114,7 +114,7 @@ DLLEXPORT_FUNC(WINBOOL, WriteFile,
   if (lpOverlapped) {
     UNIMPLEMENTED();
   }
-  /* iOS-Mythic ml572: WriteFile TRACING BLOCK REMOVED — it was a stack smash.
+  /* iOS-Madeira ml572: WriteFile TRACING BLOCK REMOVED — it was a stack smash.
    *
    * It formatted into `char dbg[8 + 64 + 16]` (88 bytes) but wrote a 38-byte
    * header plus up to 64 preview bytes, each of which could expand to 2 chars
@@ -308,7 +308,7 @@ DLLEXPORT_FUNC(WINBOOL, SetEndOfFile, (HANDLE hFile)) {
 }
 
 DLLEXPORT_FUNC(DWORD, GetFileAttributesA, (LPCSTR lpFileName)) {
-  /* iOS-Mythic stub: pretend the file doesn't exist so FEX's config-file
+  /* iOS-Madeira stub: pretend the file doesn't exist so FEX's config-file
    * lookups (FEX::Config::LoadConfig etc.) skip cleanly. */
   SetLastError(ERROR_FILE_NOT_FOUND);
   return INVALID_FILE_ATTRIBUTES;

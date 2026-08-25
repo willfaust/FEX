@@ -21,7 +21,7 @@ namespace CPU {
 
   static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 #ifdef FEX_IOS_HOST
-  // iOS-Mythic ml437 (#74): the shared 896MB JIT pool's tail budget is ~188MB
+  // iOS-Madeira ml437 (#74): the shared 896MB JIT pool's tail budget is ~188MB
   // for ALL threads' code buffers; hot threads doubling 16->32->64->128MB
   // exhausted it in ml436 (head 708MB of DLL copies + tail collided; 10 honest
   // refusals, 123 degraded threads). Cap growth at 32MB — hot threads clear
@@ -327,7 +327,7 @@ namespace CPU {
   CPUBackend::~CPUBackend() = default;
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml460 (#75): every C++ toucher of CurrentCodeBuffer /
+  /* iOS-Madeira ml460 (#75): every C++ toucher of CurrentCodeBuffer /
    * SignalHandlerCodeBuffers holds this while the sweeper may run (see the
    * header comment). Plain test-and-set spin — all critical sections are a
    * few pointer ops. NOT recursive: RegisterForSignalHandler is only called
@@ -367,7 +367,7 @@ namespace CPU {
       // This means that we can not safely clear the code at this point in time
       // Keep a reference to the old code buffer to delay deallocation
 #ifdef FEX_IOS_HOST
-      /* iOS-Mythic ml459 (#75): old code buffers are the pool's TAIL, and the
+      /* iOS-Madeira ml459 (#75): old code buffers are the pool's TAIL, and the
        * ml458 run ended with 12 carves (5 of them 32MB) but only ONE freed —
        * 214MB of a 896MB pool pinned while the head needed 1MB more. A buffer
        * lives until every strong ref drops; this vector is the one ref that can
@@ -406,7 +406,7 @@ namespace CPU {
   }
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml460 (#75): remote-migrate a PARKED thread off a stale
+  /* iOS-Madeira ml460 (#75): remote-migrate a PARKED thread off a stale
    * generation. Runs on the SWEEPER's thread; the caller has verified under
    * the Dekker gate that the owner is outside emitted code (InSimulation==0)
    * and cannot re-enter until the gate clears — so the owner cannot be inside
@@ -458,7 +458,7 @@ namespace CPU {
     : AllocatedSize(Size) {
     Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic ml364: exec allocations come from the finite JIT pool, and
+    /* iOS-Madeira ml364: exec allocations come from the finite JIT pool, and
      * ml363 died exactly here — the pool was exhausted (bump 858/896MB,
      * freelist 0), VirtualAlloc returned garbage/NULL with LOGMAN_THROW
      * compiled out, and ClearCache scribbled the detection string through a
@@ -616,7 +616,7 @@ namespace CPU {
 
 
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
-  /* iOS-Mythic ml460 (#75): the pool-tail sweep. ml459 proved the 208MB tail
+  /* iOS-Madeira ml460 (#75): the pool-tail sweep. ml459 proved the 208MB tail
    * is 13 live generations where steady state needs ~2 — each pinned by the
    * CurrentCodeBuffer ref of threads parked in wine waits, which never run
    * the compile-path self-migration. This sweep remote-migrates them.

@@ -58,7 +58,7 @@ public:
 
 FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostFeatures::HostTypeEnum HostType) {
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: registry has nothing useful here (Hardware\... reg keys
+  /* iOS-Madeira: registry has nothing useful here (Hardware\... reg keys
    * aren't populated). Synthesize a minimal HostFeatures manually with
    * baseline ARMv8.2 features that Apple Silicon supports. */
   FEXCore::HostFeatures HostFeatures = {};

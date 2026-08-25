@@ -63,7 +63,7 @@ $end_info$
 #include <chrono>
 #include <cstring>
 
-/* iOS-Mythic ml622: mirror of rpmalloc's POD snapshot (rpmalloc.c). Declared here
+/* iOS-Madeira ml622: mirror of rpmalloc's POD snapshot (rpmalloc.c). Declared here
  * rather than in a shared header because rpmalloc is C and vendored; keep the two
  * definitions in sync — the drain below is the only consumer. */
 extern "C" {
@@ -92,36 +92,36 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
 #include <utility>
 #include <xxhash.h>
 
-/* iOS-Mythic HOTRIP telemetry — plain globals (no constructors/guard vars).
+/* iOS-Madeira HOTRIP telemetry — plain globals (no constructors/guard vars).
  * 2026-05-14: per-thread callret tracking (GPT diagnosis: FMOD worker
  * thread leaks callret entries; need to confirm WHICH thread leaks and
  * separate game-thread vs render-thread vs FMOD-worker activity). 4 thread
  * slots hashed by Frame pointer. */
-static volatile uint64_t g_mythic_hot_count[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
-static volatile uint64_t g_mythic_max_alloc_size = 0;
-static volatile uint64_t g_mythic_last_str = 0;
-static volatile uint64_t g_mythic_last_vt = 0;
-static volatile uint64_t g_mythic_last_vt2 = 0;
-static volatile uint64_t g_mythic_callret_max = 0;
-static volatile uint64_t g_mythic_callret_min = ~(uint64_t)0;
-static volatile uint64_t g_mythic_callret_last = 0;
+static volatile uint64_t g_madeira_hot_count[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
+static volatile uint64_t g_madeira_max_alloc_size = 0;
+static volatile uint64_t g_madeira_last_str = 0;
+static volatile uint64_t g_madeira_last_vt = 0;
+static volatile uint64_t g_madeira_last_vt2 = 0;
+static volatile uint64_t g_madeira_callret_max = 0;
+static volatile uint64_t g_madeira_callret_min = ~(uint64_t)0;
+static volatile uint64_t g_madeira_callret_last = 0;
 
 /* Per-thread tracking (4 slots). Key = Frame ptr (unique per FEX thread).
  * Records callret_sp range, block-dispatch count, and last guest RIP seen
  * to localize WHICH thread is leaking callret entries. */
-static volatile uint64_t g_mythic_thr_key[4] = {0,0,0,0};
-static volatile uint64_t g_mythic_thr_crsp_min[4] = {~(uint64_t)0, ~(uint64_t)0, ~(uint64_t)0, ~(uint64_t)0};
-static volatile uint64_t g_mythic_thr_crsp_max[4] = {0,0,0,0};
-static volatile uint64_t g_mythic_thr_crsp_last[4] = {0,0,0,0};
-static volatile uint64_t g_mythic_thr_count[4] = {0,0,0,0};
-static volatile uint64_t g_mythic_thr_last_rip[4] = {0,0,0,0};
+static volatile uint64_t g_madeira_thr_key[4] = {0,0,0,0};
+static volatile uint64_t g_madeira_thr_crsp_min[4] = {~(uint64_t)0, ~(uint64_t)0, ~(uint64_t)0, ~(uint64_t)0};
+static volatile uint64_t g_madeira_thr_crsp_max[4] = {0,0,0,0};
+static volatile uint64_t g_madeira_thr_crsp_last[4] = {0,0,0,0};
+static volatile uint64_t g_madeira_thr_count[4] = {0,0,0,0};
+static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
 
-/* iOS-Mythic 2026-05-18 low-noise CompileBlock instrumentation counters. */
+/* iOS-Madeira 2026-05-18 low-noise CompileBlock instrumentation counters. */
 static volatile uint64_t g_cb_total = 0;
 static volatile uint64_t g_cb_real_compiles = 0;
 
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
-/* iOS-Mythic ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
+/* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
  * frontend (Module.cpp) which owns the thread registry. extern "C" so the
  * cross-layer reference has no namespace in its linkage name. */
 extern "C" void IosMaybeSweepCodeBuffers(FEXCore::Core::InternalThreadState* CallerThread);
@@ -137,7 +137,7 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
     Config.VirtualMemSize = 1ULL << 32;
   }
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: shrink the per-thread LookupCache L2 page table from 128MB
+  /* iOS-Madeira: shrink the per-thread LookupCache L2 page table from 128MB
    * (64GB VirtualMemSize) to 16MB (8GB). Every thread's LookupCache commits
    * its full arena upfront on iOS (commit-on-fault doesn't work — see
    * LookupCache.cpp), so ~264MB × ~19 game threads ≈ 5GB was killing the
@@ -236,7 +236,7 @@ uint64_t ContextImpl::RestoreRIPFromHostPC(FEXCore::Core::InternalThreadState* T
   return Frame->State.rip;
 }
 
-/* iOS-Mythic ml549: EXACT guest RIP from a host PC, callable from C.
+/* iOS-Madeira ml549: EXACT guest RIP from a host PC, callable from C.
  *
  * WHY: our fault probes (srcwatch, the bus/segv handlers) read the guest RIP out of
  * CpuStateFrame+0x18, which FEX only syncs at BLOCK boundaries. That names the calling
@@ -618,7 +618,7 @@ void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, boo
   FEXCore::Core::ResetCallRetStack(Thread, "core");
 }
 
-/* iOS-Mythic ml610: THE ONLY place the callret predictor is reset.
+/* iOS-Madeira ml610: THE ONLY place the callret predictor is reset.
  *
  * ml609 clipped this to the [base+2MB, base+6MB) window on the theory that the
  * rest of the 16MB was unreachable, so decommitting it was pure waste. Both
@@ -794,22 +794,22 @@ bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Th
   return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
 }
 
-/* iOS-Mythic ml623: targeted IR capture (PassManager.cpp). FEX_MythicIRCapTarget is the
+/* iOS-Madeira ml623: targeted IR capture (PassManager.cpp). FEX_MadeiraIRCapTarget is the
  * absolute guest address of the ONE instruction under investigation, published by the
  * Windows-side InvalidationTracker at module load. The decode loop below marks the
  * compile when the block CONTAINS that address -- containment, not entry RIP, because
  * with multiblock a block routinely starts hundreds of bytes earlier. */
-extern "C" uint64_t FEX_MythicIRCapTarget;
-extern "C" void FEX_MythicIRCapMark(uint64_t GuestRIP);
-extern "C" void FEX_MythicIRCapClear();
-extern "C" uint64_t FEX_MythicIRCapCurrentRIP();
+extern "C" uint64_t FEX_MadeiraIRCapTarget;
+extern "C" void FEX_MadeiraIRCapMark(uint64_t GuestRIP);
+extern "C" void FEX_MadeiraIRCapClear();
+extern "C" uint64_t FEX_MadeiraIRCapCurrentRIP();
 
 ContextImpl::GenerateIRResult
 ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, bool ExtendedDebugInfo, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("GenerateIR");
-  FEX_MythicIRCapClear(); // ml623: never inherit a previous compile's mark
+  FEX_MadeiraIRCapClear(); // ml623: never inherit a previous compile's mark
 
-  /* iOS-Mythic ml250: Thread->OpDispatcher has been observed NULL here, faulting as
+  /* iOS-Madeira ml250: Thread->OpDispatcher has been observed NULL here, faulting as
    * `str xzr,[x0,#0x378]` with x0=0 inside IREmitter::ResetWorkingList and killing the
    * process (unhandled c0000005, ml247 via chromehtml.dll -> tier0_s64).
    *
@@ -922,8 +922,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
 
         // ml623: does THIS block contain the instruction under investigation?
-        if (FEX_MythicIRCapTarget && InstAddress == FEX_MythicIRCapTarget) {
-          FEX_MythicIRCapMark(GuestRIP);
+        if (FEX_MadeiraIRCapTarget && InstAddress == FEX_MadeiraIRCapTarget) {
+          FEX_MadeiraIRCapMark(GuestRIP);
         }
         const FEXCore::X86Tables::X86InstInfo* TableInfo {nullptr};
         const FEXCore::X86Tables::DecodedInst* DecodedInfo {nullptr};
@@ -1036,14 +1036,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
             } else if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::UNIMPLEMENTED_INST) {
               Thread->OpDispatcher->UnimplementedOp(DecodedInfo);
             } else {
-              /* iOS-Mythic ml196: name the decode failure. The pre-existing
+              /* iOS-Madeira ml196: name the decode failure. The pre-existing
                * "Invalid or Unknown instruction" message above cannot fire for this path
                * because DecodeInstruction sets TableInfo = nullptr on exactly these
                * errors. This branch (NOEXEC_INST / PARTIAL_DECODE_INST) is what raises
                * FAULT_SIGSEGV -> GuestSignal_SIGSEGV -> the deliberate read of address 0
                * that has been killing webhelper threads. Log which address failed and
                * which status, so the guest RIP is stated rather than inferred. */
-              /* iOS-Mythic ml486 (#89): this log was UNBOUNDED. ml485's run wrote
+              /* iOS-Madeira ml486 (#89): this log was UNBOUNDED. ml485's run wrote
                * 1,117,783 copies of the SAME line for ONE address (0x7ED30A0080,
                * inside the FEX host band) — a 148MB log, 2.26M lines, from line
                * 16,648 to the end. NoExecOp raises SIGSEGV, the guest resumes at
@@ -1144,7 +1144,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 }
 
 ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, uint64_t MaxInst) {
-  // [iOS-Mythic] verbose CompileCode logs suppressed — flooding log faster than splash
+  // [iOS-Madeira] verbose CompileCode logs suppressed — flooding log faster than splash
 
   if (SourcecodeResolver && Config.GDBSymbols()) {
     auto MappedSection = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
@@ -1159,7 +1159,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
     GenerateIR(Thread, GuestRIP, Config.GDBSymbols(), MaxInst);
   if (!IRView) {
     // OpDispatcher IR already released in this case.
-    FEX_MythicIRCapClear(); // ml623
+    FEX_MadeiraIRCapClear(); // ml623
     return {{}, nullptr, 0, 0, false};
   }
 
@@ -1173,7 +1173,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
   if (MaxInst != 1 && !FEXCore::Utils::WritePriorityMutex::IosUnpublishedCompileActive()) {
     if (auto Block = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
       // Raced to compile, release the OpDispatcher IR.
-      FEX_MythicIRCapClear(); // ml623
+      FEX_MadeiraIRCapClear(); // ml623
       Thread->OpDispatcher->DelayedDisownBuffer();
       return {.CompiledCode = {.BlockBegin = reinterpret_cast<uint8_t*>(Block), .EntryPoints = {{GuestRIP, reinterpret_cast<uint8_t*>(Block)}}},
               .DebugData = nullptr,
@@ -1195,8 +1195,8 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
    * arm that separates "the emitter dropped it" from "SMC/cache/alias lifetime rewrote
    * it later": the hash printed here is of the bytes AT COMPILE TIME, so a runtime
    * disassembly that disagrees convicts something after codegen. */
-  if (const uint64_t CapRIP = FEX_MythicIRCapCurrentRIP()) {
-    const uint64_t Target = FEX_MythicIRCapTarget;
+  if (const uint64_t CapRIP = FEX_MadeiraIRCapCurrentRIP()) {
+    const uint64_t Target = FEX_MadeiraIRCapTarget;
     if (Target >= CapRIP && CompiledCode.BlockBegin && DebugData) {
       const uint64_t WantOffset = Target - CapRIP;
       const auto& GO = DebugData->GuestOpcodes;
@@ -1238,7 +1238,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
         }
       }
     }
-    FEX_MythicIRCapClear();
+    FEX_MadeiraIRCapClear();
   }
 
   // Release the IR
@@ -1254,13 +1254,13 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 }
 
 #ifdef FEX_IOS_HOST
-/* iOS-Mythic ml306 (task #51): CallbackPtr entry-state capture buffer, defined in Dispatcher.cpp
+/* iOS-Madeira ml306 (task #51): CallbackPtr entry-state capture buffer, defined in Dispatcher.cpp
  * and written by emitted code at CallbackPtr entry. Read by the [cb-entry] reporter below. */
 extern "C" uint64_t IosCbEntryLog[8];
-/* iOS-Mythic ml315 (#52): alias-table walk from IosJitAlias.cpp (same DLL link). Maps a
+/* iOS-Madeira ml315 (#52): alias-table walk from IosJitAlias.cpp (same DLL link). Maps a
  * module-pool-copy address back to its PE VA; returns the input unchanged on no match. */
 extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
-/* iOS-Mythic ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
+/* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
  * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
 extern "C" uint64_t IosFfsBypassLog[4];
 #endif
@@ -1397,7 +1397,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 #endif
 
-  /* iOS-Mythic ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.
+  /* iOS-Madeira ml304 (task #51): REPORT CallbackPtr ENTRY ON ITS OWN, not via the bogus-RIP path.
    *
    * ml302 proved the JITCallback prologue writes the bad State.rip, and ml303 added an LR witness --
    * but gated the report on a later bogus-RIP hit, which only occurs in roughly half of runs. That
@@ -1417,7 +1417,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * entry happened). Key on the entry COUNTER in the static capture buffer instead, and print the
    * full captured entry state; x16/x17 are the interesting ones since a `br` through an IP register
    * is the most plausible way to arrive with LR=0. */
-  /* iOS-Mythic ml316: report ExitToX64 FFS bypasses (native short-circuit of an EC target
+  /* iOS-Madeira ml316: report ExitToX64 FFS bypasses (native short-circuit of an EC target
    * reached via its x64 fast-forward sequence -- preserves the x4/x5 varargs contract that
    * the emulation round trip destroys; see Module.S). Same change-detection pattern as
    * [cb-entry] below: CompileBlock runs often enough to notice promptly. */
@@ -1448,7 +1448,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Mythic: refuse to compile obviously-invalid guest RIPs. After a
+  /* iOS-Madeira: refuse to compile obviously-invalid guest RIPs. After a
    * NULL-vtable virtual call (`call [rax+8]` with rax=0), control flow
    * lands at RIP=0x8, which then loops compiling thousands of garbage
    * blocks before SEH unwinds. Returning 0 here raises C0000005 to the
@@ -1459,7 +1459,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml315 (#52 root cause, ml314): a guest RIP inside a module's JIT-POOL COPY
+  /* iOS-Madeira ml315 (#52 root cause, ml314): a guest RIP inside a module's JIT-POOL COPY
    * must be reverse-translated to its PE VA and re-classified -- NEVER compiled.
    *
    * The EcCodeBitMap is populated per-module at its PE-space mapping (wine's
@@ -1500,7 +1500,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 #endif
 
-  /* iOS-Mythic ml197: NAME THE PRODUCER OF A HOST-ADDRESS "GUEST RIP".
+  /* iOS-Madeira ml197: NAME THE PRODUCER OF A HOST-ADDRESS "GUEST RIP".
    *
    * [iOS-noexec] showed FEX being asked to decode x86 at addresses that are not guest
    * code at all:
@@ -1519,7 +1519,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    *
    * Log the host return address (which lands in the dispatcher stub that supplied the
    * RIP) plus State.rip, so the PRODUCER is named instead of the consumer. */
-  /* iOS-Mythic ml296: ALSO CATCH HOST-PC-IN-GUEST-RIP INSIDE FEX'S OWN CODE BUFFER.
+  /* iOS-Madeira ml296: ALSO CATCH HOST-PC-IN-GUEST-RIP INSIDE FEX'S OWN CODE BUFFER.
    *
    * ml292/294/295 showed a SECOND leak, distinct from the 0x7c-0x7f host-heap one above and now
    * the DOMINANT killer (3 of the last 4 runs, and it fires EARLIER -- ~24.6k calls vs ~36.4k --
@@ -1539,7 +1539,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * unambiguously a host-PC leak with no possibility of a guest-image false positive. */
   const bool RIPInFEXCodeBuffer = IsAddressInCodeBuffer(Thread, GuestRIP);
 
-  /* iOS-Mythic ml300 (task #52): ALSO catch pool MODULE-COPY addresses, not just FEX's code buffer.
+  /* iOS-Madeira ml300 (task #52): ALSO catch pool MODULE-COPY addresses, not just FEX's code buffer.
    *
    * ml299 hit a third variant of the same leak and the gate missed all 3,422 occurrences of it:
    *   [fault_rip] cnt=3422 rip=0x13b2b888c
@@ -1580,7 +1580,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                         GuestRIP, Frame ? Frame->State.rip : 0, __builtin_return_address(0),
                         Frame ? Frame->State.callret_sp : 0);
 
-      /* iOS-Mythic ml295 (task #51): IS THE BAD RIP A GUEST VALUE OR A FEX-SYNTHESISED ONE?
+      /* iOS-Madeira ml295 (task #51): IS THE BAD RIP A GUEST VALUE OR A FEX-SYNTHESISED ONE?
        *
        * ml294 established, offline, that the guest CANNOT have computed this address. At fault
        * time the guest is inside chrome_elf.dll's memset (r10 = exact image base, r11 = exact
@@ -1697,7 +1697,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         }
       }
 
-      /* iOS-Mythic ml292: NAME THE GUEST CALLER of the bogus RIP.
+      /* iOS-Madeira ml292: NAME THE GUEST CALLER of the bogus RIP.
        *
        * Offline analysis of nine runs showed every bogus RIP has the form
        *   <steered 512MB PA arena base> + {0xd0080, 0xe0080, 0xf0080}
@@ -1742,7 +1742,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Mythic 2026-05-18: CALLRET_SP bounds-validation + RESET.
+  /* iOS-Madeira 2026-05-18: CALLRET_SP bounds-validation + RESET.
    *
    * Initial diagnostic showed callret_sp going 0x10..0x70 BELOW
    * Thread->CallRetStackBase — underflow of the FEX prediction stack into
@@ -1799,7 +1799,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Mythic 2026-05-15: JIT-pool RIP detector — LOG-ONLY.
+  /* iOS-Madeira 2026-05-15: JIT-pool RIP detector — LOG-ONLY.
    *
    * Earlier attempt to "recover" by setting State.rip = callret[0].pc and
    * compiling that as guest x86 produced a livelock: the recovered code
@@ -1845,7 +1845,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Mythic 2026-05-18 low-noise summary. Replaces per-call log (which
+  /* iOS-Madeira 2026-05-18 low-noise summary. Replaces per-call log (which
    * was producing ~180K lines/run for hot RIP 0x140028d46 alone, each
    * amplified ~6× by Wine's file trace). Counters: g_cb_total bumped
    * every CompileBlock call; g_cb_real_compiles bumped after cache miss
@@ -1867,7 +1867,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     if ((total - g_cb_last_summary_total) >= 16384) {
       g_cb_last_summary_total = total;
       uint64_t reals = g_cb_real_compiles;
-      /* iOS-Mythic 2026-07-03 perf hunt: also print the JIT-visible L1
+      /* iOS-Madeira 2026-07-03 perf hunt: also print the JIT-visible L1
        * lookup fields. The emitted dispatcher L1 probe reads
        * State.L1Pointer/L1Mask; the measured ~15K CompileBlock calls per
        * frame (~60us each = the whole frame time) with 99% cache hits mean
@@ -1887,7 +1887,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                         Frame ? Frame->State.L1Mask : 0,
                         (T && T->LookupCache) ? T->LookupCache->GetL1Pointer() : 0);
 
-      /* iOS-Mythic ml622: drain the rpmalloc remote-free CAS snapshot HERE —
+      /* iOS-Madeira ml622: drain the rpmalloc remote-free CAS snapshot HERE —
        * outside rpmalloc, where formatting is safe. The allocator side only ever
        * copies scalars into a POD and sets a flag; it must never format, because
        * LogMan/fmt can allocate and re-enter the very allocator that is stuck
@@ -1914,7 +1914,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Mythic 2026-05-14: per-thread callret tracking (runs for EVERY
+  /* iOS-Madeira 2026-05-14: per-thread callret tracking (runs for EVERY
    * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
    * pointer (unique per FEX thread). Identifies WHICH thread is leaking
    * callret entries vs healthy. */
@@ -1922,20 +1922,20 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     uintptr_t fk = reinterpret_cast<uintptr_t>(Frame);
     int slot = (int)((fk >> 6) & 3);
     /* Claim the slot if empty, or use if matches; ignore on collision. */
-    if (g_mythic_thr_key[slot] == 0 || g_mythic_thr_key[slot] == fk) {
-      g_mythic_thr_key[slot] = fk;
+    if (g_madeira_thr_key[slot] == 0 || g_madeira_thr_key[slot] == fk) {
+      g_madeira_thr_key[slot] = fk;
       uint64_t crsp = Frame->State.callret_sp;
-      g_mythic_thr_crsp_last[slot] = crsp;
-      g_mythic_thr_last_rip[slot] = GuestRIP;
-      g_mythic_thr_count[slot]++;
+      g_madeira_thr_crsp_last[slot] = crsp;
+      g_madeira_thr_last_rip[slot] = GuestRIP;
+      g_madeira_thr_count[slot]++;
       if (crsp != 0) {
-        if (crsp < g_mythic_thr_crsp_min[slot]) g_mythic_thr_crsp_min[slot] = crsp;
-        if (crsp > g_mythic_thr_crsp_max[slot]) g_mythic_thr_crsp_max[slot] = crsp;
+        if (crsp < g_madeira_thr_crsp_min[slot]) g_madeira_thr_crsp_min[slot] = crsp;
+        if (crsp > g_madeira_thr_crsp_max[slot]) g_madeira_thr_crsp_max[slot] = crsp;
       }
     }
   }
 
-  /* iOS-Mythic 2026-05-13 lightweight HOTRIP instrumentation (v3): use
+  /* iOS-Madeira 2026-05-13 lightweight HOTRIP instrumentation (v3): use
    * plain volatile globals to avoid __cxa_guard_acquire on static-local
    * initialization, which appears to trip a stack-cookie check on
    * ARM64EC mingw. POD types only — no constructors. Atomicity isn't
@@ -1965,17 +1965,17 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
         break;
     }
     if (idx >= 0) {
-      uint64_t n = ++g_mythic_hot_count[idx];
+      uint64_t n = ++g_madeira_hot_count[idx];
 
       /* Track callret_sp range — answers "leak (monotonic) vs boundary (oscillating)". */
       uint64_t crsp = Frame->State.callret_sp;
-      g_mythic_callret_last = crsp;
-      if (crsp > g_mythic_callret_max) g_mythic_callret_max = crsp;
-      if (crsp != 0 && crsp < g_mythic_callret_min) g_mythic_callret_min = crsp;
+      g_madeira_callret_last = crsp;
+      if (crsp > g_madeira_callret_max) g_madeira_callret_max = crsp;
+      if (crsp != 0 && crsp < g_madeira_callret_min) g_madeira_callret_min = crsp;
 
       if (idx == 5 || idx == 6) {
         uint64_t sz = Frame->State.gregs[FEXCore::X86State::REG_RDI];
-        if (sz > g_mythic_max_alloc_size) g_mythic_max_alloc_size = sz;
+        if (sz > g_madeira_max_alloc_size) g_madeira_max_alloc_size = sz;
       }
 
       if (idx == 1) {
@@ -1986,15 +1986,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
           if (rbx_0 >= 0x10000ull && rbx_0 < 0x800000000000ull) {
             uint64_t vt = *reinterpret_cast<uint64_t*>(rbx_0);
             if (vt >= 0x10000ull && vt < 0x800000000000ull) {
-              g_mythic_last_vt = vt;
-              g_mythic_last_vt2 = *reinterpret_cast<uint64_t*>(vt + 0x10);
+              g_madeira_last_vt = vt;
+              g_madeira_last_vt2 = *reinterpret_cast<uint64_t*>(vt + 0x10);
             }
           }
         }
         if (rcx >= 0x10000ull && rcx < 0x800000000000ull) {
           uint64_t bytes = *reinterpret_cast<uint64_t*>(rcx);
           uint8_t b0 = bytes & 0xff;
-          if (b0 >= 0x20 && b0 <= 0x7e) g_mythic_last_str = bytes;
+          if (b0 >= 0x20 && b0 <= 0x7e) g_madeira_last_str = bytes;
         }
       }
 
@@ -2010,29 +2010,29 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                            "max_alloc=0x{:x} crsp[min..last..max]=0x{:x}..0x{:x}..0x{:x} "
                            "last_vt=0x{:x} vt2=0x{:x} last_str=0x{:x}",
                            elapsed,
-                           g_mythic_hot_count[0], g_mythic_hot_count[1], g_mythic_hot_count[2],
-                           g_mythic_hot_count[3], g_mythic_hot_count[4], g_mythic_hot_count[5],
-                           g_mythic_hot_count[6],
-                           g_mythic_hot_count[7], g_mythic_hot_count[8],
-                           g_mythic_hot_count[9], g_mythic_hot_count[10], g_mythic_hot_count[11],
-                           g_mythic_max_alloc_size,
-                           g_mythic_callret_min, g_mythic_callret_last, g_mythic_callret_max,
-                           g_mythic_last_vt, g_mythic_last_vt2, g_mythic_last_str);
+                           g_madeira_hot_count[0], g_madeira_hot_count[1], g_madeira_hot_count[2],
+                           g_madeira_hot_count[3], g_madeira_hot_count[4], g_madeira_hot_count[5],
+                           g_madeira_hot_count[6],
+                           g_madeira_hot_count[7], g_madeira_hot_count[8],
+                           g_madeira_hot_count[9], g_madeira_hot_count[10], g_madeira_hot_count[11],
+                           g_madeira_max_alloc_size,
+                           g_madeira_callret_min, g_madeira_callret_last, g_madeira_callret_max,
+                           g_madeira_last_vt, g_madeira_last_vt2, g_madeira_last_str);
         /* Per-thread breakdown — dump all 4 slots so we can see which
          * thread is leaking callret entries. Distance min→last is the
          * "depth below high-water" — for the leaking thread this grows. */
         for (int s = 0; s < 4; s++) {
-          if (g_mythic_thr_key[s] == 0) continue;
-          uint64_t mn = g_mythic_thr_crsp_min[s];
-          uint64_t la = g_mythic_thr_crsp_last[s];
-          uint64_t mx = g_mythic_thr_crsp_max[s];
+          if (g_madeira_thr_key[s] == 0) continue;
+          uint64_t mn = g_madeira_thr_crsp_min[s];
+          uint64_t la = g_madeira_thr_crsp_last[s];
+          uint64_t mx = g_madeira_thr_crsp_max[s];
           uint64_t span = (la <= mx) ? (mx - la) : 0;
           LogMan::Msg::EFmt("[HOT thr{} t={}s] frame=0x{:x} blocks={} "
                              "crsp[min..last..max]=0x{:x}..0x{:x}..0x{:x} "
                              "leak_depth=0x{:x} last_rip=0x{:x}",
-                             s, elapsed, g_mythic_thr_key[s],
-                             g_mythic_thr_count[s], mn, la, mx, span,
-                             g_mythic_thr_last_rip[s]);
+                             s, elapsed, g_madeira_thr_key[s],
+                             g_madeira_thr_count[s], mn, la, mx, span,
+                             g_madeira_thr_last_rip[s]);
         }
       }
     }
@@ -2041,7 +2041,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml455 (#74 delivery-under-locks): if an interrupted frame on
+  /* iOS-Madeira ml455 (#74 delivery-under-locks): if an interrupted frame on
    * THIS thread already holds emission locks, this call can only be guest SEH
    * delivery re-entering the compiler asynchronously.  Re-taking the
    * invalidation shared lock risks the write-priority recursive-read park,
@@ -2078,7 +2078,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 #endif
 
-  // iOS-Mythic: cache miss reached — count as true compile.
+  // iOS-Madeira: cache miss reached — count as true compile.
   __sync_add_and_fetch(&g_cb_real_compiles, 1);
 
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
@@ -2098,7 +2098,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 #endif
   auto CodePtr = CompiledCode.EntryPoints[GuestRIP];
-  /* iOS-Mythic diag (Thumper desktop ILL 2026-07-06): three crashes branched
+  /* iOS-Madeira diag (Thumper desktop ILL 2026-07-06): three crashes branched
    * to BlockTail+0x18 instead of a code entry — the published entry itself
    * was wrong. Validate every entry against the block layout at publication
    * time: an entry must land in [BlockBegin, Tail) and must not decode as
@@ -2204,7 +2204,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
-  /* iOS-Mythic ml460 (#75): deferred pool-tail sweep. A generation swap makes
+  /* iOS-Madeira ml460 (#75): deferred pool-tail sweep. A generation swap makes
    * every parked thread's CurrentCodeBuffer ref a dead pin (ml459: 13 16MB
    * generations live where steady state needs ~2). The frontend sweeper walks
    * its thread registry and remote-migrates threads that are outside emitted

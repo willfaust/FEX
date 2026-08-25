@@ -28,7 +28,7 @@ struct LookupCacheWriteLockToken : public LookupCacheBaseLockToken {
 private:
   // Only constructible by GuestToHostMap
   friend struct GuestToHostMap;
-  /* iOS-Mythic ml452 (#74): manual RAII instead of lock_guard so a token
+  /* iOS-Madeira ml452 (#74): manual RAII instead of lock_guard so a token
    * constructed while this thread ALREADY write-owns the mutex no-ops (the
    * fault-handler re-entry chain: outer swap holds L'-write → nested compile
    * → nested swap re-acquires — the write→write self-park that stalled
@@ -473,7 +473,7 @@ private:
 
   size_t TotalCacheSize;
 
-  // iOS-Mythic ml606: L1-ONLY LAYOUT when the L2 cache is disabled.
+  // iOS-Madeira ml606: L1-ONLY LAYOUT when the L2 cache is disabled.
   //
   // The full layout is [L2 page table][CODE_SIZE arena][L1] contiguous — on iOS
   // 16MB + 32MB + 2MB = 50MB per guest thread, and FEX_IOS_HOST COMMITS it all
@@ -498,7 +498,7 @@ private:
   // Max out at 1 million entries to give each thread 16MB of L1 cache maximum.
   constexpr static size_t MIN_L1_ENTRIES = 8 * 1024;        // Must be a power of 2
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml363: cap the dynamic-L1 growth ceiling at 128K entries (2MB)
+  /* iOS-Madeira ml363: cap the dynamic-L1 growth ceiling at 128K entries (2MB)
    * instead of 1M (16MB). A hot thread's L1 inserts hash-scatter across the
    * whole array, so a few thousand cached blocks dirty nearly every 16KB page
    * of whatever the ceiling allows — ml362 [phys-map] measured ~29MB dirty
@@ -515,7 +515,7 @@ private:
 #endif
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: halve the per-thread block-backing arena — it's committed
+  /* iOS-Madeira: halve the per-thread block-backing arena — it's committed
    * upfront on iOS (see LookupCache.cpp) and 128MB × ~19 threads was OOM-ing
    * the process. 64MB still backs 1024 guest code pages per thread; on
    * overflow AllocateBackingForPage returns 0 → clean ClearCodeCache.

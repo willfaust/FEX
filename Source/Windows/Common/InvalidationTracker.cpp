@@ -15,7 +15,7 @@
 
 /* ml623: targeted IR capture target (defined in FEXCore PassManager.cpp). File scope on
  * purpose -- an extern "C" at block scope is a compile error and cost a build earlier. */
-extern "C" uint64_t FEX_MythicIRCapTarget;
+extern "C" uint64_t FEX_MadeiraIRCapTarget;
 
 /* ml648: defined in the ARM64EC alias TU. Declared at FILE scope — an
  * extern "C" declaration is illegal at block scope, and declaring it inside
@@ -81,7 +81,7 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
       }
       return true;
     } else if (XIntervals.Intersect(ProtInterval)) {
-      /* iOS-Mythic ml208 ROOT-CAUSE FIX.
+      /* iOS-Madeira ml208 ROOT-CAUSE FIX.
        *
        * A >=1GB non-executable range is an allocator reserving or managing a pool, never a
        * code-permission change. Removing exec intervals for it wipes the executable range
@@ -184,7 +184,7 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
       uint64_t SectionBase = Address + Section->VirtualAddress;
       uint64_t SectionEnd = SectionBase + Section->Misc.VirtualSize;
       XIntervals.Insert({SectionBase, SectionEnd});
-      /* iOS-Mythic ml200: FEX reports NOEXEC for libcef code addresses even though the
+      /* iOS-Madeira ml200: FEX reports NOEXEC for libcef code addresses even though the
        * ntdll side proves the map notification arrives and nothing ever removes the
        * interval. So log the actual inserts (with `this`, since each pseudo-process runs
        * its own xtajit64 copy and its own tracker) and pair it with the query-side log in
@@ -209,7 +209,7 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
    * above -- so on Marvel Cosmic Invasion the hooks stayed inert and Mono startup paid
    * the full W^X tax: ~735,000 emulated stores from one hot site during init.
    *
-   * Recognised, but activation is OPT-IN via MYTHIC_WINEMONO_BRIDGE=1, default OFF, for a
+   * Recognised, but activation is OPT-IN via MADEIRA_WINEMONO_BRIDGE=1, default OFF, for a
    * correctness reason rather than caution about perf: the bridge reclassifies a detected
    * XCHG from a true atomic exchange into an alias-directed plain write. Deciding that by
    * FILENAME alone would let any unrelated lock-free XCHG in this DLL be treated as a
@@ -230,9 +230,9 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
   const bool IsWineMono = (Name == "libmono-2.0-x86_64.dll" || Name == "libmono-2.0-x86.dll");
   bool WineMonoOptIn = false;
   if (IsWineMono) {
-    const char* Env = getenv("MYTHIC_WINEMONO_BRIDGE");
+    const char* Env = getenv("MADEIRA_WINEMONO_BRIDGE");
     WineMonoOptIn = Env && Env[0] == '1';
-    LogMan::Msg::EFmt("[mono-winemono] ml712 module={} base={:#x} opt-in={} (MYTHIC_WINEMONO_BRIDGE={})", Name, Address,
+    LogMan::Msg::EFmt("[mono-winemono] ml712 module={} base={:#x} opt-in={} (MADEIRA_WINEMONO_BRIDGE={})", Name, Address,
                       WineMonoOptIn ? 1 : 0, Env ? Env : "unset");
   }
 
@@ -242,7 +242,7 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
      *
      * MonoHacks defaults to true and is gated on Multiblock && MaxInst >= 500, but
      * MarkMonoDetected() logs nothing and the refusal message is IFmt, which
-     * MYTHIC_QUIET eats -- so the ULTRAKILL log could not distinguish "hooks armed"
+     * MADEIRA_QUIET eats -- so the ULTRAKILL log could not distinguish "hooks armed"
      * from "hooks refused". That ambiguity also decides whether a later
      * block-splitting A/B is interpretable at all, because the hook explicitly
      * requires all SMC sites to land in ONE block. Never leave this unfalsifiable. */
@@ -276,10 +276,10 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
    * Mono emitter store `mov byte ptr [rcx+2], al`.
    *
    * setenv() in WineProcessBridge.m does NOT reach GetEnvironmentVariableW, but it DOES
-   * reach FEX's own getenv (proven by MYTHIC_NO_DFE in ml597/598), which is what this uses. */
+   * reach FEX's own getenv (proven by MADEIRA_NO_DFE in ml597/598), which is what this uses. */
   {
-    const char* CapRVA = getenv("MYTHIC_IRCAP_RVA");
-    const char* CapMod = getenv("MYTHIC_IRCAP_MODULE");
+    const char* CapRVA = getenv("MADEIRA_IRCAP_RVA");
+    const char* CapMod = getenv("MADEIRA_IRCAP_MODULE");
 
     /* ml623b: THE ENV CHANNEL DOES NOT REACH THIS CODE.
      *
@@ -294,7 +294,7 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
       static bool Reported = false;
       if (!Reported) {
         Reported = true;
-        LogMan::Msg::EFmt("[ircap] ml623b env probe: MYTHIC_IRCAP_RVA={} MYTHIC_IRCAP_MODULE={}", CapRVA ? CapRVA : "(null)",
+        LogMan::Msg::EFmt("[ircap] ml623b env probe: MADEIRA_IRCAP_RVA={} MADEIRA_IRCAP_MODULE={}", CapRVA ? CapRVA : "(null)",
                           CapMod ? CapMod : "(null)");
       }
     }
@@ -316,11 +316,11 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
       if (Match) {
         const uint64_t RVA = strtoull(CapRVA, nullptr, 0);
         if (RVA) {
-          FEX_MythicIRCapTarget = Address + RVA;
+          FEX_MadeiraIRCapTarget = Address + RVA;
           LogMan::Msg::EFmt("[ircap] ml623b ARMED: module={} base={:#x} rva={:#x} => target guest addr {:#x}", Name, Address,
-                            RVA, FEX_MythicIRCapTarget);
+                            RVA, FEX_MadeiraIRCapTarget);
         } else {
-          LogMan::Msg::EFmt("[ircap] ml623b DISARMED by MYTHIC_IRCAP_RVA=0 (module={})", Name);
+          LogMan::Msg::EFmt("[ircap] ml623b DISARMED by MADEIRA_IRCAP_RVA=0 (module={})", Name);
         }
       }
     }
@@ -420,7 +420,7 @@ bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t S
   return ProtectRWXIntervalsInternal(Address, Size, true);
 }
 
-/* iOS-Mythic ml201: log EVERY XIntervals removal, tagged by path.
+/* iOS-Madeira ml201: log EVERY XIntervals removal, tagged by path.
  *
  * Proven this run: libcef's .text IS inserted (0x7385cf1000-0x7390d2cd23) into the SAME
  * tracker (0x1229612c8) that later reports MISS for 0x73875f0733 and 0x73898408f0 — both
@@ -469,7 +469,7 @@ void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThre
 
   /* ml712: name the site at EFmt, once, with module-relative RVAs and the bytes.
    *
-   * The DFmt line above is eaten by MYTHIC_QUIET, so a run could neither confirm which
+   * The DFmt line above is eaten by MADEIRA_QUIET, so a run could neither confirm which
    * guest instruction was reclassified nor let it be checked afterwards. That matters more
    * for wine-mono than for Unity's Mono: this reclassifies an XCHG from a true atomic
    * exchange into an alias-directed plain write, wine-mono ships no PDB, and its exports

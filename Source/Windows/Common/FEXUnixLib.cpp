@@ -120,7 +120,7 @@ bool Init(HMODULE NtDll) {
   };
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic (FEX-2607 rebase): the new load-by-name unixlib method
+  /* iOS-Madeira (FEX-2607 rebase): the new load-by-name unixlib method
    * (TryNewWineMethod) expects a separate "libarm64ecfex" .so unixlib. iOS has
    * no .so files — load_unixlib_by_name dlopen()s a nonexistent path and can
    * return a bogus handle whose funcs table is garbage; the dispatcher then
@@ -219,7 +219,7 @@ void VirtualTHPControl(const void* Ptr, size_t Size, FEXCore::Allocator::THPCont
 
 void VirtualName(const char* Name, const void* Ptr, size_t Size) {
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml294 (task #51): PUBLISH FEX'S OWN NAME FOR EVERY HOST ALLOCATION.
+  /* iOS-Madeira ml294 (task #51): PUBLISH FEX'S OWN NAME FOR EVERY HOST ALLOCATION.
    *
    * The prctl/unixlib naming below is meaningless on iOS, so this was a pure no-op --
    * which meant FEX already knew the identity of every region it allocates and we were

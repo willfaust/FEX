@@ -338,7 +338,7 @@ static __uint128_t DoLoad128(uint64_t Addr) {
 }
 
 #ifdef FEX_IOS_HOST
-/* iOS-Mythic ml275: route an emulated ATOMIC to the JIT pool's WRITABLE alias.
+/* iOS-Madeira ml275: route an emulated ATOMIC to the JIT pool's WRITABLE alias.
  *
  * Guest PE images are COPIED into the JIT pool so they can execute, and the copy
  * includes their .data. The pool's execute alias is mapped READ|EXECUTE with no write
@@ -623,7 +623,7 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
   } else if (Size == 1) {
     // 64-bit pairs -- a true 128-bit CAS, which is what x86 LOCK CMPXCHG16B lowers to.
     //
-    // iOS-Mythic ml258: this branch did not exist, so every CASPAL with sz=1 fell
+    // iOS-Madeira ml258: this branch did not exist, so every CASPAL with sz=1 fell
     // through to `return false`, which callers escalate to "Unhandled JIT SIGBUS
     // CASPAL" and a fatal STATUS_DATATYPE_MISALIGNMENT. That is what ends the Steam
     // run: CASPAL x6,x7, x4,x5, [x11] (Instruction 0x4866fd64), reported aligned
@@ -674,7 +674,7 @@ static bool RunCASPAL(uint64_t* GPRs, uint32_t Size, uint32_t DesiredReg1, uint3
   return false;
 }
 
-/* iOS-Mythic ml220 PROBE. RunCASPAL implements ONLY Size==0 (32-bit pairs); Size==1
+/* iOS-Madeira ml220 PROBE. RunCASPAL implements ONLY Size==0 (32-bit pairs); Size==1
  * (64-bit pairs, i.e. a 128-bit CAS from x86 LOCK CMPXCHG16B) falls straight through to
  * `return false`, which callers report as "Unhandled JIT SIGBUS CASPAL" and escalate to a
  * fatal STATUS_DATATYPE_MISALIGNMENT. Steam/CEF hits this
@@ -2314,7 +2314,7 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   // Lock code mutex during any SIGBUS handling that potentially changes code.
   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.
-  // iOS-Mythic ml472 (#80): the lock word carries no owner and lives in the
+  // iOS-Madeira ml472 (#80): the lock word carries no owner and lives in the
   // code buffer; the holder's backpatch stores fault through the Mach RX-alias
   // emulator, so a holder that dies or is unwound there orphans the lock and
   // every later unaligned-atomic thread WFE-spun here forever (ml470/ml471

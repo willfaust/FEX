@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-/* iOS-Mythic ml611: WATCH SPECIFIC HEAP BUFFERS FOR FREE/REUSE WHILE STILL LIVE.
+/* iOS-Madeira ml611: WATCH SPECIFIC HEAP BUFFERS FOR FREE/REUSE WHILE STILL LIVE.
  *
  * ml610 died because DFE's predecessor vectors came back holding the low 32 bits
  * of FEX-arena pointers (block "id" 918357056 = 0x36BD0000, in a vector whose own

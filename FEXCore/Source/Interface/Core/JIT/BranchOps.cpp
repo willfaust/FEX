@@ -162,19 +162,19 @@ DEF_OP(ExitFunction) {
       ARMEmitter::ForwardLabel l_CallReturn;
       if (Op->Hint == IR::BranchHint::Call) {
 #ifdef ARCHITECTURE_arm64ec
-        // iOS-Mythic 2026-05-13: REG_CALLRET_SP (x17) gets clobbered when a
+        // iOS-Madeira 2026-05-13: REG_CALLRET_SP (x17) gets clobbered when a
         // previous BLR returns from native ARM64EC code (DXMT vtable methods,
         // ARM64EC entry thunks). Reload from State.callret_sp before pushing
         // the call-return frame so we don't stp to wherever x17 was left.
         ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-        // iOS-Mythic 2026-05-18: inline bounds-guard (Tier-2). iOS doesn't
+        // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). iOS doesn't
         // honor PAGE_NOACCESS on the callret stack's guard pages, so the
         // SEH-driven HandleAccessViolation never resets the stack on
         // underflow. Detect-and-reset inline before the `stp` to keep stack
         // pointer in-range. Uses TMP1 as scratch; adr below re-initializes it.
         {
           ARMEmitter::ForwardLabel l_callret_ok;
-          /* iOS-Mythic ml263: the >>24 test only fires when the pointer leaves the
+          /* iOS-Madeira ml263: the >>24 test only fires when the pointer leaves the
            * ENTIRE 16MB region, so a large-but-in-range leak sails straight through.
            * Measured on the CEF webhelper thread:
            *   tid 0098 sp-base=0x2c8c40 -> 1.1MB pushed  (~36,000 nested calls)
@@ -239,7 +239,7 @@ DEF_OP(ExitFunction) {
     if (Op->Hint == IR::BranchHint::Return) {
       // First try to pop from the call-ret stack, otherwise follow the normal path (but ending in a ret)
 #ifdef ARCHITECTURE_arm64ec
-      // iOS-Mythic 2026-05-15: POP-side x17 reload + state sync. ARM64EC
+      // iOS-Madeira 2026-05-15: POP-side x17 reload + state sync. ARM64EC
       // native returns clobber x17, so we reload from State.callret_sp
       // before popping. AND we write back the post-pop value to State so
       // the dispatcher LoopTop's reload (line 134 of Dispatcher.cpp) sees
@@ -247,11 +247,11 @@ DEF_OP(ExitFunction) {
       // pop changes are lost on next dispatcher iteration — quantified
       // as ~1 leaked callret entry per block dispatch on Thumper FMOD.
       ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-      // iOS-Mythic 2026-05-18: inline bounds-guard (Tier-2) — see CALL push
+      // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2) — see CALL push
       // site for rationale. Reset to DefaultLocation if OOB before ldp.
       {
         ARMEmitter::ForwardLabel l_callret_ok;
-        /* iOS-Mythic ml263: tightened to a 4MB window -- see the first CALL push site. */
+        /* iOS-Madeira ml263: tightened to a 4MB window -- see the first CALL push site. */
         ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
         add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x200000);
         sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);
@@ -268,7 +268,7 @@ DEF_OP(ExitFunction) {
 #endif
       sub(TMP1, TMP1, RipReg.X());
 #ifdef FEX_IOS_HOST
-      /* iOS-Mythic ml305 (tasks #42 / #51 / #52): DO NOT TRUST THE CALL-RET PREDICTION ON iOS.
+      /* iOS-Madeira ml305 (tasks #42 / #51 / #52): DO NOT TRUST THE CALL-RET PREDICTION ON iOS.
        *
        * Taking this shortcut means `br TMP2`, where TMP2 is the HOST half of the popped entry -- an
        * intra-block `adr(&l_CallReturn)` label recorded by the CALL push above. That is only safe if
@@ -323,15 +323,15 @@ DEF_OP(ExitFunction) {
     if (Op->Hint == IR::BranchHint::Call) {
       ARMEmitter::ForwardLabel l_CallReturn;
 #ifdef ARCHITECTURE_arm64ec
-      // iOS-Mythic 2026-05-13: see note above — reload REG_CALLRET_SP (x17)
+      // iOS-Madeira 2026-05-13: see note above — reload REG_CALLRET_SP (x17)
       // from State.callret_sp before pushing the call-return frame, since
       // native ARM64EC returns leave x17 pointing at an arbitrary RX page.
       ldr(REG_CALLRET_SP, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp));
-      // iOS-Mythic 2026-05-18: inline bounds-guard (Tier-2). Same as
+      // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). Same as
       // linked-path CALL push.
       {
         ARMEmitter::ForwardLabel l_callret_ok;
-        /* iOS-Mythic ml263: tightened to a 4MB window -- see the first CALL push site. */
+        /* iOS-Madeira ml263: tightened to a 4MB window -- see the first CALL push site. */
         ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.callret_sp_base));
         add(ARMEmitter::Size::i64Bit, TMP1, TMP1, 0x200000);
         sub(ARMEmitter::Size::i64Bit, TMP1, REG_CALLRET_SP, TMP1);

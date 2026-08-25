@@ -39,13 +39,13 @@ namespace Msg {
     Handler = nullptr;
   }
 
-  // iOS-Mythic ml115: last format string that reached MFmtImpl, exported so a
+  // iOS-Madeira ml115: last format string that reached MFmtImpl, exported so a
 // crash dump can name the message even when every output channel is unusable
 // in a cloned pool copy. Plain pointer store — cannot fail.
 extern "C" __attribute__((visibility("default"))) const char* LastDroppedFmt = nullptr;
 
 void MFmtImpl(DebugLevels level, const char* fmt, const fmt::format_args& args) {
-    // iOS-Mythic (ml107/ml114): three separate child deaths traced to THIS
+    // iOS-Madeira (ml107/ml114): three separate child deaths traced to THIS
     // function — the allocator returned NULL on the logging thread and the
     // unchecked memmove inside vformat/fextl::string killed the process, so
     // the message that would have named the real bug never surfaced. Emit the

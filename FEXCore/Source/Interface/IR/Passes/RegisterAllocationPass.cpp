@@ -587,7 +587,7 @@ void ConstrainedRAPass::Run(IREmitter* IREmit_) {
 
     auto BlockIROp = BlockHeader->CW<IR::IROp_CodeBlock>();
 
-    // iOS-Mythic ml599: THIS is where ml598 hung.
+    // iOS-Madeira ml599: THIS is where ml598 hung.
     //
     // The backwards pass below walks `--CodeLast` and exits only on reaching
     // CodeBegin. When Steam's store page failed to render,

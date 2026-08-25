@@ -135,7 +135,7 @@ public:
   }
 
   void lock_shared() {
-    /* iOS-Mythic ml442 (#74 ROOT FIX): the class forbids recursive locking,
+    /* iOS-Madeira ml442 (#74 ROOT FIX): the class forbids recursive locking,
      * but the invalidation paths hold this WRITE-locked while a fault taken
      * on the same thread re-enters the compiler, which asks for SHARED — the
      * thread then parks forever behind itself (ml441 run: tid 00e4 write-owned
@@ -337,7 +337,7 @@ public:
   }
 #endif
 
-  /* iOS-Mythic ml612: identity of the address NoteReadAcquired() stamps into
+  /* iOS-Madeira ml612: identity of the address NoteReadAcquired() stamps into
    * TEB Instrumentation[8]. The thread-exit cleanup MUST verify a stamped
    * address against this before releasing anything — the stamp is a diagnostic
    * value written by whichever mutex was held, and acting on it blindly (or
@@ -388,7 +388,7 @@ private:
     // No-op: spin-waiters will see the change
   }
 #else
-  /* iOS-Mythic ml411: an INFINITE wait here is unobservable — a thread parked
+  /* iOS-Madeira ml411: an INFINITE wait here is unobservable — a thread parked
    * on a never-released lock looks identical to an idle one, and this mutex is
    * anonymous (no owner is recorded). Wait in 1s slices instead and, past a few
    * seconds, name the write-owner from the ring below. Semantics are unchanged:
@@ -545,7 +545,7 @@ private:
   uint32_t Futex {};
 
 #if defined(_WIN32)
-  /* iOS-Mythic ml411: who holds it exclusive. Written after every successful
+  /* iOS-Madeira ml411: who holds it exclusive. Written after every successful
    * write-acquire and cleared on release, so a stuck waiter can name the
    * thread instead of guessing. TEB comes from x18 (the ARM64 platform
    * register) and the tid from TEB.ClientId.UniqueThread at +0x48; both are
@@ -647,7 +647,7 @@ private:
     return true;
   }
 
-  /* iOS-Mythic ml413: the ml413 wedge was read-owners=1 with the writer parked
+  /* iOS-Madeira ml413: the ml413 wedge was read-owners=1 with the writer parked
    * behind it — the WRITE stamp above can't name a leaked READ hold. Ring of
    * live shared holds: acquire claims a zero slot, release clears one of the
    * caller's slots. Additionally each holder stamps TEB Instrumentation[8]
@@ -724,7 +724,7 @@ private:
 #endif
 };
 
-/* iOS-Mythic ml455 (#74 delivery-under-locks): every stall flavor left after
+/* iOS-Madeira ml455 (#74 delivery-under-locks): every stall flavor left after
  * ml454 is one shape — a fault delivered while THIS thread's interrupted frame
  * holds emission locks (WPM shared / CodeBufferWriteMutex / lookup write), and
  * the guest SEH machinery then re-enters the compiler, which parks on those

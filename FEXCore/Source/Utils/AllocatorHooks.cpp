@@ -48,7 +48,7 @@ static rpmalloc_config_t global_config {
   .unmap_on_finalize = 0,
 };
 
-// iOS-Mythic (ml107-ml109): threads that enter FEX without passing through
+// iOS-Madeira (ml107-ml109): threads that enter FEX without passing through
 // InitCRTThread (wine loader threads during EC child boot) have no rpmalloc
 // thread heap, so every hook below returned NULL/failed. The observed death:
 // LogMan::Msg::MFmtImpl -> aligned_alloc == NULL -> unchecked memmove(NULL)

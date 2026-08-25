@@ -40,7 +40,7 @@
       "HostFeatures": {
         "Type": "strenum",
         "_comment_ml538": [
-          "iOS-Mythic ml538 REVERTED: AVX is EXONERATED for the render corruption.",
+          "iOS-Madeira ml538 REVERTED: AVX is EXONERATED for the render corruption.",
           "With HostFeatures=disableavx (shipped, proven by the runtime marker) the",
           "corruption was UNCHANGED - and the writer census CHANGED (clear 816->1140,",
           "content painter 1320->684, the +0x58d937 writer vanished entirely). So",

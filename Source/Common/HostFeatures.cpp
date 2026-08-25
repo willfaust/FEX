@@ -18,7 +18,7 @@ namespace FEX {
 
 void FillMIDRInformationViaLinux(FEXCore::HostFeatures* Features) {
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: no /sys/devices on iOS and std::thread::hardware_concurrency()
+  /* iOS-Madeira: no /sys/devices on iOS and std::thread::hardware_concurrency()
    * comes from arm64ec-mingw libstdc++ which can return garbage / call into
    * unimplemented Wine functions. Use a fixed reasonable value. */
   Features->CPUMIDRs.resize(1);

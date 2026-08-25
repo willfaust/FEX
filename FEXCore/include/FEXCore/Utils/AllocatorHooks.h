@@ -55,7 +55,7 @@ FEX_DEFAULT_VISIBILITY void SetupHooks(size_t PageSize, HookPtrs Ptrs);
 FEX_DEFAULT_VISIBILITY void ClearHooks();
 
 #ifdef _WIN32
-/* iOS-Mythic ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
+/* iOS-Madeira ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
  * (the earliest allocator in the process) and followed by every other
  * consumer. C linkage: it is chosen from C. */
 extern "C" {
@@ -68,7 +68,7 @@ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Co
   DWORD Flags = (Commit ? MEM_COMMIT : 0) | MEM_RESERVE | MEM_TOP_DOWN;
 #ifdef ARCHITECTURE_arm64ec
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml321: keep FEX's host structures OUT of the guest VA band.
+  /* iOS-Madeira ml321: keep FEX's host structures OUT of the guest VA band.
    *
    * Every FEXMem_* region (Lookup/L1, BlockLinks, CallRetStacks, OpDispatcher,
    * Frontend, ThreadState, ...) allocates through here, and by default wine's VA
@@ -95,7 +95,7 @@ inline void* VirtualAlloc(void* Base, size_t Size, bool Execute = false, bool Co
    * hardening, never a new fatal (#43).
    * Exec allocations are excluded: EC_CODE buffers have their own JIT-pool
    * steering that must keep control of placement. */
-  /* iOS-Mythic ml706: use the band rpmalloc selected at process start.
+  /* iOS-Madeira ml706: use the band rpmalloc selected at process start.
    *
    * This is not the earliest allocator -- rpmalloc runs before
    * arm64ec_process_init and before SetupHooks -- so it cannot choose the
@@ -228,7 +228,7 @@ inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) 
 
 #endif
 
-/* iOS-Mythic ml362: zero a region without dirtying pages that are already
+/* iOS-Madeira ml362: zero a region without dirtying pages that are already
  * zero. The defensive full memsets added for stale-content bugs (LookupCache
  * L2/L1, CallRetStack) each commit their whole range as private-dirty pages;
  * at ~40 guest threads that is ~1.9GB of phys_footprint against the 4096MB

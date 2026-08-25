@@ -64,7 +64,7 @@ Dispatcher::~Dispatcher() {
 }
 
 #ifdef FEX_IOS_HOST
-/* iOS-Mythic ml306 (task #51): entry-state capture buffer for the CallbackPtr block.
+/* iOS-Madeira ml306 (task #51): entry-state capture buffer for the CallbackPtr block.
  * Layout: [0]=x0 [1]=x1 [2]=x16 [3]=x17 [4]=x30 [5]=sp [6]=entry count [7]=spare.
  * Written by emitted code at CallbackPtr entry via a materialised constant address, so the
  * capture works even when x0 is not a valid CpuStateFrame. Read by CompileBlock's [cb-entry]
@@ -103,7 +103,7 @@ void Dispatcher::EmitDispatcher() {
   // Move our thread pointer to the correct register
   // This is passed in to parameter 0 (x0)
 #if defined(ARCHITECTURE_arm64ec) && defined(FEX_IOS_HOST)
-  /* iOS-Mythic 2026-07-03: derive STATE from the thread's CPU area instead
+  /* iOS-Madeira 2026-07-03: derive STATE from the thread's CPU area instead
    * of trusting the caller's x0. Observed on iOS 27: the exit-linker path
    * reached DispatchPtr with x0=0 (x28 had been zeroed after an EC call and
    * every spill store was silently absorbed by the Wine page-0 Mach
@@ -154,7 +154,7 @@ void Dispatcher::EmitDispatcher() {
   ldr(STATE, EC_ENTRY_CPUAREA_REG, CPU_AREA_EMULATOR_DATA_OFFSET);
   str(EC_CALL_CHECKER_PC_REG, STATE_PTR(CpuStateFrame, State.rip));
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml299 (task #52): witness the value this path writes into State.rip.
+  /* iOS-Madeira ml299 (task #52): witness the value this path writes into State.rip.
    * One extra store, per-thread, no branch -- see CoreState.h IosLastEnterECRip. If a later
    * [iOS-bogusrip] reports the same value, EnterEC is PROVEN to be the writer; if it reports a
    * different one, the leak is in BranchOps' L1-miss store or the JITCallback store instead and
@@ -172,7 +172,7 @@ void Dispatcher::EmitDispatcher() {
   FillSpecialRegs(TMP1, TMP2, false, true);
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: skip the opportunistic call-ret-stack return on iOS. The
+  /* iOS-Madeira: skip the opportunistic call-ret-stack return on iOS. The
    * call-ret stack is zero-initialized via memset (CallRetStack.h iOS branch),
    * so the LDP loads (0,0) and cbnz takes us to LoopTop anyway. But if the
    * memset somehow misses (iOS demand-fault quirks on the previously-NOACCESS
@@ -246,7 +246,7 @@ void Dispatcher::EmitDispatcher() {
 
   ARMEmitter::ForwardLabel NoBlock;
 
-  /* iOS-Mythic 2026-07-03 perf: probe the L1 cache FIRST at loop top.
+  /* iOS-Madeira 2026-07-03 perf: probe the L1 cache FIRST at loop top.
    *
    * Upstream's loop-top lookup goes straight to the L2 page table, which
    * masks addresses to Config.VirtualMemSize (64GB). Wine on iOS maps PE
@@ -569,7 +569,7 @@ void Dispatcher::EmitDispatcher() {
 
     PauseReturnInstruction = GetCursorAddress<uint64_t>();
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic ml325 -- THE #51 ROOT CAUSE.
+    /* iOS-Madeira ml325 -- THE #51 ROOT CAUSE.
      *
      * Upstream ends this block with hlt(0) and relies on the signal handler to notice
      * Pc == PauseReturnInstruction and resume via RestoreThreadState(TYPE_PAUSE)
@@ -624,7 +624,7 @@ void Dispatcher::EmitDispatcher() {
     PushCalleeSavedRegisters();
 
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic ml306 (task #51): full entry-state capture into a STATIC buffer.
+    /* iOS-Madeira ml306 (task #51): full entry-state capture into a STATIC buffer.
      *
      * ml302/ml306 proved this prologue's str(x1, State.rip) writes the recurring bad guest RIP
      * (IosLastCallbackRip == GuestRIP, 2/2 host-heap-band hits), and the ml303 LR witness came
@@ -684,14 +684,14 @@ void Dispatcher::EmitDispatcher() {
     // Store RIP to the context state
     str(ARMEmitter::XReg::x1, STATE_PTR(CpuStateFrame, State.rip));
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic ml302 (task #51): witness this store -- see CoreState.h IosLastCallbackRip. */
+    /* iOS-Madeira ml302 (task #51): witness this store -- see CoreState.h IosLastCallbackRip. */
     str(ARMEmitter::XReg::x1, STATE_PTR(CpuStateFrame, IosLastCallbackRip));
 #endif
 
     // load static regs
     FillStaticRegs();
 #ifdef ARCHITECTURE_arm64ec
-    // iOS-Mythic 2026-05-18: inline bounds-guard (Tier-2). The JITCallback
+    // iOS-Madeira 2026-05-18: inline bounds-guard (Tier-2). The JITCallback
     // sentinel push uses REG_CALLRET_SP after FillStaticRegs, which on iOS
     // ARM64EC reloads x17 from State.callret_sp. If State has drifted OOB
     // (e.g. underflow during prior dispatch), reset before stp to avoid
@@ -808,7 +808,7 @@ void Dispatcher::EmitDispatcher() {
   End = GetCursorAddress<uint64_t>();
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml298 (task #52): PUBLISH THE DISPATCHER ADDRESS MAP.
+  /* iOS-Madeira ml298 (task #52): PUBLISH THE DISPATCHER ADDRESS MAP.
    *
    * ml297's [bogus-host] dump proved CompileBlock is reached with the guest RIP taken from x12,
    * but there is no way to tell from a raw host address WHICH dispatcher entry ran -- and that is

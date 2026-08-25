@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 /*
- * iOS-Mythic ml599: bounded structural validation of the intrusive IR node list.
+ * iOS-Madeira ml599: bounded structural validation of the intrusive IR node list.
  *
  * WHY THIS EXISTS
  * ---------------

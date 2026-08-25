@@ -9,7 +9,7 @@ $end_info$
 
 #include "Interface/Context/Context.h"
 #include <cstdio>    // ml599: snprintf for the [ir-topo] sweep labels
-#include <cstdlib>   // ml597: getenv for the MYTHIC_NO_DFE gate
+#include <cstdlib>   // ml597: getenv for the MADEIRA_NO_DFE gate
 #include "Interface/IR/IREmitter.h"
 #include "Interface/IR/IRTopologyCheck.h"
 #include "Interface/IR/PassManager.h"
@@ -83,22 +83,22 @@ void PassManager::AddDefaultPasses(FEXCore::Context::ContextImpl* ctx) {
   if (!DisablePasses()) {
     InsertPass(CreateX87StackOptimizationPass(ctx->HostFeatures, ctx->Config.Is64BitMode ? IR::OpSize::i64Bit : IR::OpSize::i32Bit));
 
-    // iOS-Mythic ml597: TARGETED A/B for the ml594 post-login hang. The renderer
+    // iOS-Madeira ml597: TARGETED A/B for the ml594 post-login hang. The renderer
     // thread was sampled 9x at 97-100% CPU inside DeadFlagCalculationEliminination
     // while everything else idled and Steam presented no further frames.
     //
     // FEX_O0 is the wrong instrument for convicting it: it drops the x87 pass too,
     // so a pass implicates one of two things and a failure exonerates neither.
-    // MYTHIC_NO_DFE removes ONLY this pass, leaving the rest of the pipeline —
+    // MADEIRA_NO_DFE removes ONLY this pass, leaving the rest of the pipeline —
     // including x87 — exactly as it is in a known-good run. Env-gated rather than
     // compiled out so both arms come from one FEX build.
     //   set  -> hang disappears  => this pass is the cause
     //   set  -> hang persists    => exonerated, look elsewhere in the compile path
     // The [dfe-guard] bounds in the pass itself remain active either way and will
     // name the failure mode (cyclic list vs non-converging dataflow) if it recurs.
-    const char* NoDFE = getenv("MYTHIC_NO_DFE");
+    const char* NoDFE = getenv("MADEIRA_NO_DFE");
     if (NoDFE && *NoDFE && *NoDFE != '0') {
-      LogMan::Msg::EFmt("[dfe-guard] ml597: MYTHIC_NO_DFE set — DeadFlagCalculationEliminination DISABLED");
+      LogMan::Msg::EFmt("[dfe-guard] ml597: MADEIRA_NO_DFE set — DeadFlagCalculationEliminination DISABLED");
     } else {
       InsertPass(CreateDeadFlagCalculationEliminination());
     }
@@ -116,7 +116,7 @@ void PassManager::InsertRegisterAllocationPass(FEXCore::Context::ContextImpl* ct
 }
 
 namespace {
-// iOS-Mythic ml599: name the pass that breaks the intrusive node list.
+// iOS-Madeira ml599: name the pass that breaks the intrusive node list.
 //
 // DFE and RA both detect corruption at their own entry, but by then the damage
 // is upstream and anonymous. This sweeps every block after every pass and
@@ -124,10 +124,10 @@ namespace {
 // "the IR is corrupt" into "pass N corrupts it".
 //
 // Off by default: it walks every block twice per pass, which is real cost on a
-// 13,000-node function. Set MYTHIC_IR_TOPO=1 for a diagnostic run.
+// 13,000-node function. Set MADEIRA_IR_TOPO=1 for a diagnostic run.
 bool IRTopoSweepEnabled() {
   static const bool Enabled = [] {
-    const char* E = getenv("MYTHIC_IR_TOPO");
+    const char* E = getenv("MADEIRA_IR_TOPO");
     return E && *E && *E != '0';
   }();
   return Enabled;
@@ -143,7 +143,7 @@ bool IRTopoSweepEnabled() {
 // SSA count keeps the attribution while dropping essentially all of the cost.
 uint32_t IRTopoSweepMinSSA() {
   static const uint32_t Min = [] {
-    const char* E = getenv("MYTHIC_IR_TOPO_MIN");
+    const char* E = getenv("MADEIRA_IR_TOPO_MIN");
     const long V = (E && *E) ? strtol(E, nullptr, 0) : 0;
     return static_cast<uint32_t>(V > 0 ? V : 2048);
   }();
@@ -177,7 +177,7 @@ bool SweepBlockTopology(IREmitter* IREmit, int PassIndex) {
 }
 } // namespace
 
-/* iOS-Mythic ml623 — TARGETED IR CAPTURE FOR ONE GUEST INSTRUCTION.
+/* iOS-Madeira ml623 — TARGETED IR CAPTURE FOR ONE GUEST INSTRUCTION.
  *
  * The ULTRAKILL wall is a miscompile of exactly one x86 instruction inside
  * Mono's x86-64 code emitter:
@@ -208,7 +208,7 @@ extern "C" {
 /* Absolute guest address to capture; 0 = disarmed. Published by the Windows
  * InvalidationTracker at module load, so nothing here needs to know about PE
  * layout or load order. */
-uint64_t FEX_MythicIRCapTarget = 0;
+uint64_t FEX_MadeiraIRCapTarget = 0;
 }
 
 namespace {
@@ -298,7 +298,7 @@ bool IRCapDefinedID(std::string_view Line, uint32_t& Out) {
 }
 
 void IRCapEmit(IREmitter* IREmit, const char* Stage, uint64_t GuestRIP, uint32_t Session) {
-  const uint64_t Target = FEX_MythicIRCapTarget;
+  const uint64_t Target = FEX_MadeiraIRCapTarget;
   if (!Target || Target < GuestRIP) {
     return;
   }
@@ -412,13 +412,13 @@ void IRCapEmit(IREmitter* IREmit, const char* Stage, uint64_t GuestRIP, uint32_t
 
 } // namespace
 
-extern "C" void FEX_MythicIRCapMark(uint64_t GuestRIP) {
+extern "C" void FEX_MadeiraIRCapMark(uint64_t GuestRIP) {
   IRCapRIP = GuestRIP;
 }
-extern "C" void FEX_MythicIRCapClear() {
+extern "C" void FEX_MadeiraIRCapClear() {
   IRCapRIP = 0;
 }
-extern "C" uint64_t FEX_MythicIRCapCurrentRIP() {
+extern "C" uint64_t FEX_MadeiraIRCapCurrentRIP() {
   return IRCapRIP;
 }
 
@@ -444,7 +444,7 @@ void PassManager::Run(IREmitter* IREmit) {
    * loop saw the target instruction in this block. Claimed per compile rather
    * than per stage, so a session always yields a complete before/after set
    * rather than a truncated one. */
-  const uint64_t CapRIP = FEX_MythicIRCapCurrentRIP();
+  const uint64_t CapRIP = FEX_MadeiraIRCapCurrentRIP();
   uint32_t CapSession = 0;
   bool Cap = false;
   if (CapRIP) {
@@ -455,7 +455,7 @@ void PassManager::Run(IREmitter* IREmit) {
       Cap = true;
       CapSession = Prev + 1;
       LogMan::Msg::EFmt("[ircap] ml623 ===== CAPTURE {}/{} — block rip={:#x} CONTAINS target {:#x} =====", CapSession,
-                        IRCapMaxCaptures, CapRIP, FEX_MythicIRCapTarget);
+                        IRCapMaxCaptures, CapRIP, FEX_MadeiraIRCapTarget);
       IRCapEmit(IREmit, "frontend", CapRIP, CapSession);
     }
   }

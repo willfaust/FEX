@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// iOS-Mythic ml611 — see AllocWatch.h for why this exists and why it is shaped
+// iOS-Madeira ml611 — see AllocWatch.h for why this exists and why it is shaped
 // the way it is (the hot path runs inside malloc/free, so it must not allocate,
 // lock, or format).
 

@@ -107,7 +107,7 @@ struct alignas(64) CPUState {
   uint64_t L1Pointer {};
   uint64_t L1Mask {};
   uint64_t callret_sp {};
-  // iOS-Mythic 2026-05-18: callret_sp_base = Thread->CallRetStackBase, mirrored
+  // iOS-Madeira 2026-05-18: callret_sp_base = Thread->CallRetStackBase, mirrored
   // here so JIT code can emit inline bounds checks against it. Initialized by
   // CallRetStack::InitializeThread alongside callret_sp. Repurposes _pad1
   // (same offset, same size — was alignment padding).
@@ -439,7 +439,7 @@ struct CpuStateFrame {
   // Pointers that the JIT needs to load to remove relocations
   JITPointers Pointers;
 
-  /* iOS-Mythic ml299 (task #52): witness slot for the EnterEC State.rip store.
+  /* iOS-Madeira ml299 (task #52): witness slot for the EnterEC State.rip store.
    *
    * Three code paths write State.rip -- BranchOps' L1-miss store, the JITCallback store, and
    * AbsoluteLoopTopAddressEnterEC's `str(EC_CALL_CHECKER_PC_REG, State.rip)`. ml298 gathered strong
@@ -454,7 +454,7 @@ struct CpuStateFrame {
    * offset the ntdll-side probes hardcode (all inside State) is unchanged. */
   uint64_t IosLastEnterECRip {};
 
-  /* iOS-Mythic ml302 (task #51): second witness, completing the 3-way discriminator.
+  /* iOS-Madeira ml302 (task #51): second witness, completing the 3-way discriminator.
    *
    * ml301 ran with the corrected (narrow) gate and produced exactly one hit -- the host-heap
    * variant, GuestRIP=0x7e600f0080 -- with the verdict NOT EnterEC (IosLastEnterECRip=0x73899eb34a,
@@ -469,7 +469,7 @@ struct CpuStateFrame {
    * Appended after IosLastEnterECRip, still past Pointers, so no hardcoded offset moves. */
   uint64_t IosLastCallbackRip {};
 
-  /* iOS-Mythic ml303 (task #51): HOW did control reach CallbackPtr at all?
+  /* iOS-Madeira ml303 (task #51): HOW did control reach CallbackPtr at all?
    *
    * ml302 proved via IosLastCallbackRip that the JITCallback prologue's str(x1, State.rip) is what
    * writes the bad value. But on ARM64EC that code should be UNREACHABLE: ExecuteJITCallback is only

@@ -99,7 +99,7 @@ namespace CPU {
     virtual void OnCodeBufferAllocated(const std::shared_ptr<CodeBuffer>&) {};
 
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic ml460 (#75): the pool-tail sweeper (Module.cpp) reads Latest
+    /* iOS-Madeira ml460 (#75): the pool-tail sweeper (Module.cpp) reads Latest
      * WITHOUT holding CodeBufferWriteMutex, racing AllocateNew's assignment.
      * A shared_ptr copy concurrent with an assignment is UB, so both go
      * through this small leaf mutex. Never held while acquiring any other
@@ -202,7 +202,7 @@ namespace CPU {
     fextl::shared_ptr<CodeBuffer> CheckCodeBufferUpdate();
 
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic ml460 (#75 pool exhaustion): CurrentCodeBuffer pins a whole
+    /* iOS-Madeira ml460 (#75 pool exhaustion): CurrentCodeBuffer pins a whole
      * generation for as long as this thread holds the ref, and the ONLY
      * release sites are compile-path self-migrations — so a thread parked in
      * a wine wait pins its generation for the entire park (ml459 census: 13

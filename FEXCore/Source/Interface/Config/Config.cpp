@@ -110,7 +110,7 @@ fextl::string GetApplicationConfig(const std::string_view Program, bool Global) 
   return fextl::fmt::format("{}{}.json", ConfigFile, Program);
 }
 
-/* iOS-Mythic: function-local-static so the map is constructed on first
+/* iOS-Madeira: function-local-static so the map is constructed on first
  * access regardless of whether the C++ static-init chain ran. The
  * arm64ec-w64-mingw32 build appears to skip global static ctors when
  * the DLL's DllMain doesn't call _CRT_INIT, leading to a zero-initialized
@@ -242,7 +242,7 @@ void MetaLayer::MergeConfigMap(const LayerOptions& Options) {
   }
 }
 
-/* iOS-Mythic bisect tags. NtTerminateProcess + __declspec are ntdll/MS-only,
+/* iOS-Madeira bisect tags. NtTerminateProcess + __declspec are ntdll/MS-only,
  * so they're available on the ARM64EC PE (llvm-mingw) build but not the native
  * iOS-host build (Apple clang has no __declspec / no ntdll). No-op there. */
 #if defined(_WIN32)
@@ -254,7 +254,7 @@ extern "C" __declspec(dllimport) long __stdcall NtTerminateProcess(void *hProces
 
 void Initialize() {
   AddLayer(fextl::make_unique<MetaLayer>(FEXCore::Config::LayerType::LAYER_TOP));
-  /* iOS-Mythic: avoid dynamic_cast — RTTI for cross-DLL types under
+  /* iOS-Madeira: avoid dynamic_cast — RTTI for cross-DLL types under
    * arm64ec-w64-mingw32 returns NULL. We just inserted MetaLayer above
    * so static_cast is safe. */
   Meta = static_cast<MetaLayer*>(ConfigLayers.begin()->second.get());
@@ -262,7 +262,7 @@ void Initialize() {
   auto it = ConfigLayers.begin();
   if (it == ConfigLayers.end()) INIT_TAG_EXIT(0x0013);
   if (!it->second) INIT_TAG_EXIT(0x0014);
-  /* iOS-Mythic: static_cast — see comment above. */
+  /* iOS-Madeira: static_cast — see comment above. */
   Meta = static_cast<MetaLayer*>(it->second.get());
   if (!Meta) INIT_TAG_EXIT(0x0015);
   /* tag 0x1F — Initialize completed. To confirm we got here, uncomment: */

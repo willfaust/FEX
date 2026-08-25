@@ -109,7 +109,7 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   ///< Data pointer for exclusive use by the frontend
   void* FrontendPtr;
 
-  // iOS-Mythic 2026-05-13: bumped 4MB → 16MB. SEH unwinds through translated
+  // iOS-Madeira 2026-05-13: bumped 4MB → 16MB. SEH unwinds through translated
   // code on iOS don't pop FEX callret entries (FEX has no SEH-aware callret
   // cleanup yet), so caught faults leak entries. With 9700+ caught faults
   // observed in Thumper FMOD worker, the original 4MB filled up. 16MB buys
@@ -117,7 +117,7 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   // hundred per-thread caught faults. Real fix: callret-aware SEH unwind.
   static constexpr size_t CALLRET_STACK_SIZE {0x1000000};
 
-  // iOS-Mythic ml609/ml610: NAMED bounds for the window the CALL/RET guard enforces.
+  // iOS-Madeira ml609/ml610: NAMED bounds for the window the CALL/RET guard enforces.
   //
   // The default sp sits at base + SIZE/4 = base+4MB and the predictor grows DOWN
   // from there; BranchOps.cpp bounds sp to [base+2MB, base+6MB).

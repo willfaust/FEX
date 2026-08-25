@@ -6,7 +6,7 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 
-/* iOS-Mythic ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
+/* iOS-Madeira ml706: the one VA-layout profile, selected in rpmalloc's os_mmap
  * (the earliest allocator in the process) and followed here. C linkage: it is
  * chosen from C. */
 extern "C" {
@@ -33,7 +33,7 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
   const size_t CallRetStackAllocSize = FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE + 2 * FEXCore::Utils::FEX_PAGE_SIZE;
   const void* CallRetStackAlloc = nullptr;
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml324: steer the call-ret stack out of the guest VA band.
+  /* iOS-Madeira ml324: steer the call-ret stack out of the guest VA band.
    *
    * This calls ::VirtualAlloc directly rather than FEXCore::Allocator::VirtualAlloc,
    * so ml321's steering missed it -- ml323 confirmed every other FEXMem_* region moved
@@ -73,7 +73,7 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
   Thread->CallRetStackBase = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(CallRetStackAlloc) + FEXCore::Utils::FEX_PAGE_SIZE);
   ::VirtualAlloc(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE, MEM_COMMIT, PAGE_READWRITE);
 
-  /* iOS-Mythic: VirtualAlloc(MEM_COMMIT) on a previously-MEM_RESERVE'd
+  /* iOS-Madeira: VirtualAlloc(MEM_COMMIT) on a previously-MEM_RESERVE'd
    * PAGE_NOACCESS region might not zero-initialize the pages on iOS. The
    * dispatcher uses callret_sp to BLR via stored values; uninit content
    * (e.g. 0x55 poison from prior wine activity) would BLR to garbage.
@@ -90,14 +90,14 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
 #endif
 
   Thread->CurrentFrame->State.callret_sp = GetInfoThread(Thread).DefaultLocation;
-  // iOS-Mythic 2026-05-18: mirror CallRetStackBase into CpuStateFrame so JIT
+  // iOS-Madeira 2026-05-18: mirror CallRetStackBase into CpuStateFrame so JIT
   // code can emit inline bounds checks. Needed because iOS Wine doesn't honor
   // PAGE_NOACCESS on the guard pages, so the SEH-driven HandleAccessViolation
   // never fires — JIT code has to detect-and-reset proactively.
   Thread->CurrentFrame->State.callret_sp_base = reinterpret_cast<uint64_t>(Thread->CallRetStackBase);
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml263: print the geometry ONCE per process. Two jobs:
+  /* iOS-Madeira ml263: print the geometry ONCE per process. Two jobs:
    * (1) a verifiable content marker for the JIT-side guard change in BranchOps.cpp
    *     (an emitter constant leaves no string in the binary, so there is otherwise
    *     nothing to grep in the installed bundle);
@@ -112,7 +112,7 @@ void InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
                         "guard-window=[base+0x200000, base+0x600000) grows-DOWN",
                         reinterpret_cast<uint64_t>(Thread->CallRetStackBase), Info.DefaultLocation,
                         FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
-      /* iOS-Mythic ml271: print the REAL CpuStateFrame offsets once.
+      /* iOS-Madeira ml271: print the REAL CpuStateFrame offsets once.
        *
        * The ntdll-unix side reads these fields out of x28 in signal handlers using
        * hand-derived constants, and ml271 showed why that is unsafe: [rsp-forensics]

@@ -126,7 +126,7 @@ struct ControlFlowGraph {
     }
   }
 
-  // iOS-Mythic ml605: EVERY BlockMap lookup is bounds-checked, and an out-of-range
+  // iOS-Madeira ml605: EVERY BlockMap lookup is bounds-checked, and an out-of-range
   // ID lands on this sentinel instead of past the end of the vector.
   //
   // ml604 (db 7276) died here: switching Steam to Library gave the in-process
@@ -626,7 +626,7 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
   // Reverse iteration is not yet working with the iterators
   auto BlockIROp = CurrentIR.GetOp<IR::IROp_CodeBlock>(Block);
 
-  // iOS-Mythic ml599: VALIDATE BEFORE MUTATING.
+  // iOS-Madeira ml599: VALIDATE BEFORE MUTATING.
   //
   // ml597 bounded the reverse walk below and ml598 saw it fire (block 405,
   // 13,183 steps). But that bound trips only AFTER the walk has already called
@@ -659,7 +659,7 @@ bool DeadFlagCalculationEliminination::ProcessBlock(IREmitter* IREmit, IRListVie
     FlagsRead = CFG.Get(ExitOp->Args[0])->Flags;
   }
 
-  // iOS-Mythic ml597/ml599: BOUND THE REVERSE WALK (backstop).
+  // iOS-Madeira ml597/ml599: BOUND THE REVERSE WALK (backstop).
   //
   // This walk terminates only by reaching CodeBegin, so a cyclic or truncated
   // Previous chain spins forever holding a fexlock read reference and stalls
@@ -845,7 +845,7 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
     CFG.Get(Block->ID)->Node = BlockNode;
   }
 
-  // iOS-Mythic ml605: SEMANTIC CFG VALIDATION, once, right after construction.
+  // iOS-Madeira ml605: SEMANTIC CFG VALIDATION, once, right after construction.
   //
   // Answers the question the ml604 crash could not: was the CFG born invalid
   // (emitter / block-ID gather supplied bad IDs) or did it become invalid while
@@ -940,7 +940,7 @@ void DeadFlagCalculationEliminination::Run(IREmitter* IREmit) {
   // After processing a block, if we made progress, we must process its
   // predecessors to propagate globally. A block will be reprocessed only if
   // there is a loop backedge.
-  // iOS-Mythic ml597: BOUND THE WORKLIST TOO — the second way this pass can fail
+  // iOS-Madeira ml597: BOUND THE WORKLIST TOO — the second way this pass can fail
   // to terminate. Blocks are re-queued whenever their flag set changes, so if the
   // dataflow never reaches a fixed point the queue refills forever even though the
   // per-block walk above is healthy. Bounding both separates the two causes: a

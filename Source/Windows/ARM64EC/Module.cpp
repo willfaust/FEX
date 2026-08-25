@@ -169,7 +169,7 @@ std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
 
-// iOS-Mythic: arm64ec-mingw doesn't reliably run global C++ ctors, so the
+// iOS-Madeira: arm64ec-mingw doesn't reliably run global C++ ctors, so the
 // recursive_mutex / unordered_map below would be zero-init'd and any lock()
 // would hang in NtWaitForAlertByThreadId. Wrap as Meyers singletons so they
 // construct on first use regardless of the broken static-init chain.
@@ -186,7 +186,7 @@ inline std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& GetThread
 #define Threads GetThreadsMap()
 
 #ifdef FEX_IOS_HOST
-/* iOS-Mythic ml460 (#75): pool-tail sweep registry, implemented in
+/* iOS-Madeira ml460 (#75): pool-tail sweep registry, implemented in
  * CPUBackend.cpp (which has the full CPUBackend type). This frontend only
  * registers each thread's ThreadState + &CpuArea->InSimulation at init and
  * unregisters at term — the unregister BLOCKS until any in-flight sweep
@@ -202,7 +202,7 @@ std::pair<NTSTATUS, ThreadCPUArea> GetThreadCPUArea(HANDLE Thread) {
 }
 
 #ifdef FEX_IOS_HOST
-/* iOS-Mythic 2026-05-19: NtCurrentTeb() compiles to a read of x18 on
+/* iOS-Madeira 2026-05-19: NtCurrentTeb() compiles to a read of x18 on
  * ARM64EC, but x18 is clobbered by Apple runtime calls (libobjc, mach
  * syscalls, pthread, etc.). Reading it after any such call returns
  * garbage — typically 0 in cold-start paths. This is the documented
@@ -238,7 +238,7 @@ ThreadCPUArea GetCPUArea() {
 }
 
 #ifdef FEX_IOS_HOST
-/* iOS-Mythic ml259 PROBE (#44). The CEF thread (0098) executes FEX JIT with x28 == 0:
+/* iOS-Madeira ml259 PROBE (#44). The CEF thread (0098) executes FEX JIT with x28 == 0:
  *   insn ldr x0,[x28,#0x658] faults with addr=0x658 -- the fault address IS the
  *   immediate, so the base is null. x28 is the CpuStateFrame, i.e. EmulatorData[0].
  *
@@ -250,7 +250,7 @@ ThreadCPUArea GetCPUArea() {
  * falls back to NtCurrentTeb() (an x18 read) when TSD slot 275 is not yet populated --
  * and x18 is clobbered by Apple runtime calls.
  *
- * Deliberately uses LogMan (which reaches mythic-log.txt, as [caspal128] proved) and
+ * Deliberately uses LogMan (which reaches madeira-log.txt, as [caspal128] proved) and
  * NOT the WriteFile(hStdError) path the existing "ThreadInit() done" line uses -- that
  * one has never once appeared in a log, so its silence means nothing. */
 static void IosLogCPUArea(const char* tag) {
@@ -405,7 +405,7 @@ void HandleImageMap(uint64_t Address, bool MainImage = false) {
   ImageTracker->HandleImageMap(ModulePath, Address, MainImage);
 }
 
-/* iOS-Mythic ml190: REPLAY IMAGE MAPS THAT ARRIVE BEFORE THE TRACKERS EXIST.
+/* iOS-Madeira ml190: REPLAY IMAGE MAPS THAT ARRIVE BEFORE THE TRACKERS EXIST.
  *
  * NotifyMapViewOfSection returns early when InvalidationTracker/ImageTracker are not yet
  * constructed (they are created in ProcessInit), and that notification was previously lost
@@ -497,7 +497,7 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
 
     // The TEB is the only populated GDT entry by default
     //
-    // iOS-Mythic 2026-07-02: use IOSLoadTEB() (TPIDRRO_EL0 + TSD slot 275)
+    // iOS-Madeira 2026-07-02: use IOSLoadTEB() (TPIDRRO_EL0 + TSD slot 275)
     // instead of NtCurrentTeb() (raw x18 read). This function runs late in
     // ThreadInit and on every EC->x86 context restore; on threads whose x18
     // has been clobbered by Apple runtime calls, NtCurrentTeb() returns 0
@@ -790,9 +790,9 @@ extern "C" void SyncThreadContext(CONTEXT* Context) {
 }
 
 #ifdef FEX_IOS_HOST
-/* iOS-Mythic 2026-05-19: define FEXCore::DualMap::WriteOffset for THIS PE.
+/* iOS-Madeira 2026-05-19: define FEXCore::DualMap::WriteOffset for THIS PE.
  * xtajit64.dll has its own statically-linked copy of FEXCore separate from
- * the iOS Mythic app's libFEXCore_Base.a — so we need our own storage for
+ * the iOS Madeira app's libFEXCore_Base.a — so we need our own storage for
  * the variable. Set early in ProcessInit (before InitCore + dispatcher emit).
  * Convention is +0x10000000 (RX→RW alias separation), matching the iOS JIT
  * pool layout established in virtual_ios.c. */
@@ -802,9 +802,9 @@ int64_t WriteOffset = 0;
 #endif
 
 NTSTATUS ProcessInit() {
-  /* iOS-Mythic: DualMap::WriteOffset (RX→RW alias distance) is set below,
+  /* iOS-Madeira: DualMap::WriteOffset (RX→RW alias distance) is set below,
    * after InitCRTProcess() populates the environment, and BEFORE InitCore().
-   * It is read from MYTHIC_JIT_WRITE_OFFSET rather than hardcoded, because
+   * It is read from MADEIRA_JIT_WRITE_OFFSET rather than hardcoded, because
    * the app creates the RW alias with VM_FLAGS_ANYWHERE — the alias is NOT
    * guaranteed to land at RX+0x10000000 (observed +0x105a4000 on iOS 27).
    * The old hardcode corrupted the JIT pool on runs where the offset
@@ -847,7 +847,7 @@ NTSTATUS ProcessInit() {
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic ml278: announce the atomic-alias geometry UNCONDITIONALLY, AFTER
+  /* iOS-Madeira ml278: announce the atomic-alias geometry UNCONDITIONALLY, AFTER
    * Logging::Init().
    *
    * The first cut put this line inside IosAtomicWritableAlias (Arm64.cpp), on its first
@@ -864,7 +864,7 @@ NTSTATUS ProcessInit() {
                       RxEnv ? RxEnv : "<unset>", SzEnv ? SzEnv : "<unset>", RwEnv ? RwEnv : "<unset>");
   }
 
-  /* iOS-Mythic ml293: UNCONDITIONAL BUILD IDENTITY.
+  /* iOS-Madeira ml293: UNCONDITIONAL BUILD IDENTITY.
    *
    * ml292 could only be attributed to a build by comparing the log's wall-clock start
    * against the install time, because every other marker in the binary is printed from
@@ -877,15 +877,15 @@ NTSTATUS ProcessInit() {
    *
    * CAVEAT found immediately (ml294): __DATE__/__TIME__ stamp THIS translation unit's
    * compile time, so changing only another .cpp leaves the stamp stale and the ambiguity
-   * half-returns. The MYTHIC_REV tag below fixes that: bump it for every deploy, which
+   * half-returns. The MADEIRA_REV tag below fixes that: bump it for every deploy, which
    * necessarily edits this file and so refreshes the timestamp too. Self-enforcing. */
 /* ml706: this tag went stale -- an ml705 binary still reported ml466, which is
  * exactly the "self-enforcing marker" failure it exists to prevent. The
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MYTHIC_REV "ml712"
-  LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MYTHIC_REV " compiled " __DATE__ " " __TIME__);
+#define MADEIRA_REV "ml712"
+  LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
 #ifdef FEX_IOS_HOST
   {
     const uint32_t Off = IosTebTsdOffset;
@@ -928,7 +928,7 @@ NTSTATUS ProcessInit() {
    * Wine launches, forwarded through get_initial_environment because they
    * are WINE-prefixed and non-special). offset = RW_base - RX_base.
    *
-   * This replaces the earlier MYTHIC_JIT_WRITE_OFFSET attempt, which read
+   * This replaces the earlier MADEIRA_JIT_WRITE_OFFSET attempt, which read
    * an uninitialized FEXBridge pool (the guest's real pool is owned by
    * StikJITHelper, not FEXBridge) and always came back null. Fail LOUD if
    * the vars are missing — a wrong/zero offset corrupts the JIT pool. */
@@ -944,7 +944,7 @@ NTSTATUS ProcessInit() {
         : nullptr;
     char buf[160];
     if (off != 0) {
-      /* iOS-Mythic 2026-07-06: FAST-WRITE re-enabled per the 2026-07-03
+      /* iOS-Madeira 2026-07-06: FAST-WRITE re-enabled per the 2026-07-03
        * TODO — the flush is now NtFlushInstructionCache (kernel IPI) in
        * JIT.cpp instead of inline dc/ic asm, which was the suspected root
        * cause of the msvcp140-DllMain/steam_api64 fast-write crashes AND
@@ -991,7 +991,7 @@ NTSTATUS ProcessInit() {
                                                           PAGE_EXECUTE_READ);
   *reinterpret_cast<uint8_t*>(X64ReturnInstr) = 0xc3;
 
-  /* iOS-Mythic ml199: state this address explicitly.
+  /* iOS-Madeira ml199: state this address explicitly.
    *
    * [iOS-noexec]/[iOS-bogusrip] show FEX being handed GuestRIP=0x7c200e0080 — page
    * 0x7c200e0000 plus 0x80 — and the same +0x0e0080 offset has appeared across three
@@ -1155,7 +1155,7 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     return true;
   } else {
 #ifdef FEX_IOS_HOST
-    // iOS-Mythic 2026-05-13: iOS doesn't switch exception delivery to a
+    // iOS-Madeira 2026-05-13: iOS doesn't switch exception delivery to a
     // separate emulator stack like Windows-ARM64EC does (no CPU_AREA-driven
     // sigaltstack). Mach exception delivery arrives on whatever thread
     // stack was current, which is usually the guest stack. Attempt rethrow
@@ -1269,7 +1269,7 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
   }
 }
 
-/* iOS-Mythic ml710: LOADER-SAFE EXECUTABLE-INTERVAL REGISTRATION.
+/* iOS-Madeira ml710: LOADER-SAFE EXECUTABLE-INTERVAL REGISTRATION.
  *
  * This is a FALLBACK, not a second full registration path. It exists because in a child
  * pseudo-process the syscall notification never arrives -- enter_syscall_callback()
@@ -1318,7 +1318,7 @@ extern "C" void NotifyImageMap(void* Address) {
 }
 
 NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Size, ULONG AllocType, ULONG Prot) {
-  /* iOS-Mythic ml183: do NOT require GetCPUArea().ThreadState() here.
+  /* iOS-Madeira ml183: do NOT require GetCPUArea().ThreadState() here.
    *
    * HandleImageMap() only needs InvalidationTracker + ImageTracker — it never touches
    * thread state. Requiring a live ThreadState silently DROPPED the notification whenever
@@ -1393,7 +1393,7 @@ void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
 }
 
-/* iOS-Mythic ml411 (#60/#66): the release half must never be gated on state
+/* iOS-Madeira ml411 (#60/#66): the release half must never be gated on state
  * that can change between the paired calls.
  *
  * Upstream returns early when `!InvalidationTracker || !ThreadState`, and
@@ -1454,7 +1454,7 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
   }
 }
 
-/* iOS-Mythic ml612: RELEASE FEX LOCKS A DYING THREAD STILL HOLDS.
+/* iOS-Madeira ml612: RELEASE FEX LOCKS A DYING THREAD STILL HOLDS.
  *
  * ml611's whole-app freeze: CrBrowserMain (00b0) blew FEX's 256KB emulator stack
  * inside a recursive fextl::set tree deleter, the fault was misclassified as
@@ -1562,7 +1562,7 @@ extern "C" uint32_t BTCpu64IosReleaseThreadHolds(void* TebPtr, uint64_t* OutStam
 }
 
 #ifdef FEX_IOS_HOST
-/* iOS-Mythic: step markers through ThreadInit. Two runs have died with a
+/* iOS-Madeira: step markers through ThreadInit. Two runs have died with a
  * fresh post-detach thread's "ThreadInit() entered" as the last FEX log
  * line (silent kill, no crash report) — once during loading's worker-thread
  * spawn, once when QuickTime's recording start triggered a thread spawn.
@@ -1584,7 +1584,7 @@ static void IosTiLog(const char* msg) {
 
 NTSTATUS ThreadInit() {
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic diagnostic: log entry to thread-init so we can confirm Wine
+  /* iOS-Madeira diagnostic: log entry to thread-init so we can confirm Wine
    * is calling BTCpu64ThreadInit for the main x86_64 thread before the
    * dispatcher is invoked. Without this, EmulatorData[0] is garbage and
    * the dispatcher BLR's into uninitialized memory. */
@@ -1643,7 +1643,7 @@ NTSTATUS ThreadInit() {
   Frame->State.cs_cached = FEXCore::Core::CPUState::CalculateGDTBase(GDT);
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: set up GS base for x86_64 TLS access. On Windows x64 the
+  /* iOS-Madeira: set up GS base for x86_64 TLS access. On Windows x64 the
    * convention is GS-base = TEB pointer, and MSVC-emitted code uses
    * `mov rax, gs:[0x58]` to reach TEB->ThreadLocalStoragePointer.
    * LoadStateFromECContext() at the EC->x86 transition sets this, but for
@@ -1686,7 +1686,7 @@ NTSTATUS ThreadInit() {
   CPUArea.DispatcherLoopTopEnterEC() = EnterEC;
 
 #ifdef FEX_IOS_HOST
-  /* iOS-Mythic: PATCH FEX dispatcher's broken SpillStaticRegs.
+  /* iOS-Madeira: PATCH FEX dispatcher's broken SpillStaticRegs.
    *
    * FEX's emitter on iOS produces 7 stale `madd`/`mul` instructions where
    * 7 `stp` should be (pairs 1-7: RDX/RBX, RSP/RBP, RSI/RDI, R8/R9, R10/R11,

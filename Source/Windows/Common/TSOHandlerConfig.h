@@ -28,7 +28,7 @@ public:
       LogMan::Msg::IFmt("FEX: Kernel unaligned atomics enabled!");
     }
 
-    /* iOS-Mythic ml512/ml513: report the EFFECTIVE TSO configuration at
+    /* iOS-Madeira ml512/ml513: report the EFFECTIVE TSO configuration at
      * runtime. A compiled-in config default is invisible to binary greps, so
      * this line is the only way to know what the JIT is actually doing.
      *

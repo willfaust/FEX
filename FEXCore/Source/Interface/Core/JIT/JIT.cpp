@@ -16,7 +16,7 @@ $end_info$
 #endif
 
 #if defined(FEX_IOS_HOST) && !defined(__APPLE__)
-// iOS-Mythic 2026-07-06: cross-modifying code flushes MUST go through the
+// iOS-Madeira 2026-07-06: cross-modifying code flushes MUST go through the
 // kernel (NtFlushInstructionCache → __clear_cache → sys_icache_invalidate),
 // which IPIs every core so remote PEs take the required context
 // synchronization. The old inline dc/ic asm only broadcast the cache
@@ -580,7 +580,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     return Frame->Pointers.DispatcherLoopTop;
   } else {
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic ml455 (#74 delivery-under-locks): guest SEH delivery running
+    /* iOS-Madeira ml455 (#74 delivery-under-locks): guest SEH delivery running
      * while an interrupted frame on this thread holds emission locks.  Both
      * FindBlock and the link patch below take locks that frame may own —
      * bounce to the dispatcher loop instead, which compiles unpublished
@@ -610,7 +610,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     }
   }
 
-  /* iOS-Mythic diag: companion to [fex-entry] in Core.cpp — scream when the
+  /* iOS-Madeira diag: companion to [fex-entry] in Core.cpp — scream when the
    * link target the blocks will be patched to jump at starts with the NOP
    * prefill or decodes as block-tail data (upper 16 bits all zero — no real
    * ARM64 instruction looks like that). */
@@ -762,7 +762,7 @@ Arm64JITCore::Arm64JITCore(FEXCore::Context::ContextImpl* ctx, FEXCore::Core::In
 extern "C" int32_t NtTerminateProcess(void* ProcessHandle, int32_t ExitStatus);
 #endif
 
-/* iOS-Mythic ml460 (#75): the ml455 bail paths return a null code pointer,
+/* iOS-Madeira ml460 (#75): the ml455 bail paths return a null code pointer,
  * which the dispatcher then executes -> c0000005 at address 0 -> guest SEH
  * re-enters the compiler under delivery -> bails again. At pool exhaustion
  * this looped 69,902 times in the ml459 run, burning minutes of CPU and
@@ -980,7 +980,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
   // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
   // This minimizes lock contention of CodeBufferWriteMutex.
-  // [iOS-Mythic] verbose SSACount/TempBuf logs suppressed
+  // [iOS-Madeira] verbose SSACount/TempBuf logs suppressed
   auto TempCodeBufferInfo = TempAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
@@ -1031,7 +1031,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   PendingTargetLabel = nullptr;
   PendingCallReturnTargetLabel = nullptr;
 
-  // [iOS-Mythic] verbose IR block loop entry log suppressed
+  // [iOS-Madeira] verbose IR block loop entry log suppressed
   for (auto [BlockNode, BlockHeader] : IR->GetBlocks()) {
     using namespace FEXCore::IR;
     auto BlockIROp = BlockHeader->CW<FEXCore::IR::IROp_CodeBlock>();
@@ -1039,7 +1039,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     LOGMAN_THROW_A_FMT(BlockIROp->Header.Op == IR::OP_CODEBLOCK, "IR type failed to be a code block");
 #endif
 
-    // [iOS-Mythic] verbose per-block log suppressed — was flooding 100MB log in 20m before splash.
+    // [iOS-Madeira] verbose per-block log suppressed — was flooding 100MB log in 20m before splash.
     auto BlockStartHostCode = GetCursorAddress<uint8_t*>();
     {
       const auto Node = IR->GetID(BlockNode);
@@ -1056,7 +1056,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
       if (BlockIROp->EntryPoint) {
         uint64_t BlockStartRIP = Entry + BlockIROp->GuestEntryOffset;
-        // [iOS-Mythic] verbose EntryPoint log suppressed
+        // [iOS-Madeira] verbose EntryPoint log suppressed
 
         const auto IsReturnTarget = CallReturnTargets.try_emplace(Node).first;
         if (PendingTargetLabel) {
@@ -1073,7 +1073,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
 
         EmitEntryPoint(JITCodeHeaderLabel, CheckTF);
-        // [iOS-Mythic] verbose EmitEntryPoint-done log suppressed
+        // [iOS-Madeira] verbose EmitEntryPoint-done log suppressed
       }
 
       if (PendingCallReturnTargetLabel) {
@@ -1086,11 +1086,11 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       BindOrRestart(Target);
     }
 
-    // [iOS-Mythic] verbose block-header-done log suppressed
+    // [iOS-Madeira] verbose block-header-done log suppressed
     {
       int OpIdx = 0;
       for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
-        // [iOS-Mythic] verbose per-op dispatch log suppressed
+        // [iOS-Madeira] verbose per-op dispatch log suppressed
         switch (IROp->Op) {
 #define REGISTER_OP(op, x) \
   case FEXCore::IR::IROps::OP_##op: Op_##x(IROp, CodeNode); break
@@ -1103,7 +1103,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         }
         OpIdx++;
       }
-      // [iOS-Mythic] verbose block-done log suppressed
+      // [iOS-Madeira] verbose block-done log suppressed
     }
 
     DebugData->Subblocks.push_back({static_cast<uint32_t>(BlockStartHostCode - CodeData.BlockBegin),
@@ -1216,7 +1216,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   // This can block progress in other compiling threads, so the duration of the lock should be as small as possible.
   {
 #ifdef FEX_IOS_HOST
-    /* iOS-Mythic ml446 (#74): stamp ownership of this std::mutex (an SRWLOCK
+    /* iOS-Madeira ml446 (#74): stamp ownership of this std::mutex (an SRWLOCK
      * underneath, anonymous by design) in TEB Instrumentation[6] so the
      * monitor's dead-holder reaper can spot a cross-terminated thread that
      * died inside this section and release the lock.  Cleared at scope end.
@@ -1348,11 +1348,11 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
     // Copy over CodeBuffer contents (write to RW mirror on iOS)
 #if defined(FEX_IOS_HOST)
-    /* iOS-Mythic 2026-05-19 sanity log: one-shot diagnostic on first 2 JIT
+    /* iOS-Madeira 2026-05-19 sanity log: one-shot diagnostic on first 2 JIT
      * copies to verify the per-Buffer dual-map wiring is correct.
      * Expect: TempCodeBuffer != RXCursor (temp is heap, offset 0), and
      * RWCursor = RXCursor + WriteOffset where WriteOffset is the real
-     * runtime RX→RW distance (from MYTHIC_JIT_WRITE_OFFSET — NOT a fixed
+     * runtime RX→RW distance (from MADEIRA_JIT_WRITE_OFFSET — NOT a fixed
      * 0x10000000; the RW alias is placed with VM_FLAGS_ANYWHERE). */
     {
       static volatile int dual_map_log_count = 0;
@@ -1399,7 +1399,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     sys_icache_invalidate(CodeBegin, CodeOnlySize);
   }
 #elif defined(FEX_IOS_HOST)
-  // iOS-Mythic 2026-07-06: route the whole-block flush through
+  // iOS-Madeira 2026-07-06: route the whole-block flush through
   // NtFlushInstructionCache (kernel-coordinated __clear_cache /
   // sys_icache_invalidate) instead of inline dc/ic asm. The inline
   // broadcast never forced the required ISB on OTHER cores — a core

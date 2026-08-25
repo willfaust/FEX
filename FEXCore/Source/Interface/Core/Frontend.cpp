@@ -1385,9 +1385,9 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   // Decode operating mode from thread's CS segment.
   const auto CSSegment = Core::CPUState::GetSegmentFromIndex(Thread->CurrentFrame->State, Thread->CurrentFrame->State.cs_idx);
   BlockInfo.Is64BitMode = CSSegment->L == 1;
-  /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: CSSegment->L={}, Is64BitMode={}, Config.Is64BitMode={}", CSSegment->L, BlockInfo.Is64BitMode, (bool)CTX->Config.Is64BitMode);
+  /* [iOS-Madeira] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: CSSegment->L={}, Is64BitMode={}, Config.Is64BitMode={}", CSSegment->L, BlockInfo.Is64BitMode, (bool)CTX->Config.Is64BitMode);
   LOGMAN_THROW_A_FMT(BlockInfo.Is64BitMode == CTX->Config.Is64BitMode, "Expected operating mode to not change at runtime!");
-  /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Assertion passed OK");
+  /* [iOS-Madeira] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Assertion passed OK");
 
   EntryPoint = PC;
   BlockInfo.EntryPoints = {PC};
@@ -1420,7 +1420,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   if (MaxInst == 0) {
     MaxInst = CTX->Config.MaxInstPerBlock;
   }
-  /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: MaxInst={}, entering decode loop...", MaxInst);
+  /* [iOS-Madeira] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: MaxInst={}, entering decode loop...", MaxInst);
 
   bool EntryBlock {true};
   bool FinalInstruction {false};
@@ -1462,7 +1462,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
 
     // Do a bit of pointer math to figure out where we are in code
     InstStream = AdjustAddrForSpecialRegion(_InstStream, EntryPoint, RIPToDecode);
-    /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Block RIP={:#x}, InstStream={}, entering inner loop", RIPToDecode, (void*)InstStream);
+    /* [iOS-Madeira] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Block RIP={:#x}, InstStream={}, entering inner loop", RIPToDecode, (void*)InstStream);
 
     while (1) {
       InstructionSize = 0;
@@ -1491,7 +1491,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
       }
 
       if (TotalInstructions == 0) {
-        /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: About to decode first instruction at {:#x}, byte={:#x}", OpAddress, InstStream[0]);
+        /* [iOS-Madeira] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: About to decode first instruction at {:#x}, byte={:#x}", OpAddress, InstStream[0]);
       }
       BlockIt->BlockStatus = DecodeInstruction(OpAddress);
       if (HitBadRelocation) {
@@ -1574,7 +1574,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   }
 
   BlockInfo.TotalInstructionCount = TotalInstructions;
-  /* [iOS-Mythic] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Done! TotalInstructions={}, Blocks={}", TotalInstructions, BlockInfo.Blocks.size());
+  /* [iOS-Madeira] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Done! TotalInstructions={}, Blocks={}", TotalInstructions, BlockInfo.Blocks.size());
 
   for (auto& Block : BlockInfo.Blocks) {
     Block.IsEntryPoint = BlockInfo.EntryPoints.contains(Block.Entry);
