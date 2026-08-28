@@ -26,3 +26,10 @@ EXPORTS
   ThreadInit
   ThreadTerm
   UpdateProcessorInformation
+  ; ml755: the VA band selector's deferred beacon buffer, exported as DATA so
+  ; ntdll can print it from arm64ec_process_init_dispatchers(). The selector
+  ; runs before the ARM64EC TEB exists and so cannot log for itself; ml751
+  ; flushed it from Module.cpp after [build-id], which is never reached when
+  ; the selector finds NO BAND -- exactly the failure that needs explaining.
+  ios_va_log DATA
+  ios_va_log_len DATA

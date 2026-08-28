@@ -62,6 +62,12 @@ $end_info$
 #include <winnt.h>
 #include <wine/debug.h>
 
+/* ml751: the VA band selector's deferred beacon buffer, filled by
+ * ios_va_emit() in rpmalloc.c before the ARM64EC TEB exists and therefore
+ * before any logging API is callable. Flushed once LogMan is up. */
+extern "C" char ios_va_log[];
+extern "C" int ios_va_log_len;
+
 #ifdef FEX_IOS_HOST
 /* iOS JIT-pool alias resolution. Implemented in IosJitAlias.cpp (separate
  * TU because ARM64EC class-method access to the static table directly from
@@ -884,8 +890,27 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MADEIRA_REV "ml712"
+#define MADEIRA_REV "ml755"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
+#ifdef FEX_IOS_HOST
+  /* ml751: flush the VA band selector's beacons.
+   *
+   * ios_fex_band_select() runs during rpmalloc init, before the ARM64EC TEB
+   * exists, so it cannot call a logging API -- ml750 tried OutputDebugStringA
+   * there and crashed every launch with x18=0x0. It appends to a plain byte
+   * buffer instead; this is the first point where LogMan is known to work, as
+   * the build-id line above demonstrates. Without this the selector that
+   * decides where FEX's arena lives reports nothing at all. */
+  {
+    if (ios_va_log_len > 0) {
+      ios_va_log[ios_va_log_len] = 0;
+      LogMan::Msg::EFmt("[va-profile] ml751 deferred selector log ({} bytes):\n{}",
+                        ios_va_log_len, ios_va_log);
+    } else {
+      LogMan::Msg::EFmt("[va-profile] ml751 selector emitted NOTHING -- it did not run");
+    }
+  }
+#endif
 #ifdef FEX_IOS_HOST
   {
     const uint32_t Off = IosTebTsdOffset;
