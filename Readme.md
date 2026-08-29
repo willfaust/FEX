@@ -1,3 +1,9 @@
+> **Licensing note for this fork.** Upstream code here remains under its
+> original licence (see `LICENSE`). Modifications and new files authored for
+> [Madeira](https://github.com/willfaust/Madeira) are **GPL-3.0-or-later**
+> (`COPYING.GPL-3.0`), so this copy as a whole is copyleft. Upstream remains
+> available under its own licence from upstream. See `LICENSE-MADEIRA.md`.
+
 [中文](https://github.com/FEX-Emu/FEX/blob/main/docs/Readme_CN.md)
 # FEX: Emulate x86 Programs on ARM64
 FEX allows you to run x86 applications on ARM64 Linux devices, similar to qemu-user and box64.

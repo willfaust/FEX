@@ -51,4 +51,5 @@
 	url = https://github.com/martinus/unordered_dense.git
 [submodule "External/rpmalloc"]
 	path = External/rpmalloc
-	url = https://github.com/FEX-Emu/rpmalloc.git
+	url = https://github.com/willfaust/rpmalloc.git
+	branch = ios-madeira
