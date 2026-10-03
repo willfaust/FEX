@@ -111,6 +111,16 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
 #endif
   HostFeatures.CPUMIDRs.push_back(0u);
   HostFeatures.HostType = HostType;
+  /* iOS-Madeira: AVX/AVX2 stay off (titles that check CPUID take their SSE
+   * paths), but a game built for AVX dies on its first VEX instruction. The app
+   * sets MADEIRA_FEX_AVX=1 for such a game; FEX then runs AVX through its
+   * 128-bit emulation. CPUID, XCR0 and IsProcessorFeaturePresent all derive
+   * from SupportsAVX. AVX is unsupported for WOW64, as on other hosts. */
+  if (const char* Avx = getenv("MADEIRA_FEX_AVX");
+      Avx && Avx[0] == '1' && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64) {
+    HostFeatures.SupportsAVX = true;
+    HostFeatures.SupportsAES256 = HostFeatures.SupportsAES;
+  }
   return HostFeatures;
 #else
   HKEY Key = OpenProcessorKey(0);
