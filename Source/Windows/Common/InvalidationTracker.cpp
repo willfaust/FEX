@@ -23,6 +23,9 @@ extern "C" uint64_t FEX_MadeiraIRCapTarget;
 #ifdef FEX_IOS_HOST
 extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
 #endif
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+extern "C" int IosSubfloorEnum(int Index, uint64_t* Low, uint64_t* Real, uint64_t* Size);  // ml1207, IosJitAlias.cpp
+#endif
 
 namespace FEX::Windows {
 #if !defined(ARCHITECTURE_arm64ec)
@@ -714,6 +717,39 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
   for (auto Thread : Threads) {
     CTX.InvalidateThreadCachedCodeRange(Thread.second, Address, Size);
   }
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  /* iOS-Madeira ml1207: a sub-floor image (fixed base below 4GB, mapped high) has
+   * two names for every byte, and its code can be compiled under either: at its
+   * low addresses (ml1206 starts it there, absolute pointers lead there) or at
+   * the real mapping. Notifications name whichever address the program used,
+   * and writes to the low name go through the Mach emulator, never through an
+   * RWX trap. A MinGW pseudo-relocator protected its .text by the real
+   * address, patched a `call` through the low one and restored the protection:
+   * the block compiled at the low RIP kept the old rel32 and jumped into .data
+   * (a NoExec fault). Drop the range under its other name too. */
+  {
+    const uint64_t End = Size > std::numeric_limits<uint64_t>::max() - Address ? std::numeric_limits<uint64_t>::max() : Address + Size;
+    uint64_t Low, Real, WinSize;
+    for (int i = 0; IosSubfloorEnum(i, &Low, &Real, &WinSize); i++) {
+      if (!WinSize || !Real) {
+        continue;
+      }
+      const uint64_t Names[2][2] = {{Real, Low}, {Low, Real}};
+      for (const auto& N : Names) {
+        const uint64_t From = N[0], To = N[1];
+        const uint64_t B = std::max(Address, From), E = std::min(End, From + WinSize);
+        if (B >= E) {
+          continue;
+        }
+        const uint64_t AliasAddr = To + (B - From), AliasSize = E - B;
+        CTX.InvalidateCodeBuffersCodeRange(AliasAddr, AliasSize);
+        for (auto Thread : Threads) {
+          CTX.InvalidateThreadCachedCodeRange(Thread.second, AliasAddr, AliasSize);
+        }
+      }
+    }
+  }
+#endif
 }
 
 bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {

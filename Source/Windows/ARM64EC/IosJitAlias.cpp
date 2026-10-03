@@ -311,6 +311,18 @@ uint64_t IosSubfloorToLow(uint64_t Addr) {
   return Addr;
 }
 
+// ml1207: window Index as {low, real, size}; 0 past the end. The invalidation
+// tracker uses it to drop a sub-floor image's code under both of its names.
+int IosSubfloorEnum(int Index, uint64_t* Low, uint64_t* Real, uint64_t* Size) {
+  if (Index < 0 || Index >= g_SubfloorCount) {
+    return 0;
+  }
+  *Low = g_Subfloor[Index].LowBase;
+  *Real = g_Subfloor[Index].RealBase;
+  *Size = g_Subfloor[Index].Size;
+  return 1;
+}
+
 // Clip a range to the end of the window containing LowAddr, so a tracker range
 // can never be reported as extending past the window we actually back.
 uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size) {
