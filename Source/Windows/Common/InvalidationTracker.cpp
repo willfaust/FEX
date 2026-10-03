@@ -25,6 +25,23 @@ extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
 #endif
 
 namespace FEX::Windows {
+uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
+#ifdef FEX_IOS_HOST
+  // The host thread pointer: x18 (the TEB) is not reliable on the iOS host.
+  uint64_t Tpidrro;
+  __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(Tpidrro));
+  return Tpidrro & ~uint64_t(7);
+#else
+  return reinterpret_cast<uint64_t>(NtCurrentTeb());
+#endif
+}
+
+// Memory notifications skipped because this thread already held IntervalsLock exclusively. They
+// must not log or allocate (the allocator is in the middle of mapping or unmapping a page), so
+// they are counted and reported later from HandleImageMap, outside the lock.
+static std::atomic<uint64_t> NestedNotificationSkips {0};
+static std::atomic<uint64_t> NestedNotificationSkipsReported {0};
+
 #if !defined(ARCHITECTURE_arm64ec)
 InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX,
                                          const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase)
@@ -66,6 +83,11 @@ static bool ProtIsWritable(ULONG Prot) {
 }
 
 void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, uint64_t Size, ULONG Prot) {
+  if (IntervalsLock.HeldByThisThread()) {
+    // FEX's own heap, changed while this thread holds IntervalsLock: see OwnedSharedMutex.
+    NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
 
@@ -254,6 +276,16 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
     }
   }
 
+  {
+    const auto Skips = NestedNotificationSkips.load(std::memory_order_relaxed);
+    auto Reported = NestedNotificationSkipsReported.load(std::memory_order_relaxed);
+    if (Skips != Reported && NestedNotificationSkipsReported.compare_exchange_strong(Reported, Skips)) {
+      LogMan::Msg::EFmt("[iv-reentry] {} memory notification(s) raised while this thread held IntervalsLock were skipped "
+                        "(FEX's own heap; waiting would deadlock)",
+                        Skips);
+    }
+  }
+
   FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
   FEX_CONFIG_OPT(MaxInst, MAXINST);
   FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
@@ -382,6 +414,11 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
 }
 
 InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::InvalidateContainingSection(uint64_t Address, bool Free) {
+  if (IntervalsLock.HeldByThisThread()) {
+    // FEX's own heap, changed while this thread holds IntervalsLock: see OwnedSharedMutex.
+    NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+    return {Address, 0};
+  }
   MEMORY_BASIC_INFORMATION Info;
   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
     return {Address, 0};
@@ -410,6 +447,11 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
 }
 
 void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free) {
+  if (IntervalsLock.HeldByThisThread()) {
+    // FEX's own heap, changed while this thread holds IntervalsLock: see OwnedSharedMutex.
+    NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
   if (!Address) {
     // Match the Windows behaviour when passed a NULL base address.
     Size = std::numeric_limits<uint64_t>::max();

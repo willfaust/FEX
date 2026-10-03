@@ -3,6 +3,8 @@
 
 #include <FEXCore/Utils/IntervalList.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
@@ -88,7 +90,47 @@ private:
 
   FEXCore::IntervalList<uint64_t> XIntervals;
   FEXCore::IntervalList<uint64_t> RWXIntervals;
-  std::shared_mutex IntervalsLock;
+  // MADEIRA: a std::shared_mutex that remembers which thread holds it exclusively. Anything that
+  // grows or shrinks FEX's own heap under the lock (a log line, an interval insert) comes back on
+  // the same thread through the memory notifications (HandleMemoryProtectionNotification,
+  // InvalidateAlignedInterval, InvalidateContainingSection); they check HeldByThisThread() and
+  // return instead of waiting on a lock that is not recursive.
+  class OwnedSharedMutex {
+  public:
+    void lock() {
+      Mutex.lock();
+      Owner.store(Self(), std::memory_order_relaxed);
+    }
+    bool try_lock() {
+      if (!Mutex.try_lock()) {
+        return false;
+      }
+      Owner.store(Self(), std::memory_order_relaxed);
+      return true;
+    }
+    void unlock() {
+      Owner.store(0, std::memory_order_relaxed);
+      Mutex.unlock();
+    }
+    void lock_shared() {
+      Mutex.lock_shared();
+    }
+    bool try_lock_shared() {
+      return Mutex.try_lock_shared();
+    }
+    void unlock_shared() {
+      Mutex.unlock_shared();
+    }
+    // Only the owning thread can find its own identity here, so relaxed accesses suffice.
+    bool HeldByThisThread() const {
+      return Owner.load(std::memory_order_relaxed) == Self();
+    }
+  private:
+    static uint64_t Self();
+    std::shared_mutex Mutex;
+    std::atomic<uint64_t> Owner {0};
+  };
+  OwnedSharedMutex IntervalsLock;
   FEXCore::Context::Context& CTX;
   const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads;
 #if !defined(ARCHITECTURE_arm64ec)
