@@ -1505,6 +1505,21 @@ void BTCpuThreadTerm(HANDLE Thread, LONG ExitCode) {
   if (!Self) {
     // If we are suspending a thread that isn't ourselves, try to suspend it first so we know internal JIT locks aren't being held.
     RtlWow64SuspendThread(*ThreadDup, NULL);
+#ifdef FEX_IOS_HOST
+    /* MADEIRA ml1200: on iOS the suspend above does not stop the thread (the port's
+     * suspend is logical unless MADEIRA_REAL_SUSPEND is on), so freeing its JIT state
+     * here is a use-after-free: when a 32-bit program terminated one of its running
+     * worker threads, this freed the worker's lookup cache and call-ret stack while
+     * the worker kept running in the dispatcher, and its fault storm took the whole
+     * app down (ml465). Leave the state alone: the victim dies at its next server
+     * request (its pipes are closed), and the few MB it holds stay allocated. Its
+     * Threads entry stays too, so code invalidation still reaches it meanwhile; that
+     * is safe because the Madeira wineserver never reuses thread ids (ml400), so no
+     * new thread can collide with the stale entry. */
+    LogMan::Msg::IFmt("[thread-term] ml1200 TID {:#x} terminated by TID {:#x}: its FEX state is kept (no real suspend on iOS)",
+                      ThreadTID, GetCurrentThreadId());
+    return;
+#endif
   }
 
   auto [Err, TLS] = GetThreadTLS(*ThreadDup);
