@@ -2,8 +2,10 @@
 
 #include "Common/CPUInfo.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
+#include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/fextl/fmt.h>
 
 #include <windows.h>
@@ -107,6 +109,50 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
     if (Absent("SHA")) HostFeatures.SupportsSHA = false;
     if (Absent("CRC")) HostFeatures.SupportsCRC = false;
     if (Absent("ATOMICS")) HostFeatures.SupportsAtomics = false;
+  }
+#endif
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  /* ml1231 (local Madeira change, not for upstream): two host features for the
+   * 64-bit (ARM64EC) module, where Unity-class games spend their CPU.
+   *
+   * FEAT_LRCPC2 lets a TSO guest access [reg+disp] be one LDAPUR/STLUR instead of
+   * an ADD plus LDAPR/STLR; in Ori and the Will of the Wisps' hot JIT code nearly every LDAPR had that ADD
+   * in front of it. Armv8.4 made it mandatory, so every core that runs this has
+   * it, but a wrong `true` is SIGILL, so it is taken only from an explicit
+   * LRCPC2=1 in the app's sysctl probe (FEX_MADEIRA_HOSTPROBE). The WOW64 build is
+   * left alone: its guest window folds every displacement into the address.
+   *
+   * FEAT_AFP is switched OFF by default. With it, FEX writes FPCR on every entry to
+   * and exit from JIT code (FillSpecialRegs / SpillStaticRegs / ExitFunctionEC),
+   * i.e. twice per x64 -> ARM64EC call, and an FPCR write is expensive on Apple
+   * cores: ~9% of Ori and the Will of the Wisps' render-thread samples sat on the instruction after the
+   * write in ExitFunctionEC. Without AFP, FEX takes its ordinary path for scalar
+   * SSE (an extra INS per op), which is what most ARM64 hosts run.
+   *
+   * FEX_HOSTFEATURES=enableafp restores AFP (when the probe does not say AFP=0);
+   * FEX_HOSTFEATURES=disablelrcpc2 turns the offset forms off. */
+  {
+    const char* Probe = getenv("FEX_MADEIRA_HOSTPROBE");
+    const auto Has = [Probe](const char* Key, char Want) {
+      if (!Probe) {
+        return false;
+      }
+      const size_t Len = strlen(Key);
+      for (const char* p = Probe; (p = strstr(p, Key)) != nullptr; p += Len) {
+        const bool AtStart = p == Probe || p[-1] == ',';
+        if (AtStart && p[Len] == '=') {
+          return p[Len + 1] == Want;
+        }
+      }
+      return false;
+    };
+    FEX_CONFIG_OPT(HostFeaturesOverride, HOSTFEATURES);
+    const uint64_t Override = HostFeaturesOverride();
+
+    HostFeatures.SupportsTSOImm9 = Has("LRCPC2", '1') && !(Override & FEXCore::Config::HostFeatures::DISABLELRCPC2);
+    HostFeatures.SupportsAFP = (Override & FEXCore::Config::HostFeatures::ENABLEAFP) && !Has("AFP", '0');
+    LogMan::Msg::IFmt("FEX: ml1231 iOS ARM64EC host features: LRCPC2={} AFP={} (probe {})", HostFeatures.SupportsTSOImm9,
+                      HostFeatures.SupportsAFP, Probe ? Probe : "none");
   }
 #endif
   HostFeatures.CPUMIDRs.push_back(0u);
