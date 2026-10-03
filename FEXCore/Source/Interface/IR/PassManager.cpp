@@ -217,9 +217,13 @@ namespace {
  * target instruction. Containment, NOT entry RIP: with multiblock the block
  * routinely starts hundreds of bytes earlier, so an entry-range gate (which is
  * what I first proposed) would have missed this block entirely. */
-#if defined(FEX_IOS_HOST) && defined(_WIN32) && !defined(ARCHITECTURE_arm64ec)
-// Not thread_local in the WOW64 module (see AllocWatch.cpp): process-global, so two threads
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+// Not thread_local in either Windows module (see AllocWatch.cpp): process-global, so two threads
 // compiling at once share the mark. For a diagnostic that can only cost a missed capture.
+// MADEIRA: in the ARM64EC module a thread_local here did not reach xtajit64's own TLS block but
+// the main executable's TLS[0] block, at the offset of IRCapRIP in xtajit64's TLS template (8),
+// so FEX_MadeiraIRCapClear() at the start of every block compile zeroed the game's thread-local
+// bytes +0x8..+0xf.
 std::atomic<uint64_t> IRCapRIP {0};
 #else
 thread_local uint64_t IRCapRIP = 0;
