@@ -2,8 +2,10 @@
 
 #include "Common/CPUInfo.h"
 
+#include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/Context.h>
 #include <FEXCore/Core/HostFeatures.h>
+#include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/fextl/fmt.h>
 
 #include <windows.h>
@@ -111,6 +113,18 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
 #endif
   HostFeatures.CPUMIDRs.push_back(0u);
   HostFeatures.HostType = HostType;
+  /* No AVX by default: every VEX instruction then decodes as invalid, which is
+   * what the titles that run today were tested with. An AVX-only binary (Pale
+   * Moon x64) dies on its first VEX instruction with c000001d, so honour
+   * HostFeatures=enableavx from the config (FEX_HOSTFEATURES in the process
+   * environment) to switch on the AVX128 path for that process alone. */
+  {
+    FEX_CONFIG_OPT(HostFeaturesOverride, HOSTFEATURES);
+    if (HostFeaturesOverride() & FEXCore::Config::HostFeatures::ENABLEAVX) {
+      HostFeatures.SupportsAVX = true;
+      LogMan::Msg::IFmt("FEX: AVX enabled (HostFeatures=enableavx)");
+    }
+  }
   return HostFeatures;
 #else
   HKEY Key = OpenProcessorKey(0);

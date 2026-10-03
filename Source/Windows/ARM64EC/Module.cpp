@@ -1490,6 +1490,20 @@ extern "C" void NotifyImageMap(void* Address) {
     return;
   }
 
+  /* iOS-Madeira: wine's loader calls this outside enter_syscall_callback(), so without
+   * the guard FEX's own allocator re-enters FEX. HandleImageMap() holds IntervalsLock
+   * exclusively while it inserts intervals; when that allocation makes rpmalloc
+   * decommit a span, the VirtualFree reaches NotifyMemoryFree -> InvalidateAlignedInterval,
+   * which takes IntervalsLock again on the same thread and parks forever with the loader
+   * lock held. steam.exe hung that way on shcore.dll: one [iOS-xins] line, a [vfree]
+   * of FEX arena memory, then an alert wait that never ended. Marking the thread as
+   * inside a syscall callback makes the nested VirtualAlloc/VirtualFree skip the
+   * notifications, as they already do on the NtMapViewOfSection path. */
+  std::optional<ScopedCallbackDisable> CallbackGuard;
+  if (GetCPUArea().Area) {
+    CallbackGuard.emplace();
+  }
+
   static std::atomic<uint32_t> Count {0};
   const auto N = ++Count;
 
