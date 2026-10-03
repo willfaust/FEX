@@ -1,10 +1,29 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstdint>
 #include <exception>
 #include <winternl.h>
 
+#ifdef FEX_IOS_HOST
+// Defined in FEXCore (Arm64Emitter.cpp); both modules import it from ntdll at process init.
+extern "C" uint32_t IosTebTsdOffset;
+#endif
+
 static inline __TEB* GetCurrentTEB() {
+#ifdef FEX_IOS_HOST
+  // MADEIRA: NtCurrentTeb() is a read of x18, which the iOS host does not preserve: it reads 0 on
+  // some threads, and the WinAPI shims (TlsGetValue and friends) then fault on TEB->TlsSlots.
+  // Take the TEB Wine publishes in the thread's TSD slot, as IOSLoadTEB() and the JIT do, and fall
+  // back to x18 only while the offset is not imported yet or the slot is still empty.
+  if (const uint32_t Offset = ::IosTebTsdOffset) {
+    uintptr_t Tpidrro;
+    __asm__ volatile("mrs %0, TPIDRRO_EL0" : "=r"(Tpidrro));
+    if (auto* Teb = *reinterpret_cast<__TEB**>((Tpidrro & ~uintptr_t(7)) + Offset)) {
+      return Teb;
+    }
+  }
+#endif
   return reinterpret_cast<__TEB*>(NtCurrentTeb());
 }
 
