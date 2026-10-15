@@ -205,6 +205,13 @@ fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
 fextl::unique_ptr<Exception::ECSyscallHandler> SyscallHandler;
 fextl::unique_ptr<FEX::Windows::StatAlloc> StatAllocHandler;
 std::optional<FEX::Windows::InvalidationTracker> InvalidationTracker;
+/* iOS-Madeira: set by ProcessTerm when the process starts exiting
+ * (NtTerminateProcess(0)). The DLLs detached after this module still free
+ * and protect memory, and by then this module's own detach may have torn
+ * down CTX: a free notified at Rocket League's quit called through CTX's
+ * zeroed vtable. Code invalidation is pointless once the process is exiting,
+ * so the notifications below stop touching the tracker. */
+std::atomic<bool> ProcessTerminating {false};
 std::optional<FEX::Windows::CPUFeatures> CPUFeatures;
 std::optional<FEX::Windows::OvercommitTracker> OvercommitTracker;
 std::optional<FEX::Windows::ImageTracker> ImageTracker;
@@ -1255,7 +1262,11 @@ NTSTATUS ProcessInit() {
   return STATUS_SUCCESS;
 }
 
-void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {}
+void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
+  if (!After) {
+    ProcessTerminating.store(true, std::memory_order_relaxed);
+  }
+}
 
 class ScopedCallbackDisable {
 private:
@@ -1565,7 +1576,7 @@ NTSTATUS ResetToConsistentState(EXCEPTION_RECORD* Exception, CONTEXT* GuestConte
  * required for its correctness. Drop the BEFORE/AFTER mutex entirely
  * and just call into the tracker directly on AFTER. */
 void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL After, NTSTATUS Status) {
-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
     return;
   }
 
@@ -1578,7 +1589,7 @@ void NotifyMemoryAlloc(void* Address, SIZE_T Size, ULONG Type, ULONG Prot, BOOL 
 }
 
 void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NTSTATUS Status) {
-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
     return;
   }
 
@@ -1590,7 +1601,7 @@ void NotifyMemoryFree(void* Address, SIZE_T Size, ULONG FreeType, BOOL After, NT
 }
 
 void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, NTSTATUS Status) {
-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
     return;
   }
 
@@ -1633,7 +1644,7 @@ void NotifyMemoryProtect(void* Address, SIZE_T Size, ULONG NewProt, BOOL After, 
  * Idempotent: re-registering the same intervals is harmless, and the syscall path still
  * fires for the same module whenever its gate does let it through. */
 extern "C" void NotifyImageMap(void* Address) {
-  if (!InvalidationTracker || !Address) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !Address) {
     return;
   }
 
@@ -1667,7 +1678,7 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
    * (+0x1900733, +0x3b508f0), which is why CEF never finished initialising.
    *
    * Keep the tracker null-checks; only the thread-state requirement is wrong. */
-  if (!InvalidationTracker || !ImageTracker) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !ImageTracker) {
     /* ml190: do not drop it — replay once ProcessInit has built the trackers. */
     QueuePendingImageMap(reinterpret_cast<uint64_t>(Address));
     return STATUS_SUCCESS;
@@ -1716,7 +1727,7 @@ NTSTATUS NotifyMapViewOfSection(void* Unk1, void* Address, void* Unk2, SIZE_T Si
 }
 
 void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
     return;
   }
 
@@ -1732,7 +1743,7 @@ void NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status) {
 }
 
 void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
     return;
   }
 
@@ -1741,7 +1752,7 @@ void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
 }
 
 void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
     return;
   }
 
@@ -1750,7 +1761,7 @@ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
 }
 
 void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {
-  if (!InvalidationTracker || !GetCPUArea().ThreadState()) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
     return;
   }
 
@@ -1804,7 +1815,7 @@ void BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After
     return;
   }
 
-  if (!InvalidationTracker || !ThreadState) {
+  if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !ThreadState) {
     return;
   }
 
