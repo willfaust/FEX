@@ -87,6 +87,7 @@ private:
   FEXCore::Context::ContextImpl* CTX {};
   const FEXCore::IR::IRListView* IR {};
   uint64_t Entry {};
+  uint64_t IosRingEntryRIP {};   /* ml1205: block entry recorded by EmitEntryPoint */
   CPUBackend::CompiledCode CodeData {};
 
   fextl::vector<ARMEmitter::BiDirectionalLabel> JumpTargets;

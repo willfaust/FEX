@@ -288,6 +288,24 @@ public:
     return true;
   }
 
+  /* MADEIRA: whether the calling thread write-owns this mutex (the OwnerTeb stamp, see
+   * ios_lock_write_nested_aware), and the return addresses recorded when it took it. */
+  bool IosHeldExclusiveByThisThread() const {
+#if defined(_WIN32)
+    const uint64_t Teb = IosSelfTeb();
+    return Teb && OwnerTeb == Teb;
+#else
+    return false;
+#endif
+  }
+  const uint64_t* IosOwnerReturnAddresses() const {
+#if defined(_WIN32)
+    return OwnerRa;
+#else
+    return nullptr;
+#endif
+  }
+
   bool try_lock() {
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
 
@@ -400,6 +418,14 @@ private:
                       Which, static_cast<void*>(&Futex), Futex, !!(Futex & WRITE_OWNED_BIT), !!(Futex & READ_WAITER_BIT),
                       (Futex & WRITE_WAITER_COUNT_MASK) >> WRITE_WAITER_OFFSET, Futex & READ_OWNER_COUNT_MASK, Expected,
                       OwnerTeb, OwnerTid, OwnerDepth);
+    /* MADEIRA: where the owner took it and where this waiter is, as raw return addresses. The
+     * anchor is the address of a named function, so a module that runs from a copy can be lined
+     * up with its symbols offline. */
+    const uint64_t Here = reinterpret_cast<uint64_t>(&IosFrameReturnAddresses);
+    uint64_t Self[4] {};
+    IosFrameReturnAddresses(Self);
+    LogMan::Msg::EFmt("[fexlock]   owner-ra={:x} {:x} {:x} {:x} | waiter-ra={:x} {:x} {:x} {:x} | anchor={:x}", OwnerRa[0], OwnerRa[1],
+                      OwnerRa[2], OwnerRa[3], Self[0], Self[1], Self[2], Self[3], Here);
     /* ml413: a parked writer means live read holds are the blockers — name them.
      * ml414: dump from READ-wait reports too — ml414 died before any write
      * waiter reached its report and the ring never printed. Global cap keeps
@@ -557,6 +583,30 @@ private:
   /* ml442: count of shared grants the write owner holds nested inside its
    * write hold.  Touched only by the owning thread — plain stores suffice. */
   uint32_t OwnerSharedNest {};
+  /* MADEIRA: return addresses of the write owner's frames when it took the lock, so a stuck
+   * waiter can say which path holds it. */
+  uint64_t OwnerRa[4] {};
+
+  /* Walks the frame-record chain from the caller's frame. ARM64EC maps the guest's RBP to x29,
+   * so a host function called from JIT code saved a guest value as its parent frame: stop at
+   * any link that is not a little higher on the same stack instead of following it. */
+  static void IosFrameReturnAddresses(uint64_t (&Ra)[4]) {
+#ifdef ARCHITECTURE_arm64
+    uint64_t Fp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+    for (auto& R : Ra) {
+      if (!Fp || (Fp & 0xf)) {
+        break;
+      }
+      const auto* Record = reinterpret_cast<const uint64_t*>(Fp);
+      R = Record[1];
+      const uint64_t Next = Record[0];
+      if (Next <= Fp || Next - Fp > 0x10000) {
+        break;
+      }
+      Fp = Next;
+    }
+#endif
+  }
 
   void NoteWriteAcquired() {
     uint64_t Teb = 0;
@@ -566,6 +616,11 @@ private:
     OwnerTeb = Teb;
     OwnerTid = Teb ? *reinterpret_cast<uint32_t*>(Teb + 0x48) : 0;
     OwnerDepth++;
+    uint64_t Ra[4] {};
+    IosFrameReturnAddresses(Ra);
+    for (size_t i = 0; i < 4; i++) {
+      OwnerRa[i] = Ra[i];
+    }
   }
 
   void NoteWriteReleased() {

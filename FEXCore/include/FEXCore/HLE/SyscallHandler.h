@@ -63,6 +63,12 @@ public:
   virtual void MarkOvercommitRange(uint64_t Start, uint64_t Length) {}
   virtual void UnmarkOvercommitRange(uint64_t Start, uint64_t Length) {}
   virtual ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) = 0;
+  // MADEIRA: true when the frontend has stopped write-protecting the guest page holding Address because
+  // it is written too often (data sharing a page with code). Blocks touching such a page must validate
+  // their code before every instruction instead, as with SMCChecks=full.
+  virtual bool IsHotSMCCodePage(uint64_t Address) {
+    return false;
+  }
   virtual std::optional<ExecutableFileSectionInfo> LookupExecutableFileSection(Core::InternalThreadState* Thread, uint64_t GuestAddr) = 0;
 
   virtual void PreCompile() {}

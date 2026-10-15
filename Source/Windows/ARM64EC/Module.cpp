@@ -837,6 +837,17 @@ public:
     return Result;
   }
 
+  bool IsHotSMCCodePage(uint64_t Address) override {
+#ifdef FEX_IOS_HOST
+    // Code compiled from a pool-copy alias: the tracker knows the page by its PE address.
+    const uint64_t OrigAddr = IosJitReverseTranslate(Address);
+    if (OrigAddr != Address && InvalidationTracker->IsHotSMCPage(OrigAddr)) {
+      return true;
+    }
+#endif
+    return InvalidationTracker->IsHotSMCPage(Address);
+  }
+
   void PreCompile() override {
     ProcessPendingCrossProcessEmulatorWork();
   }
@@ -1200,6 +1211,16 @@ NTSTATUS ProcessInit() {
   }
 #endif
   InvalidationTracker.emplace(*CTX, Threads);
+  {
+    // MADEIRA: hot SMC pages (InvalidationTracker::EnableHotSMCPages). MADEIRA_SMC_HOT_PAGE: unset = 64 write
+    // faults within a second, 0 = off (every write to a code page invalidates it), N = threshold.
+    uint32_t HotThreshold = 64;
+    if (const char* Hot = getenv("MADEIRA_SMC_HOT_PAGE"); Hot && *Hot) {
+      HotThreshold = static_cast<uint32_t>(strtoul(Hot, nullptr, 0));
+    }
+    InvalidationTracker->EnableHotSMCPages(HotThreshold);
+    LogMan::Msg::EFmt("[smc-hot] hot SMC pages {} (threshold {} write faults per second)", HotThreshold ? "on" : "off", HotThreshold);
+  }
   ImageTracker.emplace(*CTX, false);
 
   auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
@@ -1326,7 +1347,8 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
     std::scoped_lock Lock(ThreadCreationMutex);
     static std::atomic<uint64_t> IosSmcHandled {0};
     bool IosSmcSay = true;
-    if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress)) {
+    bool SmcHotPage = false;
+    if (InvalidationTracker && InvalidationTracker->HandleRWXAccessViolation(Thread, NativeContext->Pc, FaultAddress, &SmcHotPage)) {
       {
         const uint64_t N = IosSmcHandled.fetch_add(1, std::memory_order_relaxed) + 1;
         IosSmcSay = N <= 40 || (N % 1000) == 0;
@@ -1334,12 +1356,20 @@ bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* E
         if (IosSmcSay && N > 40) LogMan::Msg::DFmt("[smc] ml1055 {} self-modifying writes handled so far (lines sampled 1 in 1000)", N);
       }
       FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
-      if (CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) && !CTX->IsCurrentBlockSingleInst(CPUArea.ThreadState()) &&
+      // MADEIRA: a hot page was not invalidated, and the blocks compiled from it check their own code, so
+      // its writes never need the inline single step.
+      if (!SmcHotPage && CTX->IsAddressInCodeBuffer(Thread, NativeContext->Pc) && !CTX->IsCurrentBlockSingleInst(CPUArea.ThreadState()) &&
           CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
         // If we are not patching ourself (single inst block case) and potentially patching the current block, this is inline SMC. Reconstruct the current context (before the SMC write) then single step the write to reduce it to regular SMC.
         Exception::ReconstructThreadState(Thread, *NativeContext);
-        LogMan::Msg::DFmt("Handled inline self-modifying code: pc: {:X} rip: {:X} fault: {:X}", NativeContext->Pc,
-                          Thread->CurrentFrame->State.rip, FaultAddress);
+        // MADEIRA: one line per fault flooded the log (a data write next to its code faults thousands of
+        // times a second); keep the first 16, then 1 in 4096.
+        static std::atomic<uint64_t> InlineSmcCount {0};
+        const uint64_t InlineN = InlineSmcCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (InlineN <= 16 || (InlineN % 4096) == 0) {
+          LogMan::Msg::DFmt("Handled inline self-modifying code #{}: pc: {:X} rip: {:X} fault: {:X}", InlineN, NativeContext->Pc,
+                            Thread->CurrentFrame->State.rip, FaultAddress);
+        }
         NativeContext->Pc = CPUArea.DispatcherLoopTopEnterECFillSRA();
         NativeContext->Sp = CPUArea.EmulatorStackBase();
         NativeContext->X11 = 1;                                        // Set ENTRY_FILL_SRA_SINGLE_INST_REG to force a single step
@@ -2004,6 +2034,10 @@ NTSTATUS ThreadInit() {
 #ifdef FEX_IOS_HOST
   IosTiLog("[FEX-iOS] TI:createthread\n");
 #endif
+  if (Thread->CurrentFrame->IosBlockRing) {
+    /* ml1205: TEB+0x1710 (ActivityId, unused by Wine) names this thread's block ring for ntdll's reporters. */
+    *reinterpret_cast<uint64_t**>(reinterpret_cast<uintptr_t>(IOSLoadTEB()) + 0x1710) = Thread->CurrentFrame->IosBlockRing;
+  }
 
   // Default segment setup.
   auto Frame = Thread->CurrentFrame;
