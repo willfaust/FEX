@@ -15,6 +15,10 @@
 #include <cstdint>
 #include <cstdlib>
 
+#if defined(FEX_IOS_HOST) && !defined(__APPLE__)
+extern "C" long NtFlushInstructionCache(void* Handle, const void* Addr, unsigned long long Size);
+#endif
+
 namespace FEXCore::ArchHelpers::Arm64 {
 constexpr uint32_t CASPAL_MASK = 0xBF'E0'FC'00;
 constexpr uint32_t CASPAL_INST = 0x08'60'FC'00;
@@ -121,8 +125,14 @@ static constexpr uint32_t GetRmReg(uint32_t Instr) {
   return (Instr >> RM_OFFSET) & REGISTER_MASK;
 }
 
+/* Backpatches can race another thread executing the same code block. On iOS,
+ * use the same kernel-coordinated RX-view flush as JIT.cpp after RW stores. */
 static void ClearICache(void* Begin, std::size_t Length) {
+#if defined(FEX_IOS_HOST) && !defined(__APPLE__)
+  NtFlushInstructionCache(reinterpret_cast<void*>(~0ull), Begin, Length);
+#else
   __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
+#endif
 }
 
 static __uint128_t LoadAcquire128(uint64_t Addr) {
@@ -2322,20 +2332,16 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.
   // iOS-Madeira ml472 (#80): the lock word carries no owner and lives in the
-  // code buffer; the holder's backpatch stores fault through the Mach RX-alias
-  // emulator, so a holder that dies or is unwound there orphans the lock and
-  // every later unaligned-atomic thread WFE-spun here forever (ml470/ml471
-  // post-BrowserReady livelocks). Bounded acquire that stamps the holder's
-  // thread identity into the word (waiters only ever test zero/nonzero); on
-  // timeout, emulate this one access with the same helpers the !IsJIT path
-  // uses and leave the code unpatched.
-#if defined(FEX_IOS_HOST) && !defined(ARCHITECTURE_arm64ec)
-  /* The backpatch lock lives in the code buffer, which is execute-only on iOS: JITCodeTail is
-   * emitted after each block, so &SpinLockFutex is in the dual-mapped pool's RX view. The
-   * LDAXR/STLXR acquire below would take a permission fault on the store, inside this handler.
-   * Take the WHOLE lock through the writable alias (both views map the same physical page, so the
-   * exclusive pair is a genuine atomic, and every participant uses this one address). Scoped to
-   * the WOW64 module; the ARM64EC module is unchanged. */
+  // code buffer. A faulting backpatch store could previously orphan the lock
+  // and leave later unaligned-atomic threads WFE-spinning forever (ml470/ml471
+  // post-BrowserReady livelocks). Retain a bounded acquire with a holder stamp
+  // (waiters only test zero/nonzero); on timeout, emulate this one access with
+  // the same helpers the !IsJIT path uses and leave the code unpatched.
+#ifdef FEX_IOS_HOST
+  /* Both iOS FEX modules put JITCodeTail in the pool's RX view and initialize
+   * WriteOffset before JIT startup. Acquire, wait on, and release this lock
+   * through the same RW alias so hardware atomics keep their exclusive-store
+   * semantics without faulting inside the exception handler. */
   uint32_t* BPFutex = FEXCore::DualMap::WriteAddr(&InlineTail->SpinLockFutex);
 #else
   uint32_t* BPFutex = &InlineTail->SpinLockFutex;
@@ -2390,7 +2396,29 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     LogMan::Msg::EFmt("Unhandled JIT SIGBUS under bp-lock timeout: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
     return std::nullopt;
   }
+#ifdef FEX_IOS_HOST
+  /* Construct before the lock guard so this trace runs only after a successful
+   * acquire and after the guard has released the lock on every return path.
+   * If the logger allocates, it cannot leave the backpatch lock held. */
+  struct BPLockAliasTrace {
+    uintptr_t RX;
+    uintptr_t RW;
+    ~BPLockAliasTrace() {
+      static std::atomic<uint32_t> Logs {};
+      if (Logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+        LogMan::Msg::EFmt("[bp-lock-alias] rx={:#x} rw={:#x} offset={:#x}", RX, RW, FEXCore::DualMap::WriteOffset);
+      }
+    }
+  } AliasTrace {reinterpret_cast<uintptr_t>(&InlineTail->SpinLockFutex), reinterpret_cast<uintptr_t>(BPFutex)};
+#endif
   FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(BPFutex, FEXCore::Utils::SpinWaitLock::adopt_lock);
+#ifdef FEX_IOS_HOST
+  /* The PC remains the executable address for decoding, retry, and cache
+   * invalidation. Only the patch stores use the pool's writable view. */
+  uint32_t* PCWrite = FEXCore::DualMap::WriteAddr(PC);
+#else
+  uint32_t* PCWrite = PC;
+#endif
 
   if ((Instr & LDAXR_MASK) == LDAR_INST ||  // LDAR*
       (Instr & LDAXR_MASK) == LDAPR_INST) { // LDAPR*
@@ -2400,9 +2428,9 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     LDR |= DataReg;
     if (HandleType != UnalignedHandlerType::NonAtomic) {
       // Ordering matters with cross-thread visibility!
-      std::atomic_ref<uint32_t>(PC[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
+      std::atomic_ref<uint32_t>(PCWrite[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
     }
-    std::atomic_ref<uint32_t>(PC[0]).store(LDR, std::memory_order_release);
+    std::atomic_ref<uint32_t>(PCWrite[0]).store(LDR, std::memory_order_release);
     ClearICache(&PC[0], 8);
     // With the instruction modified, now execute again.
     return 0;
@@ -2412,9 +2440,9 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     STR |= AddrReg << 5;
     STR |= DataReg;
     if (HandleType != UnalignedHandlerType::NonAtomic) {
-      std::atomic_ref<uint32_t>(PC[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
+      std::atomic_ref<uint32_t>(PCWrite[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
     }
-    std::atomic_ref<uint32_t>(PC[0]).store(STR, std::memory_order_release);
+    std::atomic_ref<uint32_t>(PCWrite[0]).store(STR, std::memory_order_release);
     ClearICache(&PC[-1], 8);
     // Back up one instruction and have another go
     return -4;
@@ -2427,9 +2455,9 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     LDUR |= Instr & (0b1'1111'1111 << 12);
     if (HandleType != UnalignedHandlerType::NonAtomic) {
       // Ordering matters with cross-thread visibility!
-      std::atomic_ref<uint32_t>(PC[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
+      std::atomic_ref<uint32_t>(PCWrite[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
     }
-    std::atomic_ref<uint32_t>(PC[0]).store(LDUR, std::memory_order_release);
+    std::atomic_ref<uint32_t>(PCWrite[0]).store(LDUR, std::memory_order_release);
     ClearICache(&PC[0], 8);
     // With the instruction modified, now execute again.
     return 0;
@@ -2440,9 +2468,9 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     STUR |= DataReg;
     STUR |= Instr & (0b1'1111'1111 << 12);
     if (HandleType != UnalignedHandlerType::NonAtomic) {
-      std::atomic_ref<uint32_t>(PC[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
+      std::atomic_ref<uint32_t>(PCWrite[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
     }
-    std::atomic_ref<uint32_t>(PC[0]).store(STUR, std::memory_order_release);
+    std::atomic_ref<uint32_t>(PCWrite[0]).store(STUR, std::memory_order_release);
 
     ClearICache(&PC[-1], 8);
     // Back up one instruction and have another go
