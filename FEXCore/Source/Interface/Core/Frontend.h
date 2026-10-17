@@ -98,6 +98,7 @@ private:
 
   void BranchTargetInMultiblockRange();
   bool IsBranchMonoTailcall(uint64_t NumInstructions) const;
+  bool IsBranchToSelf() const;
   bool InstCanContinue() const;
 
   void AddBranchTarget(uint64_t Target);
