@@ -15,6 +15,7 @@ $end_info$
 #endif
 #include "Interface/Core/ArchHelpers/Arm64Emitter.h"
 #include "Interface/Core/LookupCache.h"
+#include <FEXCore/Utils/HotSMCPages.h>
 #include "Interface/Core/CPUBackend.h"
 #include "Interface/Core/CPUID.h"
 #include "Interface/Core/Frontend.h"
@@ -927,6 +928,12 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
     const auto GPRSize = Thread->OpDispatcher->GetGPROpSize();
 
+    // Hot SMC pages: instructions on a hot page (v1) or overlapping a hot write window (v2) get the
+    // SMCChecks=full byte check (see HotSMCPages.h).
+    // The hot list only grows under the exclusive CodeInvalidationMutex, which this compile holds shared.
+    const bool HotSMCActive = FEXCore::HotSMC::AnyHot();
+    bool HotSMCBlockCounted = false;
+
 #ifdef ZYDIS_DISASSEMBLER
     const auto ZydisMachineMode = Config.Is64BitMode ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LEGACY_32;
     if (FEXCore::Config::Get_X86DISASSEMBLE()) {
@@ -1015,7 +1022,18 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
+        bool HotSMCCheck = false;
+        if (HotSMCActive && Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL && !Block.ForceFullSMCDetection &&
+            FEXCore::HotSMC::InstructionNeedsCheck(InstAddress, InstAddress + DecodedInfo->InstSize)) {
+          HotSMCCheck = true;
+          FEXCore::HotSMC::g_State.EntryChecksCompiled.fetch_add(1, std::memory_order_relaxed);
+          if (!HotSMCBlockCounted) {
+            HotSMCBlockCounted = true;
+            FEXCore::HotSMC::g_State.BlocksValidated.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCCheck) {
           // Guest window: snapshotting the guest's code bytes is a guest read. The address handed to
           // _ValidateCode below stays guest; DEF_OP(ValidateCode) applies the window itself.
           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(GetGuestBase() + Block.Entry + BlockInstructionsLength);
@@ -2125,6 +2143,9 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * published normally on the next synchronous miss.  CompileSingleStep
    * proves the dispatcher happily consumes an unpublished pointer. */
   const bool IosUnpublished = FEXCore::Utils::WritePriorityMutex::IosEmissionLocksHeldBySelf();
+  if (!IosUnpublished) {
+    FEXCore::HotSMC::Periodic(); // Hot SMC pages: periodic line, before any compile lock is taken
+  }
   std::shared_lock<std::remove_reference_t<decltype(CodeInvalidationMutex)>> lk;
   if (IosUnpublished) {
     static std::atomic<int> UnpubLogCount {0};
@@ -2346,7 +2367,12 @@ void ContextImpl::InvalidateThreadCachedCodeRange(FEXCore::Core::InternalThreadS
 }
 
 void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  if (FEXCore::HotSMC::IsEnabled()) {
+    // Hot SMC pages: a compiled byte check failed (hot page, or a Mono/SMCChecks=full block).
+    FEXCore::HotSMC::g_State.EntryMismatches.fetch_add(1, std::memory_order_relaxed);
+  }
   static_cast<ContextImpl*>(Frame->Thread->CTX)->SyscallHandler->InvalidateGuestCodeRange(Frame->Thread, GuestRIP, 1);
+  FEXCore::HotSMC::Periodic(); // no FEX lock held here
 }
 
 std::optional<CustomIRResult>

@@ -3,6 +3,8 @@
 
 #include <FEXCore/Utils/IntervalList.h>
 #include <FEXCore/HLE/SyscallHandler.h>
+#include <FEXCore/Utils/HotSMCPages.h> // HotSMC::MaxWindows
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -81,6 +83,24 @@ private:
   // NOTE: If ForWriteLocked is true then this assumes CodeInvalidationMutex is locked by the caller,
   // and any code in the range will be invalidated before protection as RWX, otherwise protects as RX if false.
   bool ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked);
+  // The unfiltered body of ProtectRWXIntervalsInternal (which skips hot pages when trapping).
+  bool ProtectRWXIntervalsRange(uint64_t Address, uint64_t Size, bool ForWriteLocked);
+
+  // Hot SMC pages: counts an RWX write trap on Page and marks the page hot past the threshold.
+  // NOTE: CodeInvalidationMutex must be held exclusively. MarkedTraps is set non-zero when it marked.
+  // v2: also records FaultAddress's window; returns true for a fast trap (known window on a hot page).
+  bool CountTrapLocked(uint64_t Page, uint64_t FaultAddress, uint64_t& MarkedTraps, uint64_t& MarkedTicks);
+  // v2: periodic re-arm of all hot pages (HotSMC::MaybeAudit). No lock needed.
+  void AuditHotPages();
+  struct HotTrapCount {
+    uint64_t Page {0};
+    uint64_t First {0};
+    uint32_t Count {0};
+    uint32_t NumWindows {0}; // v2
+    bool Wide {false};       // v2: more than MaxWindows distinct write blocks
+    uint64_t Windows[FEXCore::HotSMC::MaxWindows] {};
+  };
+  std::array<HotTrapCount, 128> HotTrapCounts {}; // Protected by CodeInvalidationMutex
 
   // Returns the correct protection for trapping (removing write) or untrapping (restoring write) an RWX interval.
   // For DEP-promoted regions (originally non-exec), uses PAGE_READONLY/PAGE_READWRITE instead of PAGE_EXECUTE_READ/PAGE_EXECUTE_READWRITE.

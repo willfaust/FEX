@@ -10,6 +10,7 @@
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Debug/InternalThreadState.h>
 #include "InvalidationTracker.h"
+#include <FEXCore/Utils/HotSMCPages.h>
 #include <windef.h>
 #include <winternl.h>
 
@@ -58,6 +59,44 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
 #endif
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
   SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+
+#if defined(ARCHITECTURE_arm64ec)
+  /* Hot SMC pages (HotSMCPages.h). Read once here; the liveness line is unconditional so a run
+   * shows whether the switch arrived. Only the ARM64EC module: its guest and host addresses are the same,
+   * which the hot list relies on (FaultAddress pages here, guest RIP pages in the compiler). */
+  {
+    auto EnvU64 = [](const char* Name, uint64_t Default) -> uint64_t {
+      const char* V = getenv(Name);
+      return (V && *V) ? strtoull(V, nullptr, 0) : Default;
+    };
+    const char* On = getenv("FEX_HOT_SMC_PAGES");
+    const uint32_t Mode = (On && (On[0] == '1' || On[0] == '2') && !On[1]) ? static_cast<uint32_t>(On[0] - '0') : 0;
+    const bool Enable = Mode && !SMCDetectionDisabled && SMCChecks != FEXCore::Config::CONFIG_SMC_FULL;
+    auto& HS = FEXCore::HotSMC::g_State;
+    HS.Mode = Enable ? Mode : 0;
+    // v2 only: minimum duration of the Threshold traps (filters one-shot decrypt bursts) and the audit period.
+    const uint64_t MinSpanMs = EnvU64("FEX_HOT_SMC_MIN_SPAN_MS", 50);
+    const uint64_t AuditMs = EnvU64("FEX_HOT_SMC_AUDIT_MS", 1000);
+    const uint64_t Threshold = EnvU64("FEX_HOT_SMC_THRESHOLD", 8);
+    const uint64_t WindowMs = EnvU64("FEX_HOT_SMC_WINDOW_MS", 2000);
+    const uint64_t ReportMs = EnvU64("FEX_HOT_SMC_REPORT_MS", 5000);
+    const uint64_t Freq = FEXCore::HotSMC::TickFrequency();
+    HS.Threshold = static_cast<uint32_t>(std::max<uint64_t>(1, std::min<uint64_t>(Threshold, 1u << 20)));
+    HS.WindowTicks = Freq ? WindowMs * Freq / 1000 : 0;
+    HS.ReportTicks = Freq ? ReportMs * Freq / 1000 : 0;
+    HS.MinSpanTicks = Freq ? MinSpanMs * Freq / 1000 : 0;
+    HS.AuditTicks = Freq ? AuditMs * Freq / 1000 : 0;
+    HS.LastReport.store(FEXCore::HotSMC::Ticks(), std::memory_order_relaxed);
+    HS.LastAudit.store(FEXCore::HotSMC::Ticks(), std::memory_order_relaxed);
+    HS.AuditCtx = this;
+    HS.AuditFn = [](void* Ctx) { static_cast<InvalidationTracker*>(Ctx)->AuditHotPages(); };
+    HS.Enabled.store(Enable, std::memory_order_release);
+    LogMan::Msg::EFmt("[hot-smc] hot SMC pages v{} enabled={} (FEX_HOT_SMC_PAGES={}) threshold={} window_ms={} report_ms={} "
+                      "max_pages={} tick_hz={} | v2: min_span_ms={} audit_ms={} max_windows={} window_bytes={}",
+                      Mode ? Mode : 1, Enable ? 1 : 0, On ? On : "unset", HS.Threshold, WindowMs, ReportMs, FEXCore::HotSMC::MaxPages, Freq,
+                      MinSpanMs, AuditMs, FEXCore::HotSMC::MaxWindows, FEXCore::HotSMC::WindowSize);
+  }
+#endif
 
   MEMORY_BASIC_INFORMATION Info;
   uint64_t Address = 0;
@@ -519,11 +558,24 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
   }(FaultAddress);
 
   if (NeedsInvalidate) {
+    uint64_t HotMarkedTraps = 0, HotMarkedTicks = 0;
+    bool HotFast = false;
     // IntervalsLock cannot be held during invalidation
     {
       std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
 
-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      /* Hot SMC pages: count the trap and, past the threshold, mark the page hot BEFORE the
+       * invalidation below, under the same exclusive lock: every block compiled from this page from
+       * now on carries the byte checks, and the ones compiled before are dropped right here. */
+      if (FEXCore::HotSMC::IsEnabled()) {
+        HotFast = CountTrapLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FaultAddress, HotMarkedTraps, HotMarkedTicks);
+      }
+
+      // v2 fast trap: the write hit a known window of a hot page. Every instruction overlapping that window
+      // was compiled with a byte check, so nothing has to be dropped; only the un-protect below remains.
+      if (!HotFast) {
+        InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      }
 
       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
       ULONG TmpProt;
@@ -531,6 +583,13 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
       SIZE_T TmpSize = 1;
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
     }
+    if (HotMarkedTraps) {
+      const uint64_t Freq = FEXCore::HotSMC::TickFrequency();
+      LogMan::Msg::EFmt("[hot-smc] page {:#x} marked hot (#{}) after {} traps in {} ms, write at {:#x}",
+                        FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::HotSMC::g_State.PagesMarkedHot.load(std::memory_order_relaxed),
+                        HotMarkedTraps, Freq ? HotMarkedTicks * 1000 / Freq : 0, FaultAddress);
+    }
+    FEXCore::HotSMC::Periodic();
     DetectMonoBackpatcherBlock(Thread, HostPc);
     return true;
   }
@@ -831,7 +890,121 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
 #endif
 }
 
+bool InvalidationTracker::CountTrapLocked(uint64_t Page, uint64_t FaultAddress, uint64_t& MarkedTraps, uint64_t& MarkedTicks) {
+  // NOTE: CodeInvalidationMutex must be held exclusively (it also guards HotTrapCounts).
+  // Returns true for a v2 fast trap (the caller skips the invalidation).
+  auto& HS = FEXCore::HotSMC::g_State;
+  const bool V2 = FEXCore::HotSMC::IsV2();
+  HS.TrapsSeen.fetch_add(1, std::memory_order_relaxed);
+  if (const int Slot = FEXCore::HotSMC::FindSlot(Page); Slot >= 0) {
+    if (!V2) {
+      return false; // v1, already hot: the guest (or a race with a compile) re-protected it; handled as a normal trap
+    }
+    if (FEXCore::HotSMC::WindowKnown(Slot, FaultAddress)) {
+      HS.FastTraps.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    // Unknown address on a hot page: learn it, and let the caller invalidate the page so that every block
+    // overlapping the new window is recompiled with its check.
+    if (FEXCore::HotSMC::AddWindowLocked(Slot, FaultAddress)) {
+      HS.NewWindowTraps.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      HS.WindowOverflow.fetch_add(1, std::memory_order_relaxed);
+    }
+    return false;
+  }
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  {
+    // A sub-floor image has two names per byte (ml1207) and writes through the low one never trap,
+    // so the trap is the only thing guarding the other name: never stop trapping such a page.
+    uint64_t Low, Real, WinSize;
+    for (int i = 0; IosSubfloorEnum(i, &Low, &Real, &WinSize); i++) {
+      if (WinSize && ((Page >= Low && Page - Low < WinSize) || (Real && Page >= Real && Page - Real < WinSize))) {
+        return false;
+      }
+    }
+  }
+#endif
+  const uint64_t Now = FEXCore::HotSMC::Ticks();
+  auto& E = HotTrapCounts[(Page >> FEXCore::Utils::FEX_PAGE_SHIFT) % HotTrapCounts.size()];
+  if (E.Page != Page || (HS.WindowTicks && Now - E.First > HS.WindowTicks)) {
+    E.Page = Page;
+    E.First = Now;
+    E.Count = 0;
+    E.NumWindows = 0;
+    E.Wide = false;
+  }
+  if (V2 && !E.Wide) {
+    const uint64_t Base = FEXCore::HotSMC::WindowBase(FaultAddress);
+    bool Known = false;
+    for (uint32_t w = 0; w < E.NumWindows; ++w) {
+      Known |= E.Windows[w] == Base;
+    }
+    if (!Known) {
+      if (E.NumWindows < FEXCore::HotSMC::MaxWindows) {
+        E.Windows[E.NumWindows++] = Base;
+      } else {
+        E.Wide = true;
+      }
+    }
+  }
+  if (++E.Count < HS.Threshold) {
+    return false;
+  }
+  if (V2 && E.Wide) {
+    HS.RefusedWide.fetch_add(1, std::memory_order_relaxed);
+  } else if (V2 && Now - E.First < HS.MinSpanTicks) {
+    HS.RefusedBurst.fetch_add(1, std::memory_order_relaxed);
+  } else if (FEXCore::HotSMC::MarkHotLocked(Page, V2 ? E.Windows : nullptr, V2 ? E.NumWindows : 0)) {
+    MarkedTraps = E.Count;
+    MarkedTicks = Now - E.First;
+  }
+  E.Page = 0;
+  E.Count = 0;
+  E.NumWindows = 0;
+  E.Wide = false;
+  return false;
+}
+
+void InvalidationTracker::AuditHotPages() {
+  // v2: re-arm the write trap on every hot page. Only ever adds traps, so no CodeInvalidationMutex.
+  const uint32_t N = FEXCore::HotSMC::g_State.Count.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < N; ++i) {
+    const uint64_t Page = FEXCore::HotSMC::g_State.Pages[i].load(std::memory_order_relaxed);
+    ProtectRWXIntervalsRange(Page, FEXCore::Utils::FEX_PAGE_SIZE, false);
+  }
+}
+
 bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
+  /* Hot SMC pages: never re-arm the write trap on a hot page. Its code is validated by the
+   * compiled byte checks instead, and the guest keeps the writable protection it set. Only the
+   * trapping direction is filtered; making a range writable (BeginUntrackedWriteLocked) still
+   * invalidates it as before. */
+  // v2 keeps the stock re-arm: its hot pages stay trapped and known-window traps are cheap (no invalidation).
+  if (!ForWriteLocked && FEXCore::HotSMC::AnyHot() && !FEXCore::HotSMC::IsV2()) {
+    const uint64_t End = Address + Size;
+    bool Hit = false;
+    uint64_t RunStart = Address;
+    for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK; Page < End; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+      if (!FEXCore::HotSMC::IsHotPage(Page)) {
+        continue;
+      }
+      const uint64_t HotStart = std::max(Page, Address);
+      if (RunStart < HotStart) {
+        Hit |= ProtectRWXIntervalsRange(RunStart, HotStart - RunStart, false);
+      }
+      FEXCore::HotSMC::g_State.TrapsAvoided.fetch_add(1, std::memory_order_relaxed);
+      RunStart = std::min(End, Page + FEXCore::Utils::FEX_PAGE_SIZE);
+    }
+    if (RunStart < End) {
+      Hit |= ProtectRWXIntervalsRange(RunStart, End - RunStart, false);
+    }
+    return Hit;
+  }
+  return ProtectRWXIntervalsRange(Address, Size, ForWriteLocked);
+}
+
+bool InvalidationTracker::ProtectRWXIntervalsRange(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
   const auto End = Address + Size;
   std::shared_lock Lock(IntervalsLock);
 
