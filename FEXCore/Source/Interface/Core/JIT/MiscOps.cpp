@@ -241,8 +241,11 @@ DEF_OP(ProcessorID) {
   }
 #ifdef _WIN32
   else {
-    // If on Windows and TPIDRRO isn't supported (like in wine), then this is a programming error.
-    ERROR_AND_DIE_FMT("Unsupported");
+    // madeira-processorid-wine: no CPU index is readable from EL0 under wine. Dying here is a
+    // translation-time failure that takes down any block merely containing RDTSCP/RDPID
+    // (Go's runtime.cputicks does), so report CPU 0 instead.
+    LoadConstant(ARMEmitter::Size::i32Bit, GetReg(Node), 0);
+    return;
   }
 #else
   // We always need to spill x8 since we can't know if it is live at this SSA location
