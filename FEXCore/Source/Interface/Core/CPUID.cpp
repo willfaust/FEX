@@ -21,6 +21,7 @@ $end_info$
 
 #include "git_version.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace FEXCore {
@@ -661,7 +662,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
     // This is due to LRCPC performance on Cortex being abysmal.
     // Only enable EnhancedREPMOVS if atomic memcpy tso emulation isn't enabled.
     const uint32_t SupportsEnhancedREPMOVS = CTX->IsMemcpyAtomicTSOEnabled() == false;
-    const uint32_t SupportsVPCLMULQDQ = CTX->HostFeatures.SupportsPMULL_128Bit && SupportsAVX();
+    const uint32_t SupportsVPCLMULQDQ = CTX->HostFeatures.SupportsPMULL_128Bit && SupportsAVX2();   // iOS-Madeira: 256-bit, hidden with AVX2
     const uint32_t SupportsWFXT = CTX->HostFeatures.SupportsWFXT;
 
     // Number of subfunctions
@@ -671,7 +672,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
               (0 << 2) |                               // SGX
               (SupportsAVX() << 3) |                   // BMI1
               (0 << 4) |                               // Intel Hardware Lock Elison
-              (SupportsAVX() << 5) |                   // AVX2 support
+              (SupportsAVX2() << 5) |                  // AVX2 support (iOS-Madeira: MADEIRA_FEX_AVX=2 hides it)
               (1 << 6) |                               // FPU data pointer updated only on exception
               (1 << 7) |                               // SMEP support
               (SupportsAVX() << 8) |                   // BMI2
@@ -708,7 +709,7 @@ FEXCore::CPUID::FunctionResults CPUIDEmu::Function_07h(uint32_t Leaf) const {
               (0 << 6) |                                // AVX512-VBMI2
               (0 << 7) |                                // CET shadow stack
               (0 << 8) |                                // GFNI
-              (CTX->HostFeatures.SupportsAES256 << 9) | // VAES
+              ((CTX->HostFeatures.SupportsAES256 && !HideAVX2) << 9) | // VAES (iOS-Madeira: hidden with AVX2)
               (SupportsVPCLMULQDQ << 10) |              // VPCLMULQDQ
               (0 << 11) |                               // AVX512-VNNI
               (0 << 12) |                               // AVX512-BITALG
@@ -1360,6 +1361,12 @@ CPUIDEmu::CPUIDEmu(const FEXCore::Context::ContextImpl* ctx)
   SetupHostHybridFlag();
 
   SetupFeatures();
+
+  // iOS-Madeira: MADEIRA_FEX_AVX=2, AVX without AVX2 (see HideAVX2 in CPUID.h). Exactly "2"; "1" and unset are unchanged.
+  if (const char* Avx = getenv("MADEIRA_FEX_AVX"); Avx && Avx[0] == '2' && Avx[1] == '\0' && SupportsAVX()) {
+    HideAVX2 = true;
+    LogMan::Msg::IFmt("[fex-avx] MADEIRA_FEX_AVX=2: CPUID reports AVX, not AVX2 (VAES and VPCLMULQDQ hidden too)");
+  }
 
 #ifdef ARCHITECTURE_arm64
   if (SupportsCPUIndexInTPIDRRO) {

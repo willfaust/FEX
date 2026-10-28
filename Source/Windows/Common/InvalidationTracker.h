@@ -52,7 +52,16 @@ public:
   InvalidateContainingSectionResult InvalidateContainingSection(uint64_t Address, bool Free);
   void InvalidateAlignedInterval(uint64_t Address, uint64_t Size, bool Free);
   void ReprotectRWXIntervals(uint64_t Address, uint64_t Size);
-  bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress);
+  // MADEIRA: if HotPage is given, it is set when the fault hit an already hot page (see EnableHotSMCPages),
+  // which is unprotected again but not invalidated.
+  bool HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPC, uint64_t FaultAddress, bool* HotPage = nullptr);
+
+  // MADEIRA: hot SMC pages. A page taking Threshold write faults within a second (data sharing a page
+  // with code, e.g. a counter next to the function updating it) becomes hot: its code is invalidated once
+  // more, after which it is never write-protected again, and FEXCore compiles blocks touching it with
+  // per-instruction code validation (SyscallHandler::IsHotSMCCodePage). Off until enabled; 0 disables.
+  void EnableHotSMCPages(uint32_t Threshold);
+  bool IsHotSMCPage(uint64_t Address) const;
 
   // Unprotects any RWX intervals in the input interval and invalidates code
   // NOTE: CodeInvalidationMutex must be locked when calling this, and if true is returned, kept locked until the write ends.
@@ -143,5 +152,30 @@ private:
   bool MonoBackpatcherDetectionPending {false};
   uint64_t MonoBase {0};
   uint64_t MonoEnd {0};
+
+  // MADEIRA: hot SMC pages. Fixed-size tables, so nothing allocates under HotPagesLock (an allocation
+  // can come back through the memory notifications, which take IntervalsLock and then HotPagesLock).
+  // Lock order: IntervalsLock, then HotPagesLock; CodeInvalidationMutex is never taken under it.
+  // HotPages is read without the lock: a slot holds a page address or 0.
+  // Returns true when this fault made the page hot. NOTE: HotPagesLock must not be held.
+  bool CountSMCWriteFault(uint64_t Page);
+  // Forgets hot pages in [Begin, End) when their memory is freed.
+  void ForgetHotSMCPages(uint64_t Begin, uint64_t End);
+
+  // MADEIRA: locks CodeInvalidationMutex exclusively unless this thread already write-owns it.
+  // Returns whether it locked; the caller unlocks only then.
+  bool LockCodeInvalidationUnlessHeld(const char* Path, uint64_t Address);
+  static constexpr size_t HotFaultSlots = 64;
+  static constexpr size_t MaxHotPages = 64;
+  struct HotFaultSlot {
+    uint64_t Page;
+    uint64_t WindowStart; // CNTVCT_EL0 ticks
+    uint32_t Count;
+  };
+  uint32_t HotPageThreshold {0}; // 0: hot pages disabled
+  std::mutex HotPagesLock;
+  HotFaultSlot HotFaults[HotFaultSlots] {}; // Protected by HotPagesLock
+  std::atomic<uint64_t> HotPages[MaxHotPages] {};
+  std::atomic<uint32_t> HotPagesUsed {0}; // Slots of HotPages in use (high-water mark)
 };
 } // namespace FEX::Windows

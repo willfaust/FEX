@@ -466,6 +466,7 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
                       SectionBase, SectionBase + SectionSize);
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
+    ForgetHotSMCPages(SectionBase, SectionBase + SectionSize);
   }
 
   return {SectionBase, SectionSize};
@@ -502,6 +503,7 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
     }
     XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
     RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
+    ForgetHotSMCPages(AlignedBase, AlignedBase + AlignedSize);
   }
 }
 
@@ -509,7 +511,8 @@ void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size)
   ProtectRWXIntervalsInternal(Address, Size, false);
 }
 
-bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress) {
+bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress,
+                                                   bool* HotPage) {
   const auto [NeedsInvalidate, UntrapProt] = [&](uint64_t Address) -> std::pair<bool, ULONG> {
     std::shared_lock Lock(IntervalsLock);
     if (!RWXIntervals.Query(Address).Enclosed) {
@@ -518,10 +521,33 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
     return {true, GetUntrapProt(Address)};
   }(FaultAddress);
 
+  if (NeedsInvalidate && IsHotSMCPage(FaultAddress)) {
+    // MADEIRA: blocks from a hot page check their own code, so a write there only needs the page
+    // writable again (a write the host cannot complete on its own still arrives here).
+    ULONG TmpProt;
+    void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
+    SIZE_T TmpSize = 1;
+    NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+    if (HotPage) {
+      *HotPage = true;
+    }
+    return true;
+  }
+
   if (NeedsInvalidate) {
+    // MADEIRA: a page that turns hot here is invalidated below as usual, once: from then on nothing
+    // compiled from it relies on the write trap.
+    if (CountSMCWriteFault(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK)) {
+      static std::atomic<uint32_t> HotLogCount {0};
+      if (HotLogCount.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LogMan::Msg::EFmt("[smc-hot] page {:#x} took {} write faults within a second: no longer write-protected, its blocks "
+                          "validate their code per instruction (MADEIRA_SMC_HOT_PAGE=0 disables)",
+                          FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, HotPageThreshold);
+      }
+    }
     // IntervalsLock cannot be held during invalidation
     {
-      std::scoped_lock Lock(CTX.GetCodeInvalidationMutex());
+      const bool Locked = LockCodeInvalidationUnlessHeld("write-fault", FaultAddress);
 
       InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
 
@@ -530,6 +556,9 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
       void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
       SIZE_T TmpSize = 1;
       NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+      if (Locked) {
+        CTX.GetCodeInvalidationMutex().unlock();
+      }
     }
     DetectMonoBackpatcherBlock(Thread, HostPc);
     return true;
@@ -539,6 +568,75 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
 
 bool InvalidationTracker::BeginUntrackedWriteLocked(uint64_t Address, uint64_t Size) {
   return ProtectRWXIntervalsInternal(Address, Size, true);
+}
+
+void InvalidationTracker::EnableHotSMCPages(uint32_t Threshold) {
+  std::scoped_lock Lock(HotPagesLock);
+  HotPageThreshold = Threshold;
+}
+
+bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
+  const auto Used = HotPagesUsed.load(std::memory_order_acquire);
+  if (!Used) {
+    return false;
+  }
+  const auto Page = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  for (uint32_t i = 0; i < Used; ++i) {
+    if (HotPages[i].load(std::memory_order_acquire) == Page) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool InvalidationTracker::CountSMCWriteFault(uint64_t Page) {
+  uint64_t Now, Frequency;
+  __asm volatile("mrs %0, cntvct_el0" : "=r"(Now));
+  __asm volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
+
+  std::scoped_lock Lock(HotPagesLock);
+  if (!HotPageThreshold || !Page) {
+    return false;
+  }
+
+  // Direct-mapped: a page evicted by another one simply starts counting again.
+  auto& Slot = HotFaults[(Page >> FEXCore::Utils::FEX_PAGE_SHIFT) % HotFaultSlots];
+  if (Slot.Page != Page || Now - Slot.WindowStart > Frequency) {
+    Slot = {Page, Now, 0};
+  }
+  if (++Slot.Count < HotPageThreshold) {
+    return false;
+  }
+  Slot = {};
+
+  const auto Used = HotPagesUsed.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < Used; ++i) {
+    if (!HotPages[i].load(std::memory_order_relaxed)) {
+      HotPages[i].store(Page, std::memory_order_release);
+      return true;
+    }
+  }
+  if (Used == MaxHotPages) {
+    // Table full: this page keeps the write trap.
+    return false;
+  }
+  HotPages[Used].store(Page, std::memory_order_release);
+  HotPagesUsed.store(Used + 1, std::memory_order_release);
+  return true;
+}
+
+void InvalidationTracker::ForgetHotSMCPages(uint64_t Begin, uint64_t End) {
+  if (!HotPagesUsed.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::scoped_lock Lock(HotPagesLock);
+  const auto Used = HotPagesUsed.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < Used; ++i) {
+    const auto Page = HotPages[i].load(std::memory_order_relaxed);
+    if (Page && Page >= Begin && Page < End) {
+      HotPages[i].store(0, std::memory_order_release);
+    }
+  }
 }
 
 /* iOS-Madeira ml201: log EVERY XIntervals removal, tagged by path.
@@ -768,9 +866,43 @@ ULONG InvalidationTracker::GetUntrapProt(uint64_t Address) const {
   return PAGE_EXECUTE_READWRITE;
 }
 
+/* MADEIRA: CodeInvalidationMutex is not recursive. When this thread already write-owns it, a second
+ * exclusive lock parks the thread behind itself, and every other thread queues behind it for good
+ * (log 56: one thread waiting on the lock it held, a second one behind it, no further progress). A
+ * write owner already has exclusive access, so these invalidations run under the hold it has.
+ * MADEIRA_INVALIDATION_NESTED=0 restores the plain lock. */
+static bool NestedInvalidationAllowed() {
+  static const bool Allowed = [] {
+    const char* Value = getenv("MADEIRA_INVALIDATION_NESTED");
+    return !(Value && Value[0] == '0');
+  }();
+  return Allowed;
+}
+
+bool InvalidationTracker::LockCodeInvalidationUnlessHeld(const char* Path, uint64_t Address) {
+  auto& CodeMutex = CTX.GetCodeInvalidationMutex();
+  if (NestedInvalidationAllowed() && CodeMutex.IosHeldExclusiveByThisThread()) {
+    static std::atomic<uint32_t> NestedCount {0};
+    const auto N = NestedCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (N <= 16 || (N % 4096) == 0) {
+      const uint64_t* Ra = CodeMutex.IosOwnerReturnAddresses();
+      LogMan::Msg::EFmt("[inval-nested] #{} {} {:#x}: this thread already holds the code invalidation lock, taken at "
+                        "ra={:x} {:x} {:x} {:x}, here={:x} anchor={:x} (MADEIRA_INVALIDATION_NESTED=0 disables)",
+                        N, Path, Address, Ra ? Ra[0] : 0, Ra ? Ra[1] : 0, Ra ? Ra[2] : 0, Ra ? Ra[3] : 0,
+                        reinterpret_cast<uint64_t>(__builtin_return_address(0)), reinterpret_cast<uint64_t>(&NestedInvalidationAllowed));
+    }
+    return false;
+  }
+  CodeMutex.lock();
+  return true;
+}
+
 void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t Size) {
-  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+  const bool Locked = LockCodeInvalidationUnlessHeld("invalidate", Address);
   InvalidateIntervalInternalLocked(Address, Size);
+  if (Locked) {
+    CTX.GetCodeInvalidationMutex().unlock();
+  }
 }
 
 void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
@@ -853,10 +985,31 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
         }
         HitRWXInterval = true;
       }
-      void* TmpAddress = reinterpret_cast<void*>(Address);
-      SIZE_T TmpSize = static_cast<SIZE_T>(std::min(End, Address + Query.Size) - Address);
-      ULONG TmpProt;
-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address), &TmpProt);
+      const auto ProtectEnd = std::min(End, Address + Query.Size);
+      const auto Prot = ForWriteLocked ? GetUntrapProt(Address) : GetTrapProt(Address);
+      auto Protect = [Prot](uint64_t Begin, uint64_t RangeEnd) {
+        void* TmpAddress = reinterpret_cast<void*>(Begin);
+        SIZE_T TmpSize = static_cast<SIZE_T>(RangeEnd - Begin);
+        ULONG TmpProt;
+        NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, Prot, &TmpProt);
+      };
+      if (ForWriteLocked || !HotPagesUsed.load(std::memory_order_acquire)) {
+        Protect(Address, ProtectEnd);
+      } else {
+        // MADEIRA: never write-protect a hot page again; protect the runs of pages around it.
+        uint64_t RunBegin = Address;
+        for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK; Page < ProtectEnd; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+          if (IsHotSMCPage(Page)) {
+            if (RunBegin < std::max(Page, Address)) {
+              Protect(RunBegin, std::max(Page, Address));
+            }
+            RunBegin = std::min(Page + FEXCore::Utils::FEX_PAGE_SIZE, ProtectEnd);
+          }
+        }
+        if (RunBegin < ProtectEnd) {
+          Protect(RunBegin, ProtectEnd);
+        }
+      }
     } else if (!Query.Size) {
       // No more regions past `Address` in the interval list
       break;

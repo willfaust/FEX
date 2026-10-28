@@ -924,6 +924,29 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
   // Two instruction cost, each 1 cycle.
   adr_OrRestart(TMP1, &HeaderLabel);
   str(TMP1, STATE, offsetof(FEXCore::Core::CPUState, InlineJITBlockHeader));
+#ifdef FEX_IOS_HOST
+  /* ml1205: record this block entry in the thread's ring (MADEIRA_BLOCK_RING). */
+  {
+    static int RingOn = -1;
+    if (RingOn < 0) {
+      const char* E = getenv("MADEIRA_BLOCK_RING");
+      RingOn = (E && *E && *E != '0') ? 1 : 0;
+    }
+    if (RingOn) {
+      ARMEmitter::ForwardLabel l_NoRing;
+      ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, IosBlockRing));
+      (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &l_NoRing);
+      ldr(TMP2, TMP1, 0);
+      LoadConstant(ARMEmitter::Size::i64Bit, TMP3, IosRingEntryRIP);
+      add(ARMEmitter::Size::i64Bit, TMP4, TMP1, 8);
+      str(TMP3, TMP4, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
+      add(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, FEXCore::Core::IosBlockRingEntries - 1);
+      str(TMP2, TMP1, 0);
+      (void)Bind(&l_NoRing);
+    }
+  }
+#endif
 
   if (CheckTF) {
     EmitTFCheck();
@@ -1078,6 +1101,9 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         CodeData.EntryPoints.emplace(BlockStartRIP, GetCursorAddress<uint8_t*>());
         DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
 
+        /* ml1206: the high 16 bits carry the bytes left in this translation from the block start, so the
+         * dump can print the whole block (guest addresses stay below 2^48). */
+        IosRingEntryRIP = BlockStartRIP | (std::min<uint64_t>(Entry + Size - BlockStartRIP, 0xffff) << 48);   /* ml1205 */
         EmitEntryPoint(JITCodeHeaderLabel, CheckTF);
         // [iOS-Madeira] verbose EmitEntryPoint-done log suppressed
       }

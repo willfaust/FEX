@@ -1289,6 +1289,20 @@ void BTCpuProcessInit() {
   Context::HandlerConfig.emplace(*CTX);
   // The tracker speaks host addresses to the OS and converts at its calls into FEXCore.
   InvalidationTracker.emplace(*CTX, Threads, GuestWindow::Base);
+  {
+    // MADEIRA ml2020: hot SMC pages for the WoW64 module too (InvalidationTracker::EnableHotSMCPages, the
+    // ARM64EC module's rule). Without it a 32-bit title's protector DLL that unpacks code into a page it also
+    // executes from took the same write fault 2000 times (untrap, invalidate, recompile, trap, fault: device
+    // logs 2026-10-25) until the host's redelivery guard ended the whole app. MADEIRA_SMC_HOT_PAGE: unset = 64
+    // write faults within a second, 0 = off (every write to a code page invalidates it), N = threshold.
+    uint32_t HotThreshold = 64;
+    if (const char* Hot = getenv("MADEIRA_SMC_HOT_PAGE"); Hot && *Hot) {
+      HotThreshold = static_cast<uint32_t>(strtoul(Hot, nullptr, 0));
+    }
+    InvalidationTracker->EnableHotSMCPages(HotThreshold);
+    LogMan::Msg::EFmt("[smc-hot] wow64: hot SMC pages {} (threshold {} write faults per second)", HotThreshold ? "on" : "off",
+                      HotThreshold);
+  }
   ImageTracker.emplace(*CTX, false);
 
   // The 64-bit PEB's ImageBaseAddress is a HOST address: ntdll-unix's init_peb stores the address

@@ -163,12 +163,20 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
    * paths), but a game built for AVX dies on its first VEX instruction. The app
    * sets MADEIRA_FEX_AVX=1 for such a game; FEX then runs AVX through its
    * 128-bit emulation. CPUID, XCR0 and IsProcessorFeaturePresent all derive
-   * from SupportsAVX. AVX is unsupported for WOW64, as on other hosts. */
+   * from SupportsAVX. AVX is unsupported for WOW64, as on other hosts.
+   * MADEIRA_FEX_AVX=2 is the same but CPUID reports AVX without AVX2 (VAES,
+   * VPCLMULQDQ hidden too): for a game that demands AVX while its libraries
+   * (Bink 2 video) should keep their pre-AVX2 paths. Set it with the game's own
+   * line env.MADEIRA_FEX_AVX = 2. */
   if (const char* Avx = getenv("MADEIRA_FEX_AVX");
-      Avx && Avx[0] == '1' && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64) {
+      Avx && (Avx[0] == '1' || (Avx[0] == '2' && Avx[1] == '\0')) && HostType != FEXCore::HostFeatures::HostTypeEnum::Wow64) {
     HostFeatures.SupportsAVX = true;
     HostFeatures.SupportsAES256 = HostFeatures.SupportsAES;
-    LogMan::Msg::IFmt("[fex-avx] MADEIRA_FEX_AVX=1: AVX and AVX2 reported and emulated");
+    if (Avx[0] == '1') {
+      LogMan::Msg::IFmt("[fex-avx] MADEIRA_FEX_AVX=1: AVX and AVX2 reported and emulated");
+    } else {
+      LogMan::Msg::IFmt("[fex-avx] MADEIRA_FEX_AVX=2: AVX reported and emulated, AVX2 not reported");
+    }
   }
   return HostFeatures;
 #else
