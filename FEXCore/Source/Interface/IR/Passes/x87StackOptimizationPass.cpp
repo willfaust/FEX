@@ -310,6 +310,10 @@ private:
     // Tuple is only valid if we have information about the Source of the Stack Data Node.
     // In it's valid then OpSize is the original source size and Ref is the original source node.
     std::optional<StackMemberData> Source {};
+
+    // Reduced precision: the 64-bit integer (in an FPR) that a FILD m64 converted to StackDataNode,
+    // which a double may not hold exactly. Null unless pushed by PushStackFromInt64.
+    Ref Int64Source {};
   };
 
   // StackData, TopCache need to be always properly set to ensure
@@ -348,6 +352,10 @@ private:
   std::array<Ref, 8> TopOffsetCache {};
   std::array<Ref, 8> TopOffsetAddressCache {};
   std::array<Ref, 8> TopValueCache {};
+  // Reduced precision, slow path: the integer of a FILD m64 for a pending TopValueCache value
+  // (null if the value is not one). The flush stores it in the upper half of the register's
+  // 16-byte context slot, beside the double, so that a FIST m64 in a later block can find it.
+  std::array<Ref, 8> TopInt64Cache {};
   std::array<StackSlot, 8> TopValidCache {};
 
   // Are we on the slow path?
@@ -375,6 +383,7 @@ inline void X87StackOptimization::InvalidateCachedRegs() {
   TopOffsetCache.fill(nullptr);
   TopOffsetAddressCache.fill(nullptr);
   TopValueCache.fill(nullptr);
+  TopInt64Cache.fill(nullptr);
   TopValidCache.fill(StackSlot::UNUSED);
 }
 
@@ -472,7 +481,8 @@ inline Ref X87StackOptimization::GetX87ValidTag_Slow(uint8_t Offset) {
 
 inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
   OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(Offset);
-  auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+  // Preserve the integer shadow beside the reduced-precision value across blocks.
+  const auto Size = OpSize::i128Bit;
   if (!TopValueCache[Offset]) {
     // TopOffsetAddress is `STATE + index * 16` from _FormContextAddress: a host pointer, so it takes
     // the host-addressed form (identical to _LoadMemFPR unless a guest window is supported).
@@ -484,6 +494,7 @@ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
 
 inline void X87StackOptimization::StoreStackValueAtOffset_Slow(Ref Value, uint8_t Offset, bool SetValid) {
   TopValueCache[Offset] = Value;
+  TopInt64Cache[Offset] = nullptr;
   FlushValuesPending[Offset] = true;
   // mark it valid
   // In some cases we might already know it has been previously set as valid so we don't need to do it again
@@ -584,6 +595,7 @@ inline void X87StackOptimization::UpdateTopForPop_Slow() {
   std::rotate(TopOffsetCache.begin(), std::next(TopOffsetCache.begin()), TopOffsetCache.end());
   std::rotate(TopOffsetAddressCache.begin(), std::next(TopOffsetAddressCache.begin()), TopOffsetAddressCache.end());
   std::rotate(TopValueCache.begin(), std::next(TopValueCache.begin()), TopValueCache.end());
+  std::rotate(TopInt64Cache.begin(), std::next(TopInt64Cache.begin()), TopInt64Cache.end());
   std::rotate(FlushValuesPending.begin(), std::next(FlushValuesPending.begin()), FlushValuesPending.end());
   std::rotate(TopValidCache.begin(), std::next(TopValidCache.begin()), TopValidCache.end());
   FlushTopPending = true;
@@ -595,6 +607,7 @@ inline void X87StackOptimization::UpdateTopForPush_Slow() {
   std::rotate(TopOffsetCache.begin(), std::prev(TopOffsetCache.end()), TopOffsetCache.end());
   std::rotate(TopOffsetAddressCache.begin(), std::prev(TopOffsetAddressCache.end()), TopOffsetAddressCache.end());
   std::rotate(TopValueCache.begin(), std::prev(TopValueCache.end()), TopValueCache.end());
+  std::rotate(TopInt64Cache.begin(), std::prev(TopInt64Cache.end()), TopInt64Cache.end());
   std::rotate(FlushValuesPending.begin(), std::prev(FlushValuesPending.end()), FlushValuesPending.end());
   std::rotate(TopValidCache.begin(), std::prev(TopValidCache.end()), TopValidCache.end());
   FlushTopPending = true;
@@ -606,12 +619,17 @@ void X87StackOptimization::FlushCachedRegs() {
     FlushTopPending = false;
   }
 
-  auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+  // Preserve the integer shadow beside the reduced-precision value across blocks.
+  const auto Size = OpSize::i128Bit;
   for (size_t i = 0; i < FlushValuesPending.size(); i++) {
     if (FlushValuesPending[i]) {
       OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(i);
       // Host-addressed, see LoadStackValueAtOffset_Slow.
-      IREmit->_StoreMemHostFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
+      Ref Value = TopValueCache[i];
+      if (ReducedPrecisionMode && TopInt64Cache[i]) {
+        Value = IREmit->_VInsElement(OpSize::i128Bit, OpSize::i64Bit, 1, 0, Value, TopInt64Cache[i]);
+      }
+      IREmit->_StoreMemHostFPR(Size, Value, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
                                MemOffsetType::SXTX, 1);
       // store
       FlushValuesPending[i] = false;
@@ -698,6 +716,7 @@ Ref X87StackOptimization::SynchronizeStackValues() {
 
     if (Valid == StackSlot::VALID) {
       StoreStackValueAtOffset_Slow(StackMember.StackDataNode, i, false);
+      TopInt64Cache[i] = StackMember.Int64Source;
     }
   }
   { // Set valid tags
@@ -950,6 +969,22 @@ void X87StackOptimization::Run(IREmitter* Emit) {
         break;
       }
 
+      case OP_PUSHSTACKFROMINT64: {
+        const auto* Op = IROp->C<IROp_PushStackFromInt64>();
+        auto* SourceNode = CurrentIR.GetNode(Op->X80Src);
+
+        if (SlowPath) {
+          UpdateTopForPush_Slow();
+          StoreStackValueAtOffset_Slow(SourceNode);
+          TopInt64Cache[0] = CurrentIR.GetNode(Op->Int64Value);
+        } else {
+          StackMemberInfo Member {SourceNode};
+          Member.Int64Source = CurrentIR.GetNode(Op->Int64Value);
+          StackData.push(Member);
+        }
+        break;
+      }
+
       case OP_COPYPUSHSTACK: {
         const auto* Op = IROp->C<IROp_CopyPushStack>();
         auto Offset = Op->StackLocation;
@@ -971,6 +1006,37 @@ void X87StackOptimization::Run(IREmitter* Emit) {
         Ref NewValue = LoadStackValue(Offset);
 
         IREmit->ReplaceUsesWithAfter(CodeNode, NewValue, CodeNode);
+        break;
+      }
+
+      case OP_READSTACKINT64: {
+        // FIST m64 of the top. While the top is the unchanged value of a FILD m64 (moved only by
+        // FXCH, FLD ST(i) or FST ST(i)), store the loaded integer rather than the rounded double.
+        const auto* Op = IROp->C<IROp_ReadStackInt64>();
+        Ref Result = CurrentIR.GetNode(Op->Converted);
+        if (!SlowPath) {
+          const auto& [Valid, StackMember] = StackData.top(0);
+          if (Valid == StackSlot::VALID && StackMember.Int64Source) {
+            Result = StackMember.Int64Source;
+          }
+        } else if (TopInt64Cache[0]) {
+          // Pushed by a FILD m64 earlier in this block's slow path.
+          Result = TopInt64Cache[0];
+        } else if (!FlushValuesPending[0]) {
+          // Unchanged since the block began: an earlier block may have left a FILD m64's integer
+          // in the upper half of the slot (Delphi's Move loads 8 bytes before a loop and stores
+          // them after it). The upper half may also be stale or any register's upper half, so it
+          // is used only when it converts to the double on the stack: then it is the FILD's
+          // integer, or for a value of 2^53 or more an integer that rounds to that value too.
+          Ref Value = LoadStackValueAtOffset_Slow(0);
+          Ref Int64Value = IREmit->_LoadMemHostGPR(OpSize::i64Bit, GetOffsetTopAddressWithCache_Slow(0),
+                                               IREmit->_InlineConstant(MMBaseOffset() + 8), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+          Ref Int64AsDouble = IREmit->_Float_FromGPR_S(OpSize::i64Bit, OpSize::i64Bit, Int64Value);
+          Ref Same = IREmit->_VFCMPEQ(OpSize::i64Bit, OpSize::i64Bit, Int64AsDouble, Value);
+          Result = IREmit->_VBSL(OpSize::i64Bit, Same, IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, Int64Value), Result);
+        }
+
+        IREmit->ReplaceUsesWithAfter(CodeNode, Result, CodeNode);
         break;
       }
 
