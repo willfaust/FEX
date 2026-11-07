@@ -1008,6 +1008,42 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, Block.Entry - GuestRIP));
       }
 
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+      // madeira-duo byte-copy-loop (OpDispatchBuilder::MatchByteCopyLoop): a block that is exactly a
+      // byte-at-a-time copy loop becomes one forward MemCpy. Only where TSO is off for the whole block
+      // (the TSO loop orders every byte store, MemCpy does not), not under full SMC checks or extended
+      // debug info (both want per-instruction state). MADEIRA_FEX_BYTELOOP=0 turns it off.
+      {
+        static int ByteLoopOn = -1;
+        if (ByteLoopOn < 0) {
+          const char* Env = getenv("MADEIRA_FEX_BYTELOOP");
+          ByteLoopOn = !(Env && Env[0] == '0');
+        }
+        const bool TSOOff = !IsAtomicTSOEnabled() ||
+                            (BlockInForceTSOValidRange &&
+                             (InstForceTSOIt == ForceTSOInstructions.end() || *InstForceTSOIt >= Block.Entry + Block.Size));
+        IR::OpDispatchBuilder::ByteCopyLoop Loop;
+        if (ByteLoopOn && TSOOff && !ExtendedDebugInfo && Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL &&
+            !Block.ForceFullSMCDetection && !HotSMCBlock &&
+            IR::OpDispatchBuilder::MatchByteCopyLoop(Block.DecodedInstructions, InstsInBlock, Block.Entry, &Loop)) {
+          static std::atomic<uint32_t> Said {0};
+          const auto* Jcc = &Block.DecodedInstructions[InstsInBlock - 1];
+          const uint64_t Length = Jcc->PC + Jcc->InstSize - Block.Entry;
+          if (Said.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LogMan::Msg::IFmt("[byteloop] madeira-duo {:#x}: byte copy loop (src r{}, dst r{}, count r{}, byte r{}) -> MemCpy",
+                              Block.Entry, Loop.Src, Loop.Dst, Loop.Count, Loop.Byte);
+          }
+          Thread->OpDispatcher->FlushRegisterCache(true);
+          Thread->OpDispatcher->_GuestOpcode(Block.Entry - GuestRIP);
+          Thread->OpDispatcher->EmitByteCopyLoop(Loop, Jcc);
+          BlockInstructionsLength += Length;
+          TotalInstructionsLength += Length;
+          TotalInstructions += InstsInBlock;
+          Thread->OpDispatcher->FinishOp(Jcc->PC + Jcc->InstSize, true);
+          continue;
+        }
+      }
+#endif
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
 

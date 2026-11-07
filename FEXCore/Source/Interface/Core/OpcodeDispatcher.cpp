@@ -5230,3 +5230,187 @@ void OpDispatchBuilder::NoExecOp(OpcodeArgs) {
 
 #undef OpcodeArgs
 } // namespace FEXCore::IR
+
+/* madeira-duo byte-copy-loop.
+ *
+ * MSVC emits byte-at-a-time copy loops for copies whose size it cannot see,
+ * e.g. Path of Exile 2's hottest function (exe+0x1029bb0, ~9% of all CPU):
+ *
+ *   loop: movzx eax, byte [r14]   ; lea r14, [r14+1]
+ *         mov [rcx], al           ; lea rcx, [rcx+1]
+ *         sub rdx, 1              ; jne loop
+ *
+ * Translated one guest instruction at a time that is eight host instructions
+ * per byte. When a decoded block is exactly such a loop (the block starts at
+ * the loop head and ends at the backward jne), it is emitted as one forward
+ * MemCpy, which has REP MOVSB's semantics: bytes in ascending order, so an
+ * overlapping copy gives the same result as the loop. The registers and flags
+ * left behind are the loop's:
+ *   Src += n, Dst += n, Count = 0
+ *   Byte = the last byte copied, zero-extended (read back from Dst[n-1], which is
+ *          what the loop's last load returned and stored; with n == 0 the loop
+ *          would run 2^64 times, so that case only reads Src[0] like its first
+ *          iteration does)
+ *   flags = SUB 1, 1 (ZF, PF set; CF, OF, SF, AF clear)
+ * Accepted forms (64-bit mode, REX the only prefix, no SIB/RIP bases):
+ *   load   movzx r32/r64, byte [S]               (0F B6, mod 00)
+ *   store  mov byte [D], r8                      (88, mod 00)
+ *   step   lea R, [R+1] | inc R | add R, 1        for S after the load, D after the store
+ *   count  sub C, 1                              (83 /5 ib 1), fifth
+ *   branch jne back to the block entry          (75 rel8 or 0F 85 rel32), last
+ * The caller applies it only where TSO is off for the block: MemCpy does not
+ * order its stores the way the TSO byte loop does. */
+namespace FEXCore::IR {
+namespace {
+struct ByteLoopInsn {
+  enum Kind { NONE, LOAD, STORE, STEP, COUNT, BRANCH } Kind {NONE};
+  uint8_t Reg {}, Base {};
+  int64_t Target {};
+};
+
+ByteLoopInsn DecodeByteLoopInsn(const X86Tables::DecodedInst& I) {
+  ByteLoopInsn R;
+  const uint8_t* B = I.InstBytes;
+  const uint8_t Len = I.InstSize;
+  uint8_t P = 0, Rex = 0;
+  if (Len && (B[0] & 0xF0) == 0x40) {
+    Rex = B[0];
+    P = 1;
+  }
+  const uint8_t RexW = (Rex >> 3) & 1, RexR = (Rex >> 2) & 1, RexB = Rex & 1;
+  auto ModRM = [&](uint8_t At, uint8_t& Mod, uint8_t& RegF, uint8_t& Rm) {
+    Mod = B[At] >> 6;
+    RegF = ((B[At] >> 3) & 7) | (RexR << 3);
+    Rm = (B[At] & 7) | (RexB << 3);
+  };
+  uint8_t Mod, RegF, Rm;
+  if (Len == P + 3 && B[P] == 0x0F && B[P + 1] == 0xB6) {   // movzx r, byte [base]
+    ModRM(P + 2, Mod, RegF, Rm);
+    if (Mod == 0 && (Rm & 7) != 4 && (Rm & 7) != 5) {
+      R.Kind = ByteLoopInsn::LOAD;
+      R.Reg = RegF;
+      R.Base = Rm;
+    }
+  } else if (Len == P + 2 && B[P] == 0x88) {   // mov byte [base], r8
+    ModRM(P + 1, Mod, RegF, Rm);
+    if (Mod == 0 && (Rm & 7) != 4 && (Rm & 7) != 5 && (Rex || RegF < 4)) {
+      R.Kind = ByteLoopInsn::STORE;
+      R.Reg = RegF;
+      R.Base = Rm;
+    }
+  } else if (RexW && Len == P + 3 && B[P] == 0x8D) {   // lea R, [R+1]
+    ModRM(P + 1, Mod, RegF, Rm);
+    if (Mod == 1 && (Rm & 7) != 4 && RegF == Rm && B[P + 2] == 1) {
+      R.Kind = ByteLoopInsn::STEP;
+      R.Reg = RegF;
+    }
+  } else if (RexW && Len == P + 2 && B[P] == 0xFF) {   // inc R
+    ModRM(P + 1, Mod, RegF, Rm);
+    if (Mod == 3 && (RegF & 7) == 0) {
+      R.Kind = ByteLoopInsn::STEP;
+      R.Reg = Rm;
+    }
+  } else if (RexW && Len == P + 3 && B[P] == 0x83 && B[P + 2] == 1) {   // add R, 1 / sub R, 1
+    ModRM(P + 1, Mod, RegF, Rm);
+    if (Mod == 3 && (RegF & 7) == 0) {
+      R.Kind = ByteLoopInsn::STEP;
+      R.Reg = Rm;
+    } else if (Mod == 3 && (RegF & 7) == 5) {
+      R.Kind = ByteLoopInsn::COUNT;
+      R.Reg = Rm;
+    }
+  } else if (!Rex && Len == 2 && B[0] == 0x75) {   // jne rel8
+    R.Kind = ByteLoopInsn::BRANCH;
+    R.Target = static_cast<int64_t>(I.PC + Len) + static_cast<int8_t>(B[1]);
+  } else if (!Rex && Len == 6 && B[0] == 0x0F && B[1] == 0x85) {   // jne rel32
+    int32_t Rel;
+    memcpy(&Rel, B + 2, 4);
+    R.Kind = ByteLoopInsn::BRANCH;
+    R.Target = static_cast<int64_t>(I.PC + Len) + Rel;
+  }
+  return R;
+}
+} // namespace
+
+bool OpDispatchBuilder::MatchByteCopyLoop(const X86Tables::DecodedInst* Insts, size_t NumInsts, uint64_t Entry, ByteCopyLoop* Out) {
+  if (NumInsts != 6) {
+    return false;
+  }
+  ByteLoopInsn D[6];
+  for (size_t i = 0; i < 6; i++) {
+    if (Insts[i].PC != (i ? Insts[i - 1].PC + Insts[i - 1].InstSize : Entry)) {
+      return false;
+    }
+    D[i] = DecodeByteLoopInsn(Insts[i]);
+    if (D[i].Kind == ByteLoopInsn::NONE) {
+      return false;
+    }
+  }
+  if (D[4].Kind != ByteLoopInsn::COUNT || D[5].Kind != ByteLoopInsn::BRANCH || D[5].Target != static_cast<int64_t>(Entry)) {
+    return false;
+  }
+  int Load = -1, Store = -1, StepA = -1, StepB = -1;
+  for (int i = 0; i < 4; i++) {
+    switch (D[i].Kind) {
+    case ByteLoopInsn::LOAD: if (Load >= 0) return false; Load = i; break;
+    case ByteLoopInsn::STORE: if (Store >= 0) return false; Store = i; break;
+    case ByteLoopInsn::STEP: if (StepA < 0) StepA = i; else if (StepB < 0) StepB = i; else return false; break;
+    default: return false;
+    }
+  }
+  if (Load < 0 || Store < 0 || StepB < 0 || Store < Load) {
+    return false;
+  }
+  const uint8_t S = D[Load].Base, Dst = D[Store].Base, T = D[Load].Reg, C = D[4].Reg;
+  if (D[Store].Reg != T || S == Dst || T == S || T == Dst || C == S || C == Dst || C == T) {
+    return false;
+  }
+  // One step per pointer, the source's after the load, the destination's after the store.
+  int StepS = D[StepA].Reg == S ? StepA : D[StepB].Reg == S ? StepB : -1;
+  int StepD = D[StepA].Reg == Dst ? StepA : D[StepB].Reg == Dst ? StepB : -1;
+  if (StepS < 0 || StepD < 0 || StepS == StepD || StepS < Load || StepD < Store) {
+    return false;
+  }
+  // The load must read S before its step; the store must write D before its step (checked above), and
+  // the store must come after the load that produced T.
+  Out->Src = S;
+  Out->Dst = Dst;
+  Out->Count = C;
+  Out->Byte = T;
+  return true;
+}
+
+void OpDispatchBuilder::EmitByteCopyLoop(const ByteCopyLoop& Loop, X86Tables::DecodedOp Jcc) {
+  BlockSetRIP = true;
+
+  Ref Src = LoadGPRRegister(Loop.Src);
+  Ref Dst = LoadGPRRegister(Loop.Dst);
+  Ref Count = LoadGPRRegister(Loop.Count);
+
+  Ref Result_Src = _AllocateGPR(false);
+  Ref Result_Dst = _AllocateGPR(false);
+  _MemCpy(false, OpSize::i8Bit, Dst, Src, Count, Constant(1), Result_Dst, Result_Src);
+
+  // The last byte copied: Dst[n-1] after the copy (n == 0: Src[0], see above).
+  Ref LastAddr = _Sub(OpSize::i64Bit, _Add(OpSize::i64Bit, Dst, Count), Constant(1));
+  LastAddr = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Count, Constant(0), Src, LastAddr);
+  Ref Byte = _LoadMem(RegClass::GPR, OpSize::i8Bit, LastAddr, Invalid(), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+
+  StoreGPRRegister(Loop.Byte, Byte);
+  StoreGPRRegister(Loop.Src, Result_Src);
+  StoreGPRRegister(Loop.Dst, Result_Dst);
+  StoreGPRRegister(Loop.Count, Constant(0));
+
+  // Flags of the final `sub Count, 1` (1 - 1).
+  CalculateFlags_SUB(OpSize::i64Bit, Constant(1), Constant(1));
+  CalculateDeferredFlags();
+
+  FlushRegisterCache();
+  const uint64_t Next = Jcc->PC + Jcc->InstSize;
+  if (auto Fall = JumpTargets.find(Next); Fall != JumpTargets.end()) {
+    Jump(Fall->second.BlockEntry);
+  } else {
+    ExitRelocatedPC(Jcc);
+  }
+}
+} // namespace FEXCore::IR

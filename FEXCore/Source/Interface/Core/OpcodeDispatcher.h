@@ -437,6 +437,13 @@ public:
   void IMULOp(OpcodeArgs);
   void STOSOp(OpcodeArgs);
   void MOVSOp(OpcodeArgs);
+  // madeira-duo byte-copy-loop (OpcodeDispatcher.cpp): a whole guest block that copies
+  // one byte per iteration, replaced by one forward MemCpy.
+  struct ByteCopyLoop {
+    uint8_t Src, Dst, Count, Byte;
+  };
+  static bool MatchByteCopyLoop(const X86Tables::DecodedInst* Insts, size_t NumInsts, uint64_t Entry, ByteCopyLoop* Out);
+  void EmitByteCopyLoop(const ByteCopyLoop& Loop, X86Tables::DecodedOp Jcc);
   void CMPSOp(OpcodeArgs);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);
