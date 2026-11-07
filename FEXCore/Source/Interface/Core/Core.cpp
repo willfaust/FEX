@@ -675,6 +675,11 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
 
 void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
   FEXCORE_PROFILE_INSTANT("ClearCodeCache");
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  if (FEXCore::Core::MadeiraJitMapHook) {   // madeira-duo jit-map: host addresses get reused from here on
+    FEXCore::Core::MadeiraJitMapHook(0, NewCodeBuffer, 0, 0);
+  }
+#endif
 
   if (NewCodeBuffer) {
     // Allocate new CodeBuffer + L3 LookupCache and clear L1+L2 caches

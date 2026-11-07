@@ -935,6 +935,94 @@ static bool IosSmcStoreFastPath(FEXCore::Core::InternalThreadState* Thread, ARM6
 /* madeira-bcd: guest branch history v1. DATA, never a native-callable thunk. */
 /* Keep a word-sized global, matching the module's iOS relocation guards. */
 namespace FEXCore::Core { uint32_t IosGuestBranchTraceEnabled = 0; }
+/* madeira-duo jit-map. Madeira's CPU sampler sees host PCs; inside JIT code a
+ * host PC says nothing about the game until it is mapped back to the guest
+ * code that was compiled there. With MADEIRA_JITMAP=<executable-name
+ * substring> set, that executable writes one 32-byte record per block placed
+ * in the code buffer to %LOCALAPPDATA%\fex-jitmap-<pid>.bin:
+ *   u64 host begin, u64 guest entry RIP, u32 host size, u32 guest size, u32 ms, u32 seq
+ * A record with guest RIP 0 marks a code cache clear (host addresses are reused
+ * after it). The hook runs under the code buffer write lock, so writes are
+ * serialised; the stream is flushed every 2048 records. */
+namespace FEXCore::Core { void (*MadeiraJitMapHook)(uint64_t, uint64_t, uint64_t, uint64_t) = nullptr; }
+namespace {
+FILE* MadeiraJitMapFile;
+uint32_t MadeiraJitMapSeq;
+/* MADEIRA_JITCODE=<entry>[,<entry>...], each "0x<guest rip>" or "<module>+0x<rva>"
+ * (module looked up once at start, so it must already be loaded): blocks compiled
+ * at those guest entries also get their host code bytes written, after a copy of
+ * their jit-map record, to %LOCALAPPDATA%\fex-jitcode-<pid>.bin. For reading
+ * what the profile's hot host offsets inside a block actually execute. */
+FILE* MadeiraJitCodeFile;
+uint64_t MadeiraJitCodeRIPs[16];
+uint32_t MadeiraJitCodeCount;
+void MadeiraJitMapWrite(uint64_t HostBegin, uint64_t HostSize, uint64_t GuestRIP, uint64_t GuestSize) {
+  struct {
+    uint64_t HostBegin, GuestRIP;
+    uint32_t HostSize, GuestSize, Ms, Seq;
+  } Record {HostBegin, GuestRIP, static_cast<uint32_t>(HostSize), static_cast<uint32_t>(GuestSize),
+            static_cast<uint32_t>(GetTickCount64()), MadeiraJitMapSeq++};
+  fwrite(&Record, sizeof(Record), 1, MadeiraJitMapFile);
+  if (GuestRIP && MadeiraJitCodeFile) {
+    for (uint32_t Idx = 0; Idx != MadeiraJitCodeCount; ++Idx) {
+      if (MadeiraJitCodeRIPs[Idx] == GuestRIP) {
+        fwrite(&Record, sizeof(Record), 1, MadeiraJitCodeFile);
+        fwrite(reinterpret_cast<const void*>(HostBegin), 1, static_cast<uint32_t>(HostSize), MadeiraJitCodeFile);
+        fflush(MadeiraJitCodeFile);
+        break;
+      }
+    }
+  }
+  if (!GuestRIP) {
+    LogMan::Msg::IFmt("[jit-map] madeira-duo code cache cleared (new buffer {}) after {} records", HostSize, MadeiraJitMapSeq);
+  }
+  if (!GuestRIP || (MadeiraJitMapSeq & 2047) == 0) {
+    fflush(MadeiraJitMapFile);
+  }
+}
+void MadeiraJitMapInit(const fextl::string& ExecutableName) {
+  const char* Want = getenv("MADEIRA_JITMAP");
+  const char* AppData = getenv("LOCALAPPDATA");
+  if (!Want || !Want[0] || !AppData || !strstr(ExecutableName.c_str(), Want)) {
+    return;
+  }
+  const auto Path = fextl::fmt::format("{}\\fex-jitmap-{}.bin", AppData, GetCurrentProcessId());
+  MadeiraJitMapFile = fopen(Path.c_str(), "wb");
+  if (MadeiraJitMapFile) {
+    setvbuf(MadeiraJitMapFile, nullptr, _IOFBF, 1 << 18);
+    FEXCore::Core::MadeiraJitMapHook = MadeiraJitMapWrite;
+  }
+  LogMan::Msg::IFmt("[jit-map] madeira-duo MADEIRA_JITMAP={} exe={}: {} {}", Want, ExecutableName,
+                    MadeiraJitMapFile ? "writing" : "COULD NOT OPEN", Path);
+  const char* CodeWant = getenv("MADEIRA_JITCODE");
+  if (!MadeiraJitMapFile || !CodeWant || !CodeWant[0]) {
+    return;
+  }
+  for (const char* Entry = CodeWant; *Entry && MadeiraJitCodeCount < 16;) {
+    const char* End = strchr(Entry, ',');
+    const fextl::string Item(Entry, End ? End - Entry : strlen(Entry));
+    const auto Plus = Item.find('+');
+    uint64_t RIP = 0;
+    if (Plus == fextl::string::npos) {
+      RIP = strtoull(Item.c_str(), nullptr, 16);
+    } else {
+      const auto Base = reinterpret_cast<uint64_t>(GetModuleHandleA(Item.substr(0, Plus).c_str()));
+      RIP = Base ? Base + strtoull(Item.c_str() + Plus + 1, nullptr, 16) : 0;
+    }
+    LogMan::Msg::IFmt("[jit-map] madeira-duo MADEIRA_JITCODE {} -> {:#x}", Item, RIP);
+    if (RIP) {
+      MadeiraJitCodeRIPs[MadeiraJitCodeCount++] = RIP;
+    }
+    Entry = End ? End + 1 : Entry + Item.size();
+  }
+  const auto CodePath = fextl::fmt::format("{}\\fex-jitcode-{}.bin", AppData, GetCurrentProcessId());
+  if (MadeiraJitCodeCount) {
+    MadeiraJitCodeFile = fopen(CodePath.c_str(), "wb");
+  }
+  LogMan::Msg::IFmt("[jit-map] madeira-duo MADEIRA_JITCODE {} entries: {} {}", MadeiraJitCodeCount,
+                    MadeiraJitCodeFile ? "writing" : "not writing", CodePath);
+}
+} // namespace
 extern "C" const uint64_t IosGuestBranchTraceLayout[3] = {
   0x314744454742444dULL,
   offsetof(FEXCore::Core::CpuStateFrame, IosGuestBranchHistory) |
@@ -991,6 +1079,7 @@ NTSTATUS ProcessInit() {
   FEX::Windows::Logging::Init();
 
 #ifdef FEX_IOS_HOST
+  MadeiraJitMapInit(fextl::string {ExecutableName});   // madeira-duo jit-map
   /* Recorder emitted only for this executable, before CTX/JIT creation. */
   const auto HistoryName = fextl::string {ExecutableName};
   const char* HistoryOpt = getenv("MADEIRA_FEX_BRANCH_HISTORY");

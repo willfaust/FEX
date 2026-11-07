@@ -517,6 +517,10 @@ struct CpuStateFrame {
 
 #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
 extern uint32_t IosGuestBranchTraceEnabled;
+/* madeira-duo jit-map (MADEIRA_JITMAP): called under the code buffer write lock for
+ * every block placed in the code buffer (host begin, host size, guest entry RIP,
+ * guest size), and with guest RIP 0 when the code cache is cleared. Null = off. */
+extern void (*MadeiraJitMapHook)(uint64_t HostBegin, uint64_t HostSize, uint64_t GuestRIP, uint64_t GuestSize);
 static_assert(sizeof(CpuStateFrame::IosGuestBranchHistoryType) == 272);
 static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) % 8 == 0);
 static_assert(offsetof(CpuStateFrame, IosGuestBranchHistory) + 272 <= 32760);

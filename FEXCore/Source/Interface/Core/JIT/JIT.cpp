@@ -1402,6 +1402,13 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     }
 #endif
     memcpy(WritePtr(GetCursorAddress<uint8_t*>()), TempCodeBuffer, TempSize);
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+    if (FEXCore::Core::MadeiraJitMapHook) {   // madeira-duo jit-map: where this block lives, for the CPU profile.
+      // After the memcpy: before it the final address still holds the pool's NOP fill,
+      // and MADEIRA_JITCODE dumps the bytes from there (prof8 got only NOPs).
+      FEXCore::Core::MadeiraJitMapHook(reinterpret_cast<uint64_t>(CodeData.BlockBegin), CodeData.Size, Entry, Size);
+    }
+#endif
     SetCursorOffset(CodeBuffers.LatestOffset + TempSize);
 
     CodeBuffers.LatestOffset = GetCursorOffset();
