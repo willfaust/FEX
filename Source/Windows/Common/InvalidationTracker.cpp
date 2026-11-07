@@ -458,6 +458,30 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
     SectionSize += Info.RegionSize;
   }
 
+  /* madeira-duo: Path of Exile 2 streams assets through file views and unmaps ~60 a
+   * second (4 Nov logs: ~23,000 "[iOS-xrem] via=section" lines in a 6-minute run). Each
+   * unmap took the exclusive code-invalidation lock, walked every thread's lookup cache
+   * and wrote a log line, for data that was never executable. Nothing is compiled from a
+   * range outside XIntervals (code is only translated from executable memory, and
+   * removing a range from XIntervals invalidates it first), so such a section has nothing
+   * to invalidate. Executable sections take the full path as before. */
+  if (Free) {
+    bool Executable;
+    {
+      std::unique_lock Lock(IntervalsLock);
+      Executable = XIntervals.Intersect({SectionBase, SectionBase + SectionSize});
+    }
+    if (!Executable) {
+      static std::atomic<uint32_t> DataUnmaps;
+      const auto N = DataUnmaps.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (N <= 8 || !(N & 1023)) {
+        LogMan::Msg::EFmt("[iOS-xrem] via=section-data #{} {:#x}-{:#x}: never executable, no invalidation", N, SectionBase,
+                          SectionBase + SectionSize);
+      }
+      return {SectionBase, SectionSize};
+    }
+  }
+
   InvalidateIntervalInternal(SectionBase, SectionSize);
 
   if (Free) {
