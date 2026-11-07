@@ -982,10 +982,15 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       bool BlockInForceTSOValidRange = false;
       auto InstForceTSOIt = ForceTSOInstructions.end();
       if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
-        if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); *It < Block.Entry + Block.Size) {
-          InstForceTSOIt = It;
-          BlockInForceTSOValidRange = true;
-        }
+        // madeira-duo: a block inside a valid range drops TSO for every access the
+        // metadata does not list, whether or not it holds a listed one. Upstream set
+        // the flag only for blocks containing a listed instruction (and read *end()
+        // when there was none), so a block without volatile accesses -- nearly all
+        // code -- kept full TSO and a module-wide ExtendedVolatileMetadata entry
+        // changed nothing (PoE2's hot byte-copy loop at exe+0x102a480 still ran
+        // ldapurb/stlurb with the exe listed, prof1 log 5 Nov 2026).
+        InstForceTSOIt = ForceTSOInstructions.lower_bound(Block.Entry);
+        BlockInForceTSOValidRange = true;
       }
 
       // Set the block entry point
