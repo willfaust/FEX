@@ -1506,6 +1506,64 @@ static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadSt
 }
 #endif
 
+/* MADEIRA: the CALLRET_SP check below, moved out of CompileBlock so its cache-hit fast path runs it too. */
+/* iOS-Madeira 2026-05-18: CALLRET_SP bounds-validation + RESET.
+ *
+ * Initial diagnostic showed callret_sp going 0x10..0x70 BELOW
+ * Thread->CallRetStackBase — underflow of the FEX prediction stack into
+ * the lower guard page. On iOS, Wine's VirtualAlloc(MEM_RESERVE,
+ * PAGE_NOACCESS) doesn't actually enforce NOACCESS on the guard, so the
+ * guard-page SEGV that would normally trigger CallRetStack::HandleAccessViolation
+ * never fires, and the existing reset-to-DefaultLocation logic doesn't kick
+ * in. Result: the stack drifts further into "guard" memory each iteration
+ * of Thumper's hot dispatch loop.
+ *
+ * GPT's Tier-1 fix: replicate HandleAccessViolation's reset proactively
+ * in C++, triggered at CompileBlock entry whenever we detect callret_sp
+ * outside the real [base, base+SIZE) range. The callret stack is a
+ * prediction/fast-return cache, not architectural state — resetting it
+ * degrades to slower lookup, doesn't change x86 semantics.
+ *
+ * Stack direction (per GPT): CALL push uses `stp [sp, -0x10]!`, so
+ * sp decreases. RET pop uses `ldp [sp], 0x10`, so sp increases.
+ * sp < base = too many CALL pushes (likely ARM64EC return paths that
+ * push via the dispatcher sentinel but bypass the FEX RET pop path).
+ * sp >= end = too many RET pops. Both reset to DefaultLocation. */
+static void CheckCallRetBounds(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  auto *Thread = Frame ? Frame->Thread : nullptr;
+  uint64_t crsp = Frame ? Frame->State.callret_sp : 0;
+  uint64_t crbase = Thread ? reinterpret_cast<uint64_t>(Thread->CallRetStackBase) : 0;
+  uint64_t crend = crbase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+  if (crbase != 0 && (crsp < crbase || crsp >= crend)) {
+    static volatile uint32_t oob_cnt = 0;
+    uint32_t n = __sync_add_and_fetch(&oob_cnt, 1);
+    uint64_t default_loc = crbase + FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET;
+    const char *kind = (crsp < crbase) ? "UNDERFLOW" : "OVERFLOW";
+    if (n <= 16) {
+      LogMan::Msg::EFmt("[CALLRET_OOB #{}] {} callret_sp=0x{:x}  "
+                        "base=0x{:x} end=0x{:x} delta=0x{:x}  "
+                        "GuestRIP=0x{:x} State.rip=0x{:x} Frame=0x{:x}  "
+                        "RESET→0x{:x}",
+                        n, kind, crsp, crbase, crend,
+                        (crsp < crbase) ? (crbase - crsp) : (crsp - crend),
+                        GuestRIP, Frame->State.rip,
+                        reinterpret_cast<uintptr_t>(Frame),
+                        default_loc);
+      /* Dump top 4 pseudo-entries before reset (mostly stale; useful to
+       * see if anyone wrote real callret pairs into the guard page). */
+      if (crsp >= 0x10000) {
+        for (int i = 0; i < 4; i++) {
+          uint64_t *pair = reinterpret_cast<uint64_t*>(crsp + i * 0x10);
+          LogMan::Msg::EFmt("[CALLRET_OOB #{}]   [+0x{:x}] = {{0x{:x}, 0x{:x}}}",
+                            n, i * 0x10, pair[0], pair[1]);
+        }
+      }
+    }
+    /* Tier-1 reset to DefaultLocation, matching CallRetStack::HandleAccessViolation. */
+    Frame->State.callret_sp = default_loc;
+  }
+}
+
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.
@@ -1543,6 +1601,32 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * log will say so outright. */
   if (MonoBackpatcherBridgeArmed()) {
     IosMonoTryActivate(this, Thread);
+  }
+#endif
+
+#ifdef FEX_IOS_HOST
+  /* MADEIRA: cache-hit fast path. Nearly every call here is a lookup that L3 answers (the emitted
+   * dispatcher only probes L1, and L2 is off on iOS), and the reports, RIP checks and telemetry below
+   * ran on every one of them: IosJitReverseTranslate, IsAddressInCodeBuffer, and shared counters
+   * (g_cb_total, the hot-RIP estimator, the per-thread callret slots) that every guest thread writes.
+   * A block in the cache already passed all of those when it was compiled, and a pool-copy alias never
+   * gets a block (see ml315 below), so a hit can return here. A miss falls through to the full path
+   * unchanged. Not taken while this thread holds emission locks (ml455). [CB_SUMMARY] now counts only
+   * the calls that miss here. MADEIRA_FEX_CB_FAST=0 turns it off. */
+  {
+    static int CbFastOn = -1;
+    if (CbFastOn < 0) {
+      const char* Env = getenv("MADEIRA_FEX_CB_FAST");
+      CbFastOn = !(Env && Env[0] == '0');
+    }
+    if (CbFastOn && GuestRIP >= 0x10000 && !FEXCore::Utils::WritePriorityMutex::IosEmissionLocksHeldBySelf()) {
+      CheckCallRetBounds(Frame, GuestRIP);
+      static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+      std::shared_lock FastLk {CodeInvalidationMutex};
+      if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+        return HostCode;
+      }
+    }
   }
 #endif
 
@@ -1896,62 +1980,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Madeira 2026-05-18: CALLRET_SP bounds-validation + RESET.
-   *
-   * Initial diagnostic showed callret_sp going 0x10..0x70 BELOW
-   * Thread->CallRetStackBase — underflow of the FEX prediction stack into
-   * the lower guard page. On iOS, Wine's VirtualAlloc(MEM_RESERVE,
-   * PAGE_NOACCESS) doesn't actually enforce NOACCESS on the guard, so the
-   * guard-page SEGV that would normally trigger CallRetStack::HandleAccessViolation
-   * never fires, and the existing reset-to-DefaultLocation logic doesn't kick
-   * in. Result: the stack drifts further into "guard" memory each iteration
-   * of Thumper's hot dispatch loop.
-   *
-   * GPT's Tier-1 fix: replicate HandleAccessViolation's reset proactively
-   * in C++, triggered at CompileBlock entry whenever we detect callret_sp
-   * outside the real [base, base+SIZE) range. The callret stack is a
-   * prediction/fast-return cache, not architectural state — resetting it
-   * degrades to slower lookup, doesn't change x86 semantics.
-   *
-   * Stack direction (per GPT): CALL push uses `stp [sp, -0x10]!`, so
-   * sp decreases. RET pop uses `ldp [sp], 0x10`, so sp increases.
-   * sp < base = too many CALL pushes (likely ARM64EC return paths that
-   * push via the dispatcher sentinel but bypass the FEX RET pop path).
-   * sp >= end = too many RET pops. Both reset to DefaultLocation. */
-  {
-    auto *Thread = Frame ? Frame->Thread : nullptr;
-    uint64_t crsp = Frame ? Frame->State.callret_sp : 0;
-    uint64_t crbase = Thread ? reinterpret_cast<uint64_t>(Thread->CallRetStackBase) : 0;
-    uint64_t crend = crbase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-    if (crbase != 0 && (crsp < crbase || crsp >= crend)) {
-      static volatile uint32_t oob_cnt = 0;
-      uint32_t n = __sync_add_and_fetch(&oob_cnt, 1);
-      uint64_t default_loc = crbase + FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET;
-      const char *kind = (crsp < crbase) ? "UNDERFLOW" : "OVERFLOW";
-      if (n <= 16) {
-        LogMan::Msg::EFmt("[CALLRET_OOB #{}] {} callret_sp=0x{:x}  "
-                          "base=0x{:x} end=0x{:x} delta=0x{:x}  "
-                          "GuestRIP=0x{:x} State.rip=0x{:x} Frame=0x{:x}  "
-                          "RESET→0x{:x}",
-                          n, kind, crsp, crbase, crend,
-                          (crsp < crbase) ? (crbase - crsp) : (crsp - crend),
-                          GuestRIP, Frame->State.rip,
-                          reinterpret_cast<uintptr_t>(Frame),
-                          default_loc);
-        /* Dump top 4 pseudo-entries before reset (mostly stale; useful to
-         * see if anyone wrote real callret pairs into the guard page). */
-        if (crsp >= 0x10000) {
-          for (int i = 0; i < 4; i++) {
-            uint64_t *pair = reinterpret_cast<uint64_t*>(crsp + i * 0x10);
-            LogMan::Msg::EFmt("[CALLRET_OOB #{}]   [+0x{:x}] = {{0x{:x}, 0x{:x}}}",
-                              n, i * 0x10, pair[0], pair[1]);
-          }
-        }
-      }
-      /* Tier-1 reset to DefaultLocation, matching CallRetStack::HandleAccessViolation. */
-      Frame->State.callret_sp = default_loc;
-    }
-  }
+  CheckCallRetBounds(Frame, GuestRIP);
 
   /* iOS-Madeira 2026-05-15: JIT-pool RIP detector — LOG-ONLY.
    *

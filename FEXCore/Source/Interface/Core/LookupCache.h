@@ -392,16 +392,41 @@ public:
   bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {
     auto lk = Shared->AcquireWriteLock();
 
-    auto lower = CachedCodePages.lower_bound(Start >> 12);
-    auto upper = CachedCodePages.upper_bound((Start + Length - 1) >> 12);
+    if (Length == 0) {
+      return false;
+    }
 
-    for (auto it = lower; it != upper; it++) {
-      for (const auto& Entry : it->second) {
-        InvalidateCache(Entry, lk);
+    // CachedCodePages is a hash map (see its declaration), so there is no ordered range to erase.
+    // Walk whichever is shorter: the pages of the range, or the map's entries.
+    const uint64_t FirstPage = Start >> 12;
+    const uint64_t LastPage = (Start + Length - 1) >> 12;
+    bool ret = false;
+
+    if (LastPage - FirstPage < CachedCodePages.size()) {
+      for (uint64_t Page = FirstPage; Page <= LastPage; Page++) {
+        auto it = CachedCodePages.find(Page);
+        if (it == CachedCodePages.end()) {
+          continue;
+        }
+        for (const auto& Entry : it->second) {
+          InvalidateCache(Entry, lk);
+        }
+        CachedCodePages.erase(it);
+        ret = true;
+      }
+    } else {
+      for (auto it = CachedCodePages.begin(); it != CachedCodePages.end();) {
+        if (it->first < FirstPage || it->first > LastPage) {
+          ++it;
+          continue;
+        }
+        for (const auto& Entry : it->second) {
+          InvalidateCache(Entry, lk);
+        }
+        it = CachedCodePages.erase(it);
+        ret = true;
       }
     }
-    bool ret = upper != lower;
-    CachedCodePages.erase(lower, upper);
     return ret;
   }
 
@@ -501,7 +526,10 @@ private:
   }
 
   // Maps from a page index to all blocks in the page that have at some point been fetched into L1/L2
-  fextl::map<uint64_t, fextl::robin_set<uint64_t>> CachedCodePages;
+  // MADEIRA: a hash map, not fextl::map. With L2 disabled (the iOS default) every L1 miss that L3
+  // answers lands in CacheBlockMapping, and the tree descent here was 1.25% of all CPU in a capped
+  // PoE2 profile (prof11, about 70k misses/s). InvalidateCacheRange no longer needs the ordering.
+  fextl::robin_map<uint64_t, fextl::robin_set<uint64_t>> CachedCodePages;
 
   uintptr_t PagePointer;
   uintptr_t PageMemory;
