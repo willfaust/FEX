@@ -45,6 +45,18 @@ uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
 static std::atomic<uint64_t> NestedNotificationSkips {0};
 static std::atomic<uint64_t> NestedNotificationSkipsReported {0};
 
+// madeira-duo: MADEIRA_FEX_FREE_SKIP=0 turns off the skip for frees of never-executable memory in
+// InvalidateAlignedInterval (and the cached-page bounds check in LookupCache). Read once.
+static bool FreeSkipEnabled() {
+  static const bool Enabled = [] {
+    const char* Env = getenv("MADEIRA_FEX_FREE_SKIP");
+    const bool On = !(Env && Env[0] == '0');
+    LogMan::Msg::EFmt("[iOS-xrem] free-skip={} (MADEIRA_FEX_FREE_SKIP={})", On ? 1 : 0, Env ? Env : "unset");
+    return On;
+  }();
+  return Enabled;
+}
+
 #if !defined(ARCHITECTURE_arm64ec)
 InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX,
                                          const std::unordered_map<DWORD, FEXCore::Core::InternalThreadState*>& Threads, uint64_t GuestBase)
@@ -509,6 +521,46 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
 
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
+
+  /* madeira-duo: every guest VirtualFree/decommit lands here (NotifyMemoryFree), about 49 a second in
+   * a PoE2 run (dig2 C1), nearly all of it heap data. Each took the exclusive code-invalidation lock and
+   * walked every thread's lookup cache while frame threads that missed L1 queued behind it. The rule
+   * InvalidateContainingSection already uses for unmapped sections applies here: nothing is compiled
+   * from outside XIntervals, and a range leaves XIntervals only after it is invalidated, so a freed range
+   * that overlaps no X interval has nothing to invalidate. A range that touches a sub-floor image's
+   * window (either of its names, ml1207) takes the full path regardless. MADEIRA_FEX_FREE_SKIP=0 turns
+   * the skip off. */
+  if (Free && FreeSkipEnabled()) {
+    const uint64_t End = AlignedSize > std::numeric_limits<uint64_t>::max() - AlignedBase ? std::numeric_limits<uint64_t>::max()
+                                                                                        : AlignedBase + AlignedSize;
+    bool Executable;
+    {
+      std::unique_lock Lock(IntervalsLock);
+      Executable = XIntervals.Intersect({AlignedBase, End});
+    }
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+    uint64_t Low, Real, WinSize;
+    for (int i = 0; !Executable && IosSubfloorEnum(i, &Low, &Real, &WinSize); i++) {
+      if (WinSize && ((AlignedBase < Low + WinSize && End > Low) || (Real && AlignedBase < Real + WinSize && End > Real))) {
+        Executable = true;
+      }
+    }
+#endif
+    if (!Executable) {
+      static std::atomic<uint32_t> DataFrees;
+      const auto N = DataFrees.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (N <= 40 || !(N & 63)) {
+        LogMan::Msg::EFmt("[iOS-xrem] via=free-data #{} tracker={} {:#x}-{:#x}: never executable, no invalidation", N,
+                          static_cast<void*>(this), AlignedBase, End);
+      }
+      // Nothing to remove from XIntervals; keep the rest of the bookkeeping as before (RWX ranges are a
+      // subset of X ranges, so this is a no-op in practice).
+      std::unique_lock Lock(IntervalsLock);
+      RWXIntervals.Remove({AlignedBase, End});
+      ForgetHotSMCPages(AlignedBase, End);
+      return;
+    }
+  }
 
   InvalidateIntervalInternal(AlignedBase, AlignedSize);
 

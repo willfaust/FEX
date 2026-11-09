@@ -363,7 +363,13 @@ DEF_OP(ExitFunction) {
 
     // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
     // L1Mask is pre-shifted.
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    if (LookupCache::L1HashEnabled()) {
+      // MADEIRA: hashed L1 index, (rip ^ rip >> 17) & mask, as LookupCache::L1Index. TMP3 is free here.
+      eor(ARMEmitter::Size::i64Bit, TMP3, RipReg, RipReg, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP3, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    } else {
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    }
     add(TMP1, TMP1, TMP2);
 
     ldp<ARMEmitter::IndexType::OFFSET>(TMP2, TMP1, TMP1, 0);

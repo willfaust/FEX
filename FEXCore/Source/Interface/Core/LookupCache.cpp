@@ -188,6 +188,7 @@ void LookupCache::ClearThreadLocalCaches(const LookupCacheWriteLockToken&) {
 
   // TODO: Rename this member to avoid confusion with code caching
   CachedCodePages.clear();
+  ResetCachedPageBounds();
 }
 
 void LookupCache::ClearCache(const LookupCacheWriteLockToken& lk) {

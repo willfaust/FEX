@@ -379,6 +379,10 @@ public:
 #endif
 
   FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+  // MADEIRA: [fexlock-stats] counters for CodeInvalidationMutex, attached in the constructor.
+  FEXCore::Utils::WritePriorityMutex::IosContentionStats CodeInvalidationStats {};
+#endif
 
   uint32_t StrictSplitLockMutex {};
 

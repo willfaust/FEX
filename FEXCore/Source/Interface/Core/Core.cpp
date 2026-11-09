@@ -136,6 +136,10 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
   , CodeCache {*this} {
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+  CodeInvalidationStats.Name = "CodeInvalidationMutex";
+  CodeInvalidationMutex.IosSetContentionStats(&CodeInvalidationStats);
+#endif
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;

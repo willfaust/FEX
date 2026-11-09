@@ -14,10 +14,16 @@
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/fextl/memory_resource.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stddef.h>
 #include <utility>
 #include <mutex>
+
+#ifdef FEX_IOS_HOST
+extern "C" uint32_t IosTebTsdOffset; // ARM64EC/Module.cpp, see Arm64Emitter.h
+#endif
 
 namespace FEXCore {
 struct LookupCacheBaseLockToken {
@@ -187,6 +193,37 @@ public:
     uintptr_t GuestCode;
   };
 
+  /* MADEIRA: the L1 index is (rip ^ rip >> 17) & mask instead of rip & mask. 92% of x64 block entries
+   * are 16-byte aligned, so the plain mask used 1/16 of the slots and most L1 misses were conflicts
+   * between blocks that were already compiled (dig2 C2). Every site that indexes L1 must use the same
+   * expression: the C++ lookups and fills below (L1Index), and the emitted lookups in Dispatcher.cpp and
+   * BranchOps.cpp (L1HashEnabled at code-generation time). If an invalidation looked at a different slot
+   * from the fill, a stale translation would survive in L1. MADEIRA_FEX_L1_HASH=0 restores the plain
+   * mask; the variable is read once, the first time any of those sites asks. */
+  static constexpr unsigned L1_HASH_SHIFT = 17;
+  static bool L1HashEnabled() {
+    static const bool Enabled = [] {
+      const char* Env = getenv("MADEIRA_FEX_L1_HASH");
+      const bool On = !(Env && Env[0] == '0');
+      LogMan::Msg::EFmt("[l1-hash] index={} (MADEIRA_FEX_L1_HASH={})", On ? "rip^rip>>17" : "rip", Env ? Env : "unset");
+      return On;
+    }();
+    return Enabled;
+  }
+  static uint64_t L1Index(uint64_t Address) {
+    return L1HashEnabled() ? (Address ^ (Address >> L1_HASH_SHIFT)) : Address;
+  }
+
+  /* MADEIRA: MADEIRA_FEX_FREE_SKIP=0 turns off InvalidateCacheRange's cached-page bounds check (and,
+   * in InvalidationTracker, the skip for frees of never-executable memory). Read once. */
+  static bool FreeSkipEnabled() {
+    static const bool Enabled = [] {
+      const char* Env = getenv("MADEIRA_FEX_FREE_SKIP");
+      return !(Env && Env[0] == '0');
+    }();
+    return Enabled;
+  }
+
   LookupCache(FEXCore::Context::ContextImpl* CTX);
   ~LookupCache();
 
@@ -199,10 +236,13 @@ public:
 
   uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
     // Try L1, no lock needed
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
     if (L1Entry.GuestCode == Address) {
       return L1Entry.HostCode;
     }
+#ifdef FEX_IOS_HOST
+    CountL1Miss();
+#endif
 
     // L2 and L3 need to be locked
     uintptr_t HostPtr {};
@@ -354,11 +394,12 @@ public:
     // cache returned to that size and sent the address to its old translation (HotSpot, rewriting
     // code it runs, failed one launch in three). Entries past the current size were decommitted when
     // the cache shrank.
+    const uint64_t Index = L1Index(Address);
     for (size_t Entries = DynamicL1Cache() ? MIN_L1_ENTRIES : L1PointerMask + 1; Entries <= L1PointerMask + 1; Entries <<= 1) {
-      auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & (Entries - 1)];
+      auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Index & (Entries - 1)];
 #else
     {
-      auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+      auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
 #endif
       if (L1Entry.GuestCode == Address) {
         L1Entry.GuestCode = 0;
@@ -402,6 +443,14 @@ public:
     const uint64_t LastPage = (Start + Length - 1) >> 12;
     bool ret = false;
 
+    // MADEIRA: every thread's cache is walked for every invalidation, inside the exclusive
+    // CodeInvalidationMutex section, and most ranges (guest frees of heap memory) are nowhere near the
+    // pages this thread has cached. MinCachedPage/MaxCachedPage bound every page that was ever added
+    // since the map was last empty, so a range outside them has nothing here.
+    if (FreeSkipEnabled() && (CachedCodePages.empty() || LastPage < MinCachedPage || FirstPage > MaxCachedPage)) {
+      return false;
+    }
+
     if (LastPage - FirstPage < CachedCodePages.size()) {
       for (uint64_t Page = FirstPage; Page <= LastPage; Page++) {
         auto it = CachedCodePages.find(Page);
@@ -426,6 +475,9 @@ public:
         it = CachedCodePages.erase(it);
         ret = true;
       }
+    }
+    if (CachedCodePages.empty()) {
+      ResetCachedPageBounds();
     }
     return ret;
   }
@@ -470,11 +522,14 @@ public:
 private:
   void CacheBlockMapping(uint64_t Address, const GuestToHostMap::BlockEntry& Entry, bool L1Only, const LookupCacheBaseLockToken& lk) {
     for (const auto& CodePage : Entry.CodePages) {
-      CachedCodePages[CodePage >> 12].insert(Address);
+      const uint64_t Page = CodePage >> 12;
+      CachedCodePages[Page].insert(Address);
+      MinCachedPage = std::min(MinCachedPage, Page);
+      MaxCachedPage = std::max(MaxCachedPage, Page);
     }
 
     // Do L1
-    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[L1Index(Address) & L1PointerMask];
     L1Entry.GuestCode = Address;
     L1Entry.HostCode = Entry.HostCode;
 
@@ -530,6 +585,55 @@ private:
   // answers lands in CacheBlockMapping, and the tree descent here was 1.25% of all CPU in a capped
   // PoE2 profile (prof11, about 70k misses/s). InvalidateCacheRange no longer needs the ordering.
   fextl::robin_map<uint64_t, fextl::robin_set<uint64_t>> CachedCodePages;
+  // MADEIRA: lowest and highest page added to CachedCodePages since it was last empty (see
+  // InvalidateCacheRange). Only widened while entries exist, reset when the map empties.
+  uint64_t MinCachedPage = UINT64_MAX;
+  uint64_t MaxCachedPage = 0;
+  void ResetCachedPageBounds() {
+    MinCachedPage = UINT64_MAX;
+    MaxCachedPage = 0;
+  }
+
+#ifdef FEX_IOS_HOST
+  /* MADEIRA: per-thread L1 miss rate. Every C++ lookup that misses L1 counts (the emitted lookups
+   * only come here after their own L1 probe missed), and about every 30 s the thread logs its rate.
+   * The clock is read once per 4096 misses and is the counter register, not a library call (see
+   * ml1059 below). */
+  uint64_t IosL1Misses {};
+  uint64_t IosL1MissesAtReport {};
+  uint64_t IosL1ReportTicks {};
+  void CountL1Miss() {
+    if ((++IosL1Misses & 0xfff) != 0) {
+      return;
+    }
+    uint64_t Now, Frequency;
+    __asm volatile("mrs %0, cntvct_el0" : "=r"(Now));
+    __asm volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
+    if (!IosL1ReportTicks) {
+      IosL1ReportTicks = Now;
+      IosL1MissesAtReport = IosL1Misses;
+      return;
+    }
+    const uint64_t Elapsed = Now - IosL1ReportTicks;
+    if (Elapsed < Frequency * 30) {
+      return;
+    }
+    // The TEB as the dispatcher finds it (x18 is not reliable on the iOS host): TPIDRRO_EL0 plus Wine's
+    // published TSD offset, then ClientId.UniqueThread at +0x48, the tid the [thr-name] lines use.
+    uint32_t Tid = 0;
+    if (IosTebTsdOffset) {
+      uint64_t Tpidrro;
+      __asm volatile("mrs %0, TPIDRRO_EL0" : "=r"(Tpidrro));
+      const uint64_t Teb = *reinterpret_cast<const uint64_t*>((Tpidrro & ~uint64_t(7)) + IosTebTsdOffset);
+      Tid = Teb ? *reinterpret_cast<const uint32_t*>(Teb + 0x48) : 0;
+    }
+    LogMan::Msg::EFmt("[l1-miss-t] tid={:04x} {:.0f}/s over {:.1f}s, total={} l1-entries={} hash={}", Tid,
+                      double(IosL1Misses - IosL1MissesAtReport) * double(Frequency) / double(Elapsed),
+                      double(Elapsed) / double(Frequency), IosL1Misses, L1PointerMask + 1, L1HashEnabled() ? 1 : 0);
+    IosL1ReportTicks = Now;
+    IosL1MissesAtReport = IosL1Misses;
+  }
+#endif
 
   uintptr_t PagePointer;
   uintptr_t PageMemory;
