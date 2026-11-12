@@ -465,6 +465,9 @@ inline Ref X87StackOptimization::GetFTW() {
 
 inline void X87StackOptimization::SetX87ValidTag(uint8_t Offset, bool Valid) {
   TopValidCache[Offset] = Valid ? StackSlot::VALID : StackSlot::INVALID;
+  if (!Valid) {
+    TopInt64Cache[Offset] = nullptr;
+  }
   FlushValidPending = true;
 }
 
@@ -925,7 +928,6 @@ void X87StackOptimization::Run(IREmitter* Emit) {
         if (Offset != 0xff) { // invalidate single offset
           if (SlowPath) {
             SetX87ValidTag(Offset, false);
-            TopInt64Cache[Offset] = nullptr;
           } else {
             StackData.setTagInvalid(Offset);
           }
