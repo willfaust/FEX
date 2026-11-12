@@ -7,6 +7,7 @@
 %endif
 
 ; Install a guest signal handler that returns through rt_sigreturn.
+mov rsp, 0xe8000000
 mov rdi, 0xe0000000
 lea rax, [rel .handler]
 mov [rdi + 0x100], rax
