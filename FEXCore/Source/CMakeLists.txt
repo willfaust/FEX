@@ -66,6 +66,7 @@ set(SRCS
   Interface/IR/Passes/RegisterAllocationPass.cpp
   Interface/IR/Passes/x87StackOptimizationPass.cpp
   Utils/AllocWatch.cpp
+  Utils/FPState.cpp
   Utils/LongJump.cpp
   Utils/Telemetry.cpp
   Utils/Threads.cpp

@@ -16,6 +16,10 @@ if (NOT MINGW)
   endif()
 endif()
 
+add_executable(x87_context_test host/x87-context-test.cpp)
+target_link_libraries(x87_context_test PRIVATE FEXCore FEXCore_Base JemallocLibs)
+add_test(NAME x87_context_test COMMAND x87_context_test)
+
 add_subdirectory(ASM/)
 add_subdirectory(32Bit_ASM/)
 if (ENABLE_VIXL_DISASSEMBLER)

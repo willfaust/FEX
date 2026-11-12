@@ -2,8 +2,15 @@
 #pragma once
 
 #include <cstdint>
+#include <FEXCore/Utils/CompilerDefs.h>
+
+namespace FEXCore::Core { struct CPUState; }
 
 namespace FEXCore::FPState {
+// These conversions use caller-owned SoftFloat state and are safe in signal handlers.
+FEX_DEFAULT_VISIBILITY void ExportX87Register(const FEXCore::Core::CPUState& State, unsigned Slot, uint64_t (&Out)[2], bool Reduced);
+FEX_DEFAULT_VISIBILITY void ImportX87Register(FEXCore::Core::CPUState& State, unsigned Slot, const uint64_t (&In)[2], bool Reduced);
+
 enum class X87Tag : uint8_t { Valid = 0b00, Zero = 0b01, Special = 0b10, Empty = 0b11 };
 
 static inline X87Tag GetX87Tag(uint64_t (&Reg)[2], bool Valid) {

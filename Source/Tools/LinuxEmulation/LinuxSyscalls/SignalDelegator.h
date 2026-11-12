@@ -107,6 +107,7 @@ public:
   void QueueSignal(pid_t tgid, pid_t tid, int Signal, siginfo_t* info, bool IgnoreMask);
 
   FEXCore::Context::Context* CTX;
+  FEX_CONFIG_OPT(ReducedX87, X87REDUCEDPRECISION);
 
   void SetVDSOSymbols() {
     // Get symbols from VDSO.
