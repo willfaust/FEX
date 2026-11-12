@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#undef NDEBUG
 #include <FEXCore/Core/CoreState.h>
 #include <FEXCore/Utils/FPState.h>
 #include <cassert>
