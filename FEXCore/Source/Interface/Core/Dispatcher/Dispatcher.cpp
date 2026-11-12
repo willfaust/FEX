@@ -436,9 +436,11 @@ void Dispatcher::EmitDispatcher() {
     sub(ARMEmitter::Size::i64Bit, TMP2, TMP2, 1);
     str(TMP2, STATE, offsetof(FEXCore::Core::CPUState, DeferredSignalRefCount));
 
-    // Trigger segfault if any deferred signals are pending
-    strb(ARMEmitter::XReg::zr, STATE,
-         offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) - offsetof(FEXCore::Core::InternalThreadState, BaseFrameState));
+    // The page can be more than 4095 bytes from the frame after alignment.
+    constexpr auto FaultPageOffset = offsetof(FEXCore::Core::InternalThreadState, InterruptFaultPage) -
+                                     offsetof(FEXCore::Core::InternalThreadState, BaseFrameState);
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP2, FaultPageOffset);
+    strb(ARMEmitter::XReg::zr, STATE, TMP2, ARMEmitter::ExtendedType::LSL_64, 0);
 #endif
   };
 
