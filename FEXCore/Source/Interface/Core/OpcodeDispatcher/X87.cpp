@@ -32,6 +32,7 @@ Ref OpDispatchBuilder::GetX87Top() {
 
 void OpDispatchBuilder::SetX87FTW(Ref FTW) {
   _StackForceSlow(); // Invalidate x87 FTW register cache
+  _StoreContextGPR(OpSize::i8Bit, Constant(0), offsetof(FEXCore::Core::CPUState, x87_exact_valid));
 
   // For the output, we want a 1-bit for each pair not equal to 11 (Empty).
   static_assert(static_cast<uint8_t>(FPState::X87Tag::Empty) == 0b11);

@@ -252,6 +252,11 @@ struct alignas(64) CPUState {
   constexpr static uint32_t SEGMENT_ARRAY_INDEX_GDT = 0;
   constexpr static uint32_t SEGMENT_ARRAY_INDEX_LDT = 1;
   Core::CPUState::gdt_segment private_gdt[32] {};
+
+  // shortcut: context save/restore loses exact provenance, upgrade when reduced-precision state preserves full x87 values.
+  // Kept separate from ARM64EC's mm state.
+  alignas(16) uint64_t x87_exact_int[8][2] {};
+  uint8_t x87_exact_valid {};
 };
 static_assert(std::is_trivially_copyable_v<CPUState>, "Needs to be trivial");
 static_assert(std::is_standard_layout_v<CPUState>, "This needs to be standard layout");

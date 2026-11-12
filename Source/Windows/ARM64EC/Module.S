@@ -280,10 +280,10 @@ BeginSimulation:
 
 #ifdef FEX_IOS_HOST
 // FEXCore::Core::CpuStateFrame offsets read below; ARM64EC/Module.cpp checks them with static_asserts.
-#define IOS_FRAME_SUSPEND_DOORBELL 1512
-#define IOS_FRAME_CPU_AREA 4080
-#define IOS_FRAME_XP_COUNT 4088
-#define IOS_FRAME_ALIAS_HINT 4096
+#define IOS_FRAME_SUSPEND_DOORBELL 1704
+#define IOS_FRAME_CPU_AREA 4272
+#define IOS_FRAME_XP_COUNT 4280
+#define IOS_FRAME_ALIAS_HINT 4288
 
   // ExitFunctionEC for exits from JIT code, where x28 is this thread's CpuStateFrame; installed as
   // Pointers.ExitFunctionEC when AFP is off, so FPCR.NEP and FPCR.AH are never set and there is

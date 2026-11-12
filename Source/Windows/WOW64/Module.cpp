@@ -597,6 +597,7 @@ void LoadStateFromWowContext(FEXCore::Core::InternalThreadState* Thread, uint64_
 
   CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(XSave->XmmRegisters), nullptr);
   memcpy(State.mm, XSave->FloatRegisters, sizeof(State.mm));
+  State.x87_exact_valid = 0;
 
   State.FCW = XSave->ControlWord;
   State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = XSave->StatusWord & 1;

@@ -1,19 +1,18 @@
 %ifdef CONFIG
 {
   "RegData": {
-    "RAX": "0x8428000232030000",
-    "RBX": "0x0047005c003a0044",
-    "RCX": "0x005c00730065006c",
-    "RDX": "0x8428000232030000",
+    "RAX": "0x84280002320300a8",
+    "RBX": "0x0047005c003a0043",
+    "RCX": "0x005c00730065006d",
+    "RDX": "0x84280002320300a8",
     "RSI": "0x8428000232030000"
   },
   "Env": { "FEX_X87REDUCEDPRECISION" : "1" }
 }
 %endif
 
-; A value crossing a block uses reduced-precision conversion. In particular,
-; do not recover a stale integer from the upper half of the x87 context slot.
-; Exact 64-bit transfers across blocks remain unsupported in reduced mode.
+; An unchanged FILD m64 value remains exact across translation blocks.
+; An arithmetic operation discards provenance and uses reduced precision.
 mov rdi, 0xe0000000
 
 mov rax, 0x84280002320300a8

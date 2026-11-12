@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdint.h>
+#include <utility>
 
 // This file adds a pass to process X87 stack instructions.
 // These instructions are marked in IR.json with `X87: true` and are generated
@@ -288,6 +289,7 @@ private:
   Ref GetOffsetTopAddressWithCache_Slow(uint8_t Offset);
   void SetTopWithCache_Slow(Ref Value);
   Ref GetX87ValidTag_Slow(uint8_t Offset);
+  std::pair<Ref, Ref> LoadExactInt_Slow(uint8_t Offset);
   // Resets fields to initial values
   void Reset();
 
@@ -354,6 +356,7 @@ private:
   std::array<Ref, 8> TopValueCache {};
   // Reduced precision: exact FILD m64 integer while its source is known in this block.
   std::array<Ref, 8> TopInt64Cache {};
+  std::array<Ref, 8> TopInt64ValidCache {};
   std::array<StackSlot, 8> TopValidCache {};
 
   // Are we on the slow path?
@@ -382,6 +385,7 @@ inline void X87StackOptimization::InvalidateCachedRegs() {
   TopOffsetAddressCache.fill(nullptr);
   TopValueCache.fill(nullptr);
   TopInt64Cache.fill(nullptr);
+  TopInt64ValidCache.fill(nullptr);
   TopValidCache.fill(StackSlot::UNUSED);
 }
 
@@ -467,6 +471,7 @@ inline void X87StackOptimization::SetX87ValidTag(uint8_t Offset, bool Valid) {
   TopValidCache[Offset] = Valid ? StackSlot::VALID : StackSlot::INVALID;
   if (!Valid) {
     TopInt64Cache[Offset] = nullptr;
+    TopInt64ValidCache[Offset] = nullptr;
   }
   FlushValidPending = true;
 }
@@ -478,6 +483,23 @@ inline Ref X87StackOptimization::GetX87ValidTag_Slow(uint8_t Offset) {
   case StackSlot::INVALID: return GetConstant(0);
   case StackSlot::VALID: return GetConstant(1);
   }
+}
+
+inline std::pair<Ref, Ref> X87StackOptimization::LoadExactInt_Slow(uint8_t Offset) {
+  if (!ReducedPrecisionMode) return {};
+  if (TopInt64Cache[Offset]) return {TopInt64Cache[Offset], TopInt64ValidCache[Offset]};
+  if (FlushValuesPending[Offset]) return {};
+  Ref Top = GetOffsetTopWithCache_Slow(Offset);
+  Ref Mask = IREmit->_LoadContextGPR(OpSize::i8Bit, offsetof(Core::CPUState, x87_exact_valid));
+  Ref Bit = IREmit->_And(OpSize::i32Bit, IREmit->_Lshr(OpSize::i32Bit, Mask, Top), GetConstant(1));
+  Ref Valid = IREmit->_And(OpSize::i32Bit, Bit, GetX87ValidTag_Slow(Offset));
+  Ref Address = GetOffsetTopAddressWithCache_Slow(Offset);
+  Ref Exact = IREmit->_LoadMemHostFPR(OpSize::i64Bit, Address,
+                                      IREmit->_InlineConstant(offsetof(Core::CPUState, x87_exact_int)),
+                                      OpSize::i64Bit, MemOffsetType::SXTX, 1);
+  TopInt64Cache[Offset] = Exact;
+  TopInt64ValidCache[Offset] = Valid;
+  return {Exact, Valid};
 }
 
 inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
@@ -495,6 +517,7 @@ inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
 inline void X87StackOptimization::StoreStackValueAtOffset_Slow(Ref Value, uint8_t Offset, bool SetValid) {
   TopValueCache[Offset] = Value;
   TopInt64Cache[Offset] = nullptr;
+  TopInt64ValidCache[Offset] = nullptr;
   FlushValuesPending[Offset] = true;
   // mark it valid
   // In some cases we might already know it has been previously set as valid so we don't need to do it again
@@ -596,6 +619,7 @@ inline void X87StackOptimization::UpdateTopForPop_Slow() {
   std::rotate(TopOffsetAddressCache.begin(), std::next(TopOffsetAddressCache.begin()), TopOffsetAddressCache.end());
   std::rotate(TopValueCache.begin(), std::next(TopValueCache.begin()), TopValueCache.end());
   std::rotate(TopInt64Cache.begin(), std::next(TopInt64Cache.begin()), TopInt64Cache.end());
+  std::rotate(TopInt64ValidCache.begin(), std::next(TopInt64ValidCache.begin()), TopInt64ValidCache.end());
   std::rotate(FlushValuesPending.begin(), std::next(FlushValuesPending.begin()), FlushValuesPending.end());
   std::rotate(TopValidCache.begin(), std::next(TopValidCache.begin()), TopValidCache.end());
   FlushTopPending = true;
@@ -608,6 +632,7 @@ inline void X87StackOptimization::UpdateTopForPush_Slow() {
   std::rotate(TopOffsetAddressCache.begin(), std::prev(TopOffsetAddressCache.end()), TopOffsetAddressCache.end());
   std::rotate(TopValueCache.begin(), std::prev(TopValueCache.end()), TopValueCache.end());
   std::rotate(TopInt64Cache.begin(), std::prev(TopInt64Cache.end()), TopInt64Cache.end());
+  std::rotate(TopInt64ValidCache.begin(), std::prev(TopInt64ValidCache.end()), TopInt64ValidCache.end());
   std::rotate(FlushValuesPending.begin(), std::prev(FlushValuesPending.end()), FlushValuesPending.end());
   std::rotate(TopValidCache.begin(), std::prev(TopValidCache.end()), TopValidCache.end());
   FlushTopPending = true;
@@ -620,15 +645,34 @@ void X87StackOptimization::FlushCachedRegs() {
   }
 
   auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+  Ref ExactMask {};
   for (size_t i = 0; i < FlushValuesPending.size(); i++) {
     if (FlushValuesPending[i]) {
       OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(i);
       // Host-addressed, see LoadStackValueAtOffset_Slow.
       IREmit->_StoreMemHostFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
                                MemOffsetType::SXTX, 1);
+      if (ReducedPrecisionMode) {
+        if (!ExactMask) {
+          ExactMask = IREmit->_LoadContextGPR(OpSize::i8Bit, offsetof(Core::CPUState, x87_exact_valid));
+        }
+        Ref Bit = IREmit->_Lshl(OpSize::i32Bit, GetConstant(1), GetOffsetTopWithCache_Slow(i));
+        ExactMask = IREmit->_Andn(OpSize::i32Bit, ExactMask, Bit);
+        if (TopInt64Cache[i]) {
+          IREmit->_StoreMemHostFPR(OpSize::i64Bit, TopInt64Cache[i], TopOffsetAddress,
+                                   IREmit->_InlineConstant(offsetof(Core::CPUState, x87_exact_int)), OpSize::i64Bit,
+                                   MemOffsetType::SXTX, 1);
+          Ref ValidBit = IREmit->_Lshl(OpSize::i32Bit, TopInt64ValidCache[i], GetOffsetTopWithCache_Slow(i));
+          ExactMask = IREmit->_Or(OpSize::i32Bit, ExactMask, ValidBit);
+        }
+      }
       // store
       FlushValuesPending[i] = false;
     }
+  }
+
+  if (ExactMask) {
+    IREmit->_StoreContextGPR(OpSize::i8Bit, ExactMask, offsetof(Core::CPUState, x87_exact_valid));
   }
 
   if (FlushValidPending) {
@@ -712,6 +756,7 @@ Ref X87StackOptimization::SynchronizeStackValues() {
     if (Valid == StackSlot::VALID) {
       StoreStackValueAtOffset_Slow(StackMember.StackDataNode, i, false);
       TopInt64Cache[i] = StackMember.Int64Source;
+      TopInt64ValidCache[i] = StackMember.Int64Source ? GetConstant(1) : nullptr;
     }
   }
   { // Set valid tags
@@ -935,6 +980,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
           if (SlowPath) {
             TopValidCache.fill(StackSlot::INVALID);
             TopInt64Cache.fill(nullptr);
+            TopInt64ValidCache.fill(nullptr);
             FlushValidPending = true;
           } else {
             for (size_t i = 0; i < StackData.size; i++) {
@@ -973,6 +1019,7 @@ void X87StackOptimization::Run(IREmitter* Emit) {
           UpdateTopForPush_Slow();
           StoreStackValueAtOffset_Slow(SourceNode);
           TopInt64Cache[0] = CurrentIR.GetNode(Op->Int64Value);
+          TopInt64ValidCache[0] = GetConstant(1);
         } else {
           StackMemberInfo Member {SourceNode};
           Member.Int64Source = CurrentIR.GetNode(Op->Int64Value);
@@ -988,8 +1035,11 @@ void X87StackOptimization::Run(IREmitter* Emit) {
 
         if (SlowPath) {
           Ref St0 = LoadStackValueAtOffset_Slow(Offset);
+          auto [Exact, Valid] = LoadExactInt_Slow(Offset);
           UpdateTopForPush_Slow();
           StoreStackValueAtOffset_Slow(St0);
+          TopInt64Cache[0] = Exact;
+          TopInt64ValidCache[0] = Valid;
         } else {
           StackData.push(*Value);
         }
@@ -1015,9 +1065,14 @@ void X87StackOptimization::Run(IREmitter* Emit) {
           if (Valid == StackSlot::VALID && StackMember.Int64Source) {
             Result = StackMember.Int64Source;
           }
-        } else if (TopInt64Cache[0]) {
-          // Pushed by a FILD m64 earlier in this block's slow path.
-          Result = TopInt64Cache[0];
+        } else {
+          auto [Exact, Valid] = LoadExactInt_Slow(0);
+          if (Exact) {
+            Ref ExactGPR = IREmit->_VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, Exact, 0);
+            Ref Converted = IREmit->_VExtractToGPR(OpSize::i64Bit, OpSize::i64Bit, Result, 0);
+            Ref Selected = IREmit->_Select(OpSize::i64Bit, OpSize::i32Bit, CondClass::NEQ, Valid, GetConstant(0), ExactGPR, Converted);
+            Result = IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, Selected);
+          }
         }
 
         IREmit->ReplaceUsesWithAfter(CodeNode, Result, CodeNode);
@@ -1091,7 +1146,11 @@ void X87StackOptimization::Run(IREmitter* Emit) {
 
           // Need to store st0 to stack location - basically a copy.
           if (SlowPath) {
-            StoreStackValueAtOffset_Slow(LoadStackValueAtOffset_Slow(), Offset);
+            Ref Value = LoadStackValueAtOffset_Slow();
+            auto [Exact, Valid] = LoadExactInt_Slow(0);
+            StoreStackValueAtOffset_Slow(Value, Offset);
+            TopInt64Cache[Offset] = Exact;
+            TopInt64ValidCache[Offset] = Valid;
           } else {
             StackData.setTop(*Value, Offset);
           }
@@ -1122,8 +1181,14 @@ void X87StackOptimization::Run(IREmitter* Emit) {
           // Slow path: do actual memory operations
           Ref ValueTop = LoadStackValue();
           Ref ValueOffset = LoadStackValue(Offset);
+          auto [ExactTop, ValidTop] = LoadExactInt_Slow(0);
+          auto [ExactOffset, ValidOffset] = LoadExactInt_Slow(Offset);
           StoreStackValue(ValueOffset);
           StoreStackValue(ValueTop, Offset);
+          TopInt64Cache[0] = ExactOffset;
+          TopInt64ValidCache[0] = ValidOffset;
+          TopInt64Cache[Offset] = ExactTop;
+          TopInt64ValidCache[Offset] = ValidTop;
         } else {
           // Fast path: swap complete StackMemberInfo preserving Source metadata
           StackData.setTop(StackMemberOffset, 0);

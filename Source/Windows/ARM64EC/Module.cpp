@@ -578,6 +578,7 @@ static void LoadStateFromECContext(FEXCore::Core::InternalThreadState* Thread, C
       CTX->SetXMMRegistersFromState(Thread, reinterpret_cast<const __uint128_t*>(Context.FltSave.XmmRegisters), nullptr);
     }
     memcpy(State.mm, Context.FltSave.FloatRegisters, sizeof(State.mm));
+    State.x87_exact_valid = 0;
 
     State.FCW = Context.FltSave.ControlWord;
     State.flags[FEXCore::X86State::X87FLAG_IE_LOC] = Context.FltSave.StatusWord & 1;
@@ -2175,10 +2176,10 @@ NTSTATUS ThreadInit() {
   IosTiLog("[FEX-iOS] TI:callret\n");
 #endif
 #ifdef FEX_IOS_HOST
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) == 1512, "IOS_FRAME_SUSPEND_DOORBELL in Module.S");
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosCpuArea) == 4080, "IOS_FRAME_CPU_AREA in Module.S");
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosXpCallCount) == 4088, "IOS_FRAME_XP_COUNT in Module.S");
-  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosAliasHint) == 4096, "IOS_FRAME_ALIAS_HINT in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, SuspendDoorbell) == 1704, "IOS_FRAME_SUSPEND_DOORBELL in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosCpuArea) == 4272, "IOS_FRAME_CPU_AREA in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosXpCallCount) == 4280, "IOS_FRAME_XP_COUNT in Module.S");
+  static_assert(offsetof(FEXCore::Core::CpuStateFrame, IosAliasHint) == 4288, "IOS_FRAME_ALIAS_HINT in Module.S");
   // ExitFunctionECJit reads the CPU area from the frame; the doorbell it reads is the frame's own
   // SuspendDoorbell, which CPUArea.Area->SuspendDoorbell points at (set below).
   Thread->CurrentFrame->IosCpuArea = reinterpret_cast<uint64_t>(CPUArea.Area);

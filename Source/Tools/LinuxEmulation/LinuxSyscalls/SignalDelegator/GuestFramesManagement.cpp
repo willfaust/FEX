@@ -200,6 +200,7 @@ void SignalDelegator::RestoreFrame_x64(FEXCore::Core::InternalThreadState* Threa
     const uint16_t CurrentOffset = Frame->State.flags[FEXCore::X86State::X87FLAG_TOP_LOC];
     for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
       const auto modulo_i = (i + CurrentOffset) % 8;
+      Frame->State.x87_exact_valid = 0;
       memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], sizeof(Frame->State.mm[0]));
     }
   }
@@ -278,6 +279,7 @@ void SignalDelegator::RestoreFrame_ia32(FEXCore::Core::InternalThreadState* Thre
     for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
       // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
       const auto modulo_i = (i + CurrentOffset) % 8;
+      Frame->State.x87_exact_valid = 0;
       memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
     }
   }
@@ -357,6 +359,7 @@ void SignalDelegator::RestoreRTFrame_ia32(FEXCore::Core::InternalThreadState* Th
     for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_MMS; ++i) {
       // 32-bit st register size is only 10 bytes. Not padded to 16byte like x86-64
       const auto modulo_i = (i + CurrentOffset) % 8;
+      Frame->State.x87_exact_valid = 0;
       memcpy(&Frame->State.mm[modulo_i], &fpstate->_st[i], 10);
     }
   }

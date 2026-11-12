@@ -3227,6 +3227,7 @@ void OpDispatchBuilder::XRstorOpImpl(OpcodeArgs) {
 
 void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
   _StackForceSlow();
+  _StoreContextGPR(OpSize::i8Bit, Constant(0), offsetof(FEXCore::Core::CPUState, x87_exact_valid));
 
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, MemBase, OpSize::i16Bit);
   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
@@ -3286,6 +3287,7 @@ void OpDispatchBuilder::DefaultX87State(OpcodeArgs) {
   // We can piggy-back on FNINIT's implementation, since
   // it performs the same behavior as required by XRSTOR for resetting flags
   FNINIT(Op);
+  _StoreContextGPR(OpSize::i8Bit, Constant(0), offsetof(FEXCore::Core::CPUState, x87_exact_valid));
 
   // On top of resetting the flags to a default state, we also need to clear
   // all of the ST0-7/MM0-7 registers to zero.
