@@ -35,7 +35,7 @@ Ref OpDispatchBuilder::SaveReducedX87Value(Ref Top, Ref Value) {
   Ref Mask = _LoadContextGPR(OpSize::i8Bit, offsetof(Core::CPUState, x87_exact_valid));
   Ref Tags = _LoadContextGPR(OpSize::i8Bit, offsetof(Core::CPUState, AbridgedFTW));
   Ref Valid = _And(OpSize::i64Bit, _Lshr(OpSize::i64Bit, _And(OpSize::i64Bit, Mask, Tags), Top), Constant(1));
-  Ref Integer = _LoadContextGPRIndexed(Top, OpSize::i64Bit, offsetof(Core::CPUState, x87_exact_int), 16);
+  Ref Integer = _LoadContextGPRIndexed(_Lshl(OpSize::i32Bit, Top, Constant(1)), OpSize::i64Bit, offsetof(Core::CPUState, x87_exact_int), 8);
   Ref Zero = Constant(0);
   Ref Sign = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::SLT, Integer, Zero, Constant(0x8000), Zero);
   Ref Magnitude = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::SLT, Integer, Zero, Sub(OpSize::i64Bit, Zero, Integer), Integer);
@@ -67,7 +67,7 @@ Ref OpDispatchBuilder::RestoreReducedX87Value(Ref Top, Ref Value, Ref Mask) {
   Ref Normal = _Lshr(OpSize::i64Bit, Mantissa, Constant(63));
   Ref Valid = _And(OpSize::i64Bit, Equal, _And(OpSize::i64Bit, Lower, _And(OpSize::i64Bit, Normal, _Or(OpSize::i64Bit, Upper, Limit))));
   Ref Integer = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Sign, Zero, Sub(OpSize::i64Bit, Zero, Magnitude), Magnitude);
-  _StoreContextGPRIndexed(Integer, Top, OpSize::i64Bit, offsetof(Core::CPUState, x87_exact_int), 16);
+  _StoreContextGPRIndexed(Integer, _Lshl(OpSize::i32Bit, Top, Constant(1)), OpSize::i64Bit, offsetof(Core::CPUState, x87_exact_int), 8);
   return _Or(OpSize::i32Bit, Mask, _Lshl(OpSize::i32Bit, Valid, Top));
 }
 
