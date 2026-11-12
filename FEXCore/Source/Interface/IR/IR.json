@@ -2929,7 +2929,6 @@
         "Desc": [
           "Reduced precision only: the 64-bit integer for a FIST of the top of the stack.",
           "If the top was pushed by PushStackFromInt64 and is unchanged, its Int64Value, which a 64-bit float may not hold exactly;",
-          "in a later block, the integer kept in the upper half of the register's context slot when it converts to the top;",
           "otherwise Converted, the top converted to a 64-bit integer."
         ],
         "DestSize": "OpSize::i64Bit",

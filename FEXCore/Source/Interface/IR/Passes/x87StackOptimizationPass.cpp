@@ -352,9 +352,7 @@ private:
   std::array<Ref, 8> TopOffsetCache {};
   std::array<Ref, 8> TopOffsetAddressCache {};
   std::array<Ref, 8> TopValueCache {};
-  // Reduced precision, slow path: the integer of a FILD m64 for a pending TopValueCache value
-  // (null if the value is not one). The flush stores it in the upper half of the register's
-  // 16-byte context slot, beside the double, so that a FIST m64 in a later block can find it.
+  // Reduced precision: exact FILD m64 integer while its source is known in this block.
   std::array<Ref, 8> TopInt64Cache {};
   std::array<StackSlot, 8> TopValidCache {};
 
@@ -481,8 +479,7 @@ inline Ref X87StackOptimization::GetX87ValidTag_Slow(uint8_t Offset) {
 
 inline Ref X87StackOptimization::LoadStackValueAtOffset_Slow(uint8_t Offset) {
   OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(Offset);
-  // Preserve the integer shadow beside the reduced-precision value across blocks.
-  const auto Size = OpSize::i128Bit;
+  auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
   if (!TopValueCache[Offset]) {
     // TopOffsetAddress is `STATE + index * 16` from _FormContextAddress: a host pointer, so it takes
     // the host-addressed form (identical to _LoadMemFPR unless a guest window is supported).
@@ -619,17 +616,12 @@ void X87StackOptimization::FlushCachedRegs() {
     FlushTopPending = false;
   }
 
-  // Preserve the integer shadow beside the reduced-precision value across blocks.
-  const auto Size = OpSize::i128Bit;
+  auto Size = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
   for (size_t i = 0; i < FlushValuesPending.size(); i++) {
     if (FlushValuesPending[i]) {
       OrderedNode* TopOffsetAddress = GetOffsetTopAddressWithCache_Slow(i);
       // Host-addressed, see LoadStackValueAtOffset_Slow.
-      Ref Value = TopValueCache[i];
-      if (ReducedPrecisionMode && TopInt64Cache[i]) {
-        Value = IREmit->_VInsElement(OpSize::i128Bit, OpSize::i64Bit, 1, 0, Value, TopInt64Cache[i]);
-      }
-      IREmit->_StoreMemHostFPR(Size, Value, TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
+      IREmit->_StoreMemHostFPR(Size, TopValueCache[i], TopOffsetAddress, IREmit->_InlineConstant(MMBaseOffset()), Size,
                                MemOffsetType::SXTX, 1);
       // store
       FlushValuesPending[i] = false;
@@ -1022,18 +1014,6 @@ void X87StackOptimization::Run(IREmitter* Emit) {
         } else if (TopInt64Cache[0]) {
           // Pushed by a FILD m64 earlier in this block's slow path.
           Result = TopInt64Cache[0];
-        } else if (!FlushValuesPending[0]) {
-          // Unchanged since the block began: an earlier block may have left a FILD m64's integer
-          // in the upper half of the slot (Delphi's Move loads 8 bytes before a loop and stores
-          // them after it). The upper half may also be stale or any register's upper half, so it
-          // is used only when it converts to the double on the stack: then it is the FILD's
-          // integer, or for a value of 2^53 or more an integer that rounds to that value too.
-          Ref Value = LoadStackValueAtOffset_Slow(0);
-          Ref Int64Value = IREmit->_LoadMemHostGPR(OpSize::i64Bit, GetOffsetTopAddressWithCache_Slow(0),
-                                               IREmit->_InlineConstant(MMBaseOffset() + 8), OpSize::i64Bit, MemOffsetType::SXTX, 1);
-          Ref Int64AsDouble = IREmit->_Float_FromGPR_S(OpSize::i64Bit, OpSize::i64Bit, Int64Value);
-          Ref Same = IREmit->_VFCMPEQ(OpSize::i64Bit, OpSize::i64Bit, Int64AsDouble, Value);
-          Result = IREmit->_VBSL(OpSize::i64Bit, Same, IREmit->_VCastFromGPR(OpSize::i64Bit, OpSize::i64Bit, Int64Value), Result);
         }
 
         IREmit->ReplaceUsesWithAfter(CodeNode, Result, CodeNode);

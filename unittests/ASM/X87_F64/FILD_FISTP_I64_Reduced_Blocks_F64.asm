@@ -1,19 +1,19 @@
 %ifdef CONFIG
 {
   "RegData": {
-    "RAX": "0x84280002320300a8",
-    "RBX": "0x0047005c003a0043",
-    "RCX": "0x005c00730065006d",
-    "RDX": "0x84280002320300a8",
+    "RAX": "0x8428000232030000",
+    "RBX": "0x0047005c003a0044",
+    "RCX": "0x005c00730065006c",
+    "RDX": "0x8428000232030000",
     "RSI": "0x8428000232030000"
   },
   "Env": { "FEX_X87REDUCEDPRECISION" : "1" }
 }
 %endif
 
-; fild m64 and fistp m64 in different blocks: a branch target starts a new
-; block, whose x87 stack is read back from the context. Delphi's Move copies
-; 8 bytes this way around a branch or a loop.
+; A value crossing a block uses reduced-precision conversion. In particular,
+; do not recover a stale integer from the upper half of the x87 context slot.
+; Exact 64-bit transfers across blocks remain unsupported in reduced mode.
 mov rdi, 0xe0000000
 
 mov rax, 0x84280002320300a8
