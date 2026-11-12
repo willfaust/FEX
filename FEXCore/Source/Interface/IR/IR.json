@@ -2880,7 +2880,7 @@
       "PushStackFromInt64 FPR:$X80Src, FPR:$Int64Value": {
         "Desc": [
           "Reduced precision only: pushes X80Src, the 64-bit float converted from the 64-bit integer Int64Value, on to the x87 stack.",
-          "Tracks Int64Value so that ReadStackInt64 returns it exactly while the value is unchanged on the stack."
+          "Allows ReadStackInt64 to return Int64Value exactly when its unchanged provenance is known within the translated block."
         ],
         "HasSideEffects": true,
         "X87": true
@@ -2928,7 +2928,7 @@
       "FPR = ReadStackInt64 FPR:$Converted": {
         "Desc": [
           "Reduced precision only: the 64-bit integer for a FIST of the top of the stack.",
-          "If the top was pushed by PushStackFromInt64 and is unchanged, its Int64Value, which a 64-bit float may not hold exactly;",
+          "If the unchanged PushStackFromInt64 provenance is known within this block, its Int64Value, which a 64-bit float may not hold exactly;",
           "otherwise Converted, the top converted to a 64-bit integer."
         ],
         "DestSize": "OpSize::i64Bit",
