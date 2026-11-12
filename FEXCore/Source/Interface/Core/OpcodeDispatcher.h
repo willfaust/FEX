@@ -2387,6 +2387,8 @@ private:
   /**  @} */
 
   Ref GetX87Top();
+  Ref SaveReducedX87Value(Ref Top, Ref Value);
+  Ref RestoreReducedX87Value(Ref Top, Ref Value, Ref Mask);
   void SetX87FTW(Ref FTW);
   Ref GetX87FTW_Helper();
   void SetX87Top(Ref Value);

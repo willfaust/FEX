@@ -3112,7 +3112,7 @@ void OpDispatchBuilder::SaveX87State(OpcodeArgs, Ref MemBase) {
   for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
     Ref data = _LoadContextFPRIndexed(Top, LoadSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
     if (ReducedPrecisionMode) {
-      data = _F80CVTTo(data, OpSize::i64Bit);
+      data = SaveReducedX87Value(Top, data);
     }
     _StoreMemFPR(OpSize::i128Bit, data, MemBase, Constant(16 * i + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
     Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
@@ -3243,10 +3243,19 @@ void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
     _StoreContextGPR(OpSize::i8Bit, NewFTW, offsetof(FEXCore::Core::CPUState, AbridgedFTW));
   }
 
-  for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; i += 2) {
-    auto MMRegs = LoadMemPairFPR(OpSize::i128Bit, MemBase, i * 16 + 32);
-    _StoreContextFPR(OpSize::i128Bit, MMRegs.Low, MMBaseOffset() + i * 16);
-    _StoreContextFPR(OpSize::i128Bit, MMRegs.High, MMBaseOffset() + (i + 1) * 16);
+  Ref Top = GetX87Top();
+  Ref ExactMask = Constant(0);
+  for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
+    Ref Value = _LoadMemFPR(OpSize::i128Bit, MemBase, Constant(i * 16 + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+    if (ReducedPrecisionMode) {
+      ExactMask = RestoreReducedX87Value(Top, Value, ExactMask);
+      Value = _F80CVT(OpSize::i64Bit, Value);
+    }
+    _StoreContextFPRIndexed(Value, Top, ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit, MMBaseOffset(), 16);
+    Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), Constant(7));
+  }
+  if (ReducedPrecisionMode) {
+    _StoreContextGPR(OpSize::i8Bit, ExactMask, offsetof(Core::CPUState, x87_exact_valid));
   }
 }
 
