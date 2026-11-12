@@ -1,6 +1,6 @@
 %ifdef CONFIG
 {
-  "RegData": { "RAX": "0x0020000000000001", "RBX": "0x8000000000000000", "RCX": "0x0000000000000002" },
+  "RegData": { "RAX": "0x0020000000000001", "RBX": "0x8000000000000000", "RCX": "0x0000000000000002", "RDX": "0x8000000000000400", "RSI": "0x4034", "R8": "0x8000000000000000", "R9": "0xc03e" },
   "Env": { "FEX_X87REDUCEDPRECISION": "1" }
 }
 %endif
@@ -14,6 +14,8 @@ jz .save
 nop
 .save:
 fxsave [rdi + 0x100]
+mov rdx, [rdi + 0x120]
+movzx rsi, word [rdi + 0x128]
 fstp st0
 fld1
 fxrstor [rdi + 0x100]
@@ -27,6 +29,8 @@ jz .legacy
 nop
 .legacy:
 fnsave [rdi + 0x300]
+mov r8, [rdi + 0x31c]
+movzx r9, word [rdi + 0x324]
 frstor [rdi + 0x300]
 fistp qword [rdi + 24]
 mov rbx, [rdi + 24]
