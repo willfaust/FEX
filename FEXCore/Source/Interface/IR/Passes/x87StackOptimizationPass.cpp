@@ -925,12 +925,14 @@ void X87StackOptimization::Run(IREmitter* Emit) {
         if (Offset != 0xff) { // invalidate single offset
           if (SlowPath) {
             SetX87ValidTag(Offset, false);
+            TopInt64Cache[Offset] = nullptr;
           } else {
             StackData.setTagInvalid(Offset);
           }
         } else { // invalidate all
           if (SlowPath) {
             TopValidCache.fill(StackSlot::INVALID);
+            TopInt64Cache.fill(nullptr);
             FlushValidPending = true;
           } else {
             for (size_t i = 0; i < StackData.size; i++) {
