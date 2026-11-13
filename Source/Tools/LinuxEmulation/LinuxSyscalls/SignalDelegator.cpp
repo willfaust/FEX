@@ -397,6 +397,7 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
   // This state will be restored on rt_sigreturn
   memset(Frame->State.xmm.avx.data, 0, sizeof(Frame->State.xmm));
   memset(Frame->State.mm, 0, sizeof(Frame->State.mm));
+  Frame->State.x87_exact_valid = 0;
   Frame->State.FCW = 0x37F;
   Frame->State.AbridgedFTW = 0;
 

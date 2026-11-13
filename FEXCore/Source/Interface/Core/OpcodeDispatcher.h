@@ -2041,6 +2041,9 @@ private:
   void StoreContext(uint8_t Index, Ref Value) {
     LOGMAN_THROW_A_FMT(Index < 64, "valid index");
     LOGMAN_THROW_A_FMT(Value != InvalidNode, "storing valid");
+    if (Index >= MM0Index && Index <= MM7Index) {
+      _StoreContextGPR(OpSize::i8Bit, Constant(0), offsetof(FEXCore::Core::CPUState, x87_exact_valid));
+    }
 
     uint64_t Bit = (1ull << (uint64_t)Index);
 
@@ -2384,6 +2387,8 @@ private:
   /**  @} */
 
   Ref GetX87Top();
+  Ref SaveReducedX87Value(Ref Top, Ref Value);
+  Ref RestoreReducedX87Value(Ref Top, Ref Value, Ref Mask);
   void SetX87FTW(Ref FTW);
   Ref GetX87FTW_Helper();
   void SetX87Top(Ref Value);
@@ -2391,6 +2396,7 @@ private:
   void ChgStateX87_MMX() override {
     LOGMAN_THROW_A_FMT(MMXState == MMXState_X87, "Expected state to be x87");
     _StackForceSlow();
+    _StoreContextGPR(OpSize::i8Bit, Constant(0), offsetof(FEXCore::Core::CPUState, x87_exact_valid));
     SetX87Top(Constant(0)); // top reset to zero
     _StoreContextGPR(OpSize::i8Bit, Constant(0xFFFFUL), offsetof(FEXCore::Core::CPUState, AbridgedFTW));
     MMXState = MMXState_MMX;

@@ -30,8 +30,50 @@ Ref OpDispatchBuilder::GetX87Top() {
   return _LoadContextGPR(OpSize::i8Bit, offsetof(FEXCore::Core::CPUState, flags) + FEXCore::X86State::X87FLAG_TOP_LOC);
 }
 
+// Save the original integer in the architectural 80-bit format when it is known.
+Ref OpDispatchBuilder::SaveReducedX87Value(Ref Top, Ref Value) {
+  Ref Mask = _LoadContextGPR(OpSize::i8Bit, offsetof(Core::CPUState, x87_exact_valid));
+  Ref Tags = _LoadContextGPR(OpSize::i8Bit, offsetof(Core::CPUState, AbridgedFTW));
+  Ref Valid = _And(OpSize::i64Bit, _Lshr(OpSize::i64Bit, _And(OpSize::i64Bit, Mask, Tags), Top), Constant(1));
+  Ref Integer = _LoadContextGPRIndexed(_Lshl(OpSize::i32Bit, Top, Constant(1)), OpSize::i64Bit, offsetof(Core::CPUState, x87_exact_int), 8);
+  Ref Zero = Constant(0);
+  Ref Sign = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::SLT, Integer, Zero, Constant(0x8000), Zero);
+  Ref Magnitude = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::SLT, Integer, Zero, Sub(OpSize::i64Bit, Zero, Integer), Integer);
+  Ref Shift = Sub(OpSize::i64Bit, Constant(63), _FindMSB(OpSize::i64Bit, Magnitude));
+  Ref Mantissa = _Lshl(OpSize::i64Bit, Magnitude, Shift);
+  Ref Exponent = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Magnitude, Zero, Zero, Sub(OpSize::i64Bit, Constant(0x403e), Shift));
+  Ref Original = _F80CVTTo(Value, OpSize::i64Bit);
+  Ref Low = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Valid, Zero, Mantissa, _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Original, 0));
+  Ref High = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Valid, Zero, _Or(OpSize::i64Bit, Sign, Exponent), _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Original, 1));
+  return _VLoadTwoGPRs(Low, High);
+}
+
+// Recover an exact signed integer only when the saved 80-bit value is integral and in range.
+Ref OpDispatchBuilder::RestoreReducedX87Value(Ref Top, Ref Value, Ref Mask) {
+  Ref Zero = Constant(0), One = Constant(1);
+  Ref Mantissa = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Value, 0);
+  Ref High = _VExtractToGPR(OpSize::i128Bit, OpSize::i64Bit, Value, 1);
+  Ref Exponent = _And(OpSize::i64Bit, High, Constant(0x7fff));
+  Ref Sign = _And(OpSize::i64Bit, High, Constant(0x8000));
+  Ref Shift = Sub(OpSize::i64Bit, Constant(0x403e), Exponent);
+  Ref Magnitude = _Lshr(OpSize::i64Bit, Mantissa, Shift);
+  Ref Equal = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, _Lshl(OpSize::i64Bit, Magnitude, Shift), Mantissa, One, Zero);
+  Ref Lower = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::UGE, Exponent, Constant(0x3fff), One, Zero);
+  Ref Upper = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::ULT, Exponent, Constant(0x403e), One, Zero);
+  Ref Limit = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Exponent, Constant(0x403e), One, Zero);
+  Ref Negative = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Sign, Zero, One, Zero);
+  Ref ExactLimit = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::EQ, Mantissa, Constant(0x8000000000000000ULL), One, Zero);
+  Limit = _And(OpSize::i64Bit, Limit, _And(OpSize::i64Bit, Negative, ExactLimit));
+  Ref Normal = _Lshr(OpSize::i64Bit, Mantissa, Constant(63));
+  Ref Valid = _And(OpSize::i64Bit, Equal, _And(OpSize::i64Bit, Lower, _And(OpSize::i64Bit, Normal, _Or(OpSize::i64Bit, Upper, Limit))));
+  Ref Integer = _Select(OpSize::i64Bit, OpSize::i64Bit, CondClass::NEQ, Sign, Zero, Sub(OpSize::i64Bit, Zero, Magnitude), Magnitude);
+  _StoreContextGPRIndexed(Integer, _Lshl(OpSize::i32Bit, Top, Constant(1)), OpSize::i64Bit, offsetof(Core::CPUState, x87_exact_int), 8);
+  return _Or(OpSize::i32Bit, Mask, _Lshl(OpSize::i32Bit, Valid, Top));
+}
+
 void OpDispatchBuilder::SetX87FTW(Ref FTW) {
   _StackForceSlow(); // Invalidate x87 FTW register cache
+  _StoreContextGPR(OpSize::i8Bit, Constant(0), offsetof(FEXCore::Core::CPUState, x87_exact_valid));
 
   // For the output, we want a 1-bit for each pair not equal to 11 (Empty).
   static_assert(static_cast<uint8_t>(FPState::X87Tag::Empty) == 0b11);
@@ -520,7 +562,7 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
   for (int i = 0; i < 7; ++i) {
     Ref data = _LoadContextFPRIndexed(Top, LoadSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
     if (ReducedPrecisionMode) {
-      data = _F80CVTTo(data, OpSize::i64Bit);
+      data = SaveReducedX87Value(Top, data);
     }
     _StoreMemFPR(OpSize::i128Bit, data, Mem, Constant((IR::OpSizeToSize(Size) * 7) + (10 * i)), OpSize::i8Bit, MemOffsetType::SXTX, 1);
     Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
@@ -529,7 +571,7 @@ void OpDispatchBuilder::X87FNSAVE(OpcodeArgs) {
   // The final st(7) needs a bit of special handling here
   Ref data = _LoadContextFPRIndexed(Top, LoadSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
   if (ReducedPrecisionMode) {
-    data = _F80CVTTo(data, OpSize::i64Bit);
+    data = SaveReducedX87Value(Top, data);
   }
   // ST7 broken in to two parts
   // Lower 64bits [63:0]
@@ -572,12 +614,13 @@ void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
   auto high = Constant(0xFFFF);
   Ref Mask = _VLoadTwoGPRs(low, high);
   const auto StoreSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+  Ref ExactMask = Constant(0);
   for (int i = 0; i < 7; ++i) {
     Ref Reg = _LoadMemFPR(OpSize::i128Bit, Mem, Constant((IR::OpSizeToSize(Size) * 7) + (10 * i)), OpSize::i8Bit, MemOffsetType::SXTX, 1);
     // Mask off the top bits
     Reg = _VAnd(OpSize::i128Bit, OpSize::i128Bit, Reg, Mask);
     if (ReducedPrecisionMode) {
-      // Convert to double precision
+      ExactMask = RestoreReducedX87Value(Top, Reg, ExactMask);
       Reg = _F80CVT(OpSize::i64Bit, Reg);
     }
     _StoreContextFPRIndexed(Reg, Top, StoreSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
@@ -593,7 +636,9 @@ void OpDispatchBuilder::X87FRSTOR(OpcodeArgs) {
   Ref RegHigh = _LoadMemFPR(OpSize::i16Bit, Mem, Constant((IR::OpSizeToSize(Size) * 7) + (10 * 7) + 8), OpSize::i8Bit, MemOffsetType::SXTX, 1);
   Reg = _VInsElement(OpSize::i128Bit, OpSize::i16Bit, 4, 0, Reg, RegHigh);
   if (ReducedPrecisionMode) {
-    Reg = _F80CVT(OpSize::i64Bit, Reg); // Convert to double precision
+    ExactMask = RestoreReducedX87Value(Top, Reg, ExactMask);
+    Reg = _F80CVT(OpSize::i64Bit, Reg);
+    _StoreContextGPR(OpSize::i8Bit, ExactMask, offsetof(Core::CPUState, x87_exact_valid));
   }
   _StoreContextFPRIndexed(Reg, Top, StoreSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
 }
