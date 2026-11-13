@@ -253,7 +253,6 @@ struct alignas(64) CPUState {
   constexpr static uint32_t SEGMENT_ARRAY_INDEX_LDT = 1;
   Core::CPUState::gdt_segment private_gdt[32] {};
 
-  // shortcut: ARM64EC context conversions lose provenance, upgrade when they preserve full x87 values.
   // Kept separate from ARM64EC's mm state.
   alignas(16) uint64_t x87_exact_int[8][2] {};
   uint8_t x87_exact_valid {};

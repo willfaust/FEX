@@ -990,6 +990,14 @@ NTSTATUS ProcessInit() {
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
   FEX::Windows::Logging::Init();
+  {
+    FEX_CONFIG_OPT(ReducedX87, X87REDUCEDPRECISION);
+    if (ReducedX87) {
+      // ARM64EC maps native GPRs onto all 80 bits of the x87 register slots.
+      FEXCore::Config::Set(FEXCore::Config::CONFIG_X87REDUCEDPRECISION, "0");
+      LogMan::Msg::IFmt("FEX: using full x87 precision for ARM64EC context fidelity");
+    }
+  }
 
 #ifdef FEX_IOS_HOST
   /* Recorder emitted only for this executable, before CTX/JIT creation. */
