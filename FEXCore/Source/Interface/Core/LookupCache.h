@@ -633,6 +633,85 @@ private:
     IosL1ReportTicks = Now;
     IosL1MissesAtReport = IosL1Misses;
   }
+
+
+public:
+  /* madeira-duo (20 Nov 2026): pool-copy alias redirects on this thread (Core.cpp alias-first and
+   * ml315). About every 30 s the thread logs its rate and its heaviest PE targets, so the log names
+   * which DLL's code the game reaches through alias addresses (map a target to its module with the
+   * "Load module" lines). The target table is 16 slots, each a frequent-items counter: a different
+   * target landing on a held slot takes a count away and replaces the holder only at zero, so a
+   * target that dominates its slot stays. Thread-local state only; no atomics. */
+  void IosNoteAliasRedirect(uint64_t PeRIP) {
+    const uint32_t Slot = static_cast<uint32_t>((PeRIP >> 4) ^ (PeRIP >> 12)) & 15;
+    if (IosAliasTarget[Slot] == PeRIP) {
+      ++IosAliasHits[Slot];
+    } else if (IosAliasHits[Slot] == 0) {
+      IosAliasTarget[Slot] = PeRIP;
+      IosAliasHits[Slot] = 1;
+    } else {
+      --IosAliasHits[Slot];
+    }
+    if ((++IosAliasRedirects & 0xfff) != 0) {
+      return;
+    }
+    uint64_t Now, Frequency;
+    __asm volatile("mrs %0, cntvct_el0" : "=r"(Now));
+    __asm volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
+    if (!IosAliasReportTicks) {
+      IosAliasReportTicks = Now;
+      IosAliasRedirectsAtReport = IosAliasRedirects;
+      return;
+    }
+    const uint64_t Elapsed = Now - IosAliasReportTicks;
+    if (Elapsed < Frequency * 30) {
+      return;
+    }
+    const uint64_t Window = IosAliasRedirects - IosAliasRedirectsAtReport;
+    uint32_t Order[16];
+    for (uint32_t i = 0; i < 16; i++) {
+      Order[i] = i;
+    }
+    for (uint32_t i = 0; i < 6; i++) {
+      for (uint32_t j = i + 1; j < 16; j++) {
+        if (IosAliasHits[Order[j]] > IosAliasHits[Order[i]]) {
+          const uint32_t Swap = Order[i];
+          Order[i] = Order[j];
+          Order[j] = Swap;
+        }
+      }
+    }
+    LogMan::Msg::EFmt("[alias-redir] tid={:04x} {:.0f}/s over {:.1f}s, total={}; top PE targets (approximate counts): "
+                      "{:#x} {}, {:#x} {}, {:#x} {}, {:#x} {}, {:#x} {}, {:#x} {}",
+                      IosCurrentTid(), double(Window) * double(Frequency) / double(Elapsed), double(Elapsed) / double(Frequency),
+                      IosAliasRedirects, IosAliasTarget[Order[0]], IosAliasHits[Order[0]], IosAliasTarget[Order[1]],
+                      IosAliasHits[Order[1]], IosAliasTarget[Order[2]], IosAliasHits[Order[2]], IosAliasTarget[Order[3]],
+                      IosAliasHits[Order[3]], IosAliasTarget[Order[4]], IosAliasHits[Order[4]], IosAliasTarget[Order[5]],
+                      IosAliasHits[Order[5]]);
+    for (uint32_t i = 0; i < 16; i++) {
+      IosAliasHits[i] = 0;
+      IosAliasTarget[i] = 0;
+    }
+    IosAliasReportTicks = Now;
+    IosAliasRedirectsAtReport = IosAliasRedirects;
+  }
+
+private:
+  uint64_t IosAliasRedirects {};
+  uint64_t IosAliasRedirectsAtReport {};
+  uint64_t IosAliasReportTicks {};
+  uint64_t IosAliasTarget[16] {};
+  uint64_t IosAliasHits[16] {};
+
+  static uint32_t IosCurrentTid() {
+    if (!IosTebTsdOffset) {
+      return 0;
+    }
+    uint64_t Tpidrro;
+    __asm volatile("mrs %0, TPIDRRO_EL0" : "=r"(Tpidrro));
+    const uint64_t Teb = *reinterpret_cast<const uint64_t*>((Tpidrro & ~uint64_t(7)) + IosTebTsdOffset);
+    return Teb ? *reinterpret_cast<const uint32_t*>(Teb + 0x48) : 0;
+  }
 #endif
 
   uintptr_t PagePointer;

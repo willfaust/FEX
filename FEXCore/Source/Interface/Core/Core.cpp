@@ -1609,6 +1609,33 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 #endif
 
 #ifdef FEX_IOS_HOST
+  /* madeira-duo (20 Nov 2026): alias-first. A pool-copy alias never gets a block (ml315 below), so the
+   * fast path's FindBlock under CodeInvalidationMutex could only miss for one, and then ml315 redirected
+   * it. Path of Exile 2 calls x64 code in hybrid DLLs through pool-copy addresses (madeira_d3d12's
+   * list-journal methods and trampolines, ntdll's syscall entry) about 450K times a second per frame
+   * thread: the shared-lock round trips, the lookup read lock and the block-map probe were 27% of those
+   * threads' CPU (fexl1-run1 profile). The reverse translation takes no lock (its per-chunk answer
+   * cache hits), so check it first and go straight back to the dispatcher with the PE VA, exactly as
+   * ml315 does. Delivery-mode calls (ml455) redirect the same way there, so no condition on them here.
+   * The callret bounds check stays; PreCompile's cross-process work waits for the next real compile,
+   * as it does for every dispatcher L1 hit. MADEIRA_FEX_ALIAS_FIRST=0 turns it off. */
+  {
+    static int AliasFirstOn = -1;
+    if (AliasFirstOn < 0) {
+      const char* Env = getenv("MADEIRA_FEX_ALIAS_FIRST");
+      AliasFirstOn = !(Env && Env[0] == '0');
+    }
+    if (AliasFirstOn && GuestRIP >= 0x10000) {
+      const uint64_t PeRIP = IosJitReverseTranslate(GuestRIP);
+      if (PeRIP != GuestRIP) {
+        CheckCallRetBounds(Frame, GuestRIP);
+        Thread->LookupCache->IosNoteAliasRedirect(PeRIP);
+        Frame->State.rip = PeRIP;
+        return Frame->Pointers.DispatcherLoopTop;
+      }
+    }
+  }
+
   /* MADEIRA: cache-hit fast path. Nearly every call here is a lookup that L3 answers (the emitted
    * dispatcher only probes L1, and L2 is off on iOS), and the reports, RIP checks and telemetry below
    * ran on every one of them: IosJitReverseTranslate, IsAddressInCodeBuffer, and shared counters
@@ -1735,6 +1762,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                           "-- redirecting to PE VA and re-entering the dispatcher",
                           N + 1, GuestRIP, PeRIP);
       }
+      Thread->LookupCache->IosNoteAliasRedirect(PeRIP);
       Frame->State.rip = PeRIP;
       return Frame->Pointers.DispatcherLoopTop;
     }
