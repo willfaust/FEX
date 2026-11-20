@@ -954,7 +954,7 @@ uint32_t MadeiraJitMapSeq;
  * their jit-map record, to %LOCALAPPDATA%\fex-jitcode-<pid>.bin. For reading
  * what the profile's hot host offsets inside a block actually execute. */
 FILE* MadeiraJitCodeFile;
-uint64_t MadeiraJitCodeRIPs[16];
+uint64_t MadeiraJitCodeRIPs[128];   /* madeira-duo: was 16; the hottest functions of a whole profile in one run */
 uint32_t MadeiraJitCodeCount;
 void MadeiraJitMapWrite(uint64_t HostBegin, uint64_t HostSize, uint64_t GuestRIP, uint64_t GuestSize) {
   struct {
@@ -998,7 +998,7 @@ void MadeiraJitMapInit(const fextl::string& ExecutableName) {
   if (!MadeiraJitMapFile || !CodeWant || !CodeWant[0]) {
     return;
   }
-  for (const char* Entry = CodeWant; *Entry && MadeiraJitCodeCount < 16;) {
+  for (const char* Entry = CodeWant; *Entry && MadeiraJitCodeCount < 128;) {
     const char* End = strchr(Entry, ',');
     const fextl::string Item(Entry, End ? End - Entry : strlen(Entry));
     const auto Plus = Item.find('+');
