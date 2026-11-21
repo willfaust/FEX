@@ -57,7 +57,10 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
   , Threads {Threads} {
 #endif
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
-  SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+  // FULL validates every instruction's bytes before it runs, so write-trapping RWX pages adds a
+  // fault per store without catching anything new, and it makes the guest observe PAGE_EXECUTE_READ
+  // where Windows would report RWX.
+  SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE || SMCChecks == FEXCore::Config::CONFIG_SMC_FULL);
 
   MEMORY_BASIC_INFORMATION Info;
   uint64_t Address = 0;
@@ -129,6 +132,10 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
       if (EffectiveRWX) {
         LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
         RWXIntervals.Insert(ProtInterval);
+      } else {
+        // Code made read-only again (e.g. after in-place decryption) can no longer be written, and
+        // an RWX write-trap here would wrongly grant write access.
+        RWXIntervals.Remove(ProtInterval);
       }
       if (DEPDisabled && !HasExec) {
         DEPPromotedIntervals.Insert(ProtInterval);
@@ -486,29 +493,50 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
 
-  InvalidateIntervalInternal(AlignedBase, AlignedSize);
-
   if (Free) {
-    std::unique_lock Lock(IntervalsLock);
-    // ml437 (#74): this fires on EVERY guest free/decommit (the ml201 probe is
-    // unconditional) — ml436 logged 4,234 lines of ordinary heap decommit
-    // churn, drowning the log and costing a dprintf syscall per free. The
-    // signal (which path removes a tracked range) is preserved by the first 40
-    // plus a 1-in-64 sample.
-    static std::atomic<uint32_t> AlignedRemoveCount;
-    const auto N = AlignedRemoveCount.fetch_add(1) + 1;
-    if (N <= 40 || !(N & 63)) {
-      LogMan::Msg::EFmt("[iOS-xrem] via=aligned #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
-                        AlignedBase, AlignedBase + AlignedSize);
+    bool WasExecutable = false;
+    {
+      std::unique_lock Lock(IntervalsLock);
+      const FEXCore::IntervalList<uint64_t>::Interval FreeInterval {AlignedBase, AlignedBase + AlignedSize};
+      WasExecutable = XIntervals.Intersect(FreeInterval);
+      if (WasExecutable) {
+        /* ml437 (#74): this fires on EVERY guest free/decommit (the ml201 probe is
+         * unconditional) — ml436 logged 4,234 lines of ordinary heap decommit churn,
+         * drowning the log and costing a dprintf syscall per free. Keep the signal with
+         * the first 40 plus a 1-in-64 sample. */
+        static std::atomic<uint32_t> AlignedRemoveCount;
+        const auto N = AlignedRemoveCount.fetch_add(1) + 1;
+        if (N <= 40 || !(N & 63)) {
+          LogMan::Msg::EFmt("[iOS-xrem] via=aligned #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                            AlignedBase, AlignedBase + AlignedSize);
+        }
+        XIntervals.Remove(FreeInterval);
+        RWXIntervals.Remove(FreeInterval);
+        ForgetHotSMCPages(AlignedBase, AlignedBase + AlignedSize);
+      }
     }
-    XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
-    RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
-    ForgetHotSMCPages(AlignedBase, AlignedBase + AlignedSize);
+    if (!WasExecutable) {
+      return;
+    }
+  } else if (AlignedBase + AlignedSize > AlignedBase) {
+    // Code is only ever decoded from pages in XIntervals (QueryExecutableRange inserts any VMA it
+    // recovers), and every removal from XIntervals invalidates. Writes into memory that is not
+    // executable, such as file reads into data buffers, cannot reach a translation.
+    std::shared_lock Lock(IntervalsLock);
+    if (!XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize})) {
+      return;
+    }
   }
+
+  InvalidateIntervalInternal(AlignedBase, AlignedSize);
 }
 
+
 void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size) {
-  ProtectRWXIntervalsInternal(Address, Size, false);
+  // Full SMC already CRC-checks writable blocks at entry. Re-trapping the trampoline pool after
+  // every compile was NtProtect + fault at tens of kHz.
+  (void)Address;
+  (void)Size;
 }
 
 bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress,
@@ -726,10 +754,6 @@ FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionL
 
 // NOTE: IntervalsLock must be held (shared or exclusive) by the caller.
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRangeLocked(uint64_t Address) {
-#else
-FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
-  std::shared_lock Lock(IntervalsLock);
-#endif
   const auto XResult = XIntervals.Query(Address);
   if (!XResult.Enclosed) {
     return {};
@@ -742,6 +766,46 @@ FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint
   }
   return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
 }
+#else
+FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+  {
+    std::shared_lock Lock(IntervalsLock);
+    const auto XResult = XIntervals.Query(Address);
+    if (XResult.Enclosed) {
+      const auto RWXResult = RWXIntervals.Query(Address);
+      if (RWXResult.Enclosed) {
+        return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
+      } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
+        return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
+      }
+      return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
+    }
+  }
+
+  /* PORTED fh6-fex 0004: a handler trampoline is VirtualAlloc'd RWX and can miss XIntervals when a
+   * later protect split the tracked range. Recover it from the live VMA so the decoder does not
+   * emit NoExec/#UD for valid cmp/jmp bytes. Note this only rescues MEM_COMMIT+executable; it says
+   * nothing about an address Wine answers MEM_RESERVE/NOACCESS for. */
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info)) || Info.State != MEM_COMMIT || !ProtHasExec(Info.Protect)) {
+    return {};
+  }
+
+  const auto Base = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  const auto Size = static_cast<uint64_t>(Info.RegionSize);
+  const bool Writable = ProtIsWritable(Info.Protect);
+  {
+    std::unique_lock Lock(IntervalsLock);
+    FEXCore::IntervalList<uint64_t>::Interval Interval {Base, Base + Size};
+    XIntervals.Insert(Interval);
+    if (Writable) {
+      RWXIntervals.Insert(Interval);
+    }
+  }
+  LogMan::Msg::DFmt("Recovered executable VMA: {:X} - {:X} writable={}", Base, Base + Size, Writable);
+  return {Base, Size, Writable};
+}
+#endif
 
 void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc) {
   if (!MonoBackpatcherDetectionPending) {

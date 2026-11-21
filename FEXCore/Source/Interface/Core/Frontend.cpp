@@ -99,12 +99,19 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
       return false;
     }
 
+    /* PORTED fh6-fex 0002: a block spanning several ranges is writable if ANY of them is. */
+    BlockInfo.ContainsWritableCode |= RangeInfo.Writable;
+
     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
     if (Size > RangeRemainingSize) {
       Size -= RangeRemainingSize;
       Address += RangeRemainingSize;
     }
   }
+
+  /* PORTED fh6-fex 0002: record writability over the whole range, so GenerateIR can decide
+   * whether this block can be self-modified and needs code validation. */
+  BlockInfo.ContainsWritableCode |= ExecutableRangeWritable;
 
   return true;
 }
@@ -1483,6 +1490,7 @@ bool Decoder::CheckIfCacheable(FEXCore::Core::InternalThreadState& Thread, const
 void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, const uint8_t* _InstStream, uint64_t PC, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
+  BlockInfo.ContainsWritableCode = false;
   BlockInfo.Blocks.clear();
   VisitedBlocks.clear();
   // Reset internal state management

@@ -49,6 +49,10 @@ public:
   struct DecodedBlockInformation final {
     uint64_t TotalInstructionCount;
     bool Is64BitMode {};
+    /* PORTED fh6-fex 0002: set if any decoded byte came from a range that was writable while
+     * decoding. Only such a block can be self-modified behind the decoder's back, so only it
+     * needs code validation under SMCChecks=full. */
+    bool ContainsWritableCode {};
     fextl::vector<DecodedBlocks> Blocks;
     fextl::set<uint64_t> EntryPoints;
     fextl::set<uint64_t> CodePages; // Start addresses of all pages touching the block
