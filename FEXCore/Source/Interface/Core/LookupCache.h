@@ -289,6 +289,24 @@ public:
 
       if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
         if (CurrentL1Entries < MAX_L1_ENTRIES) {
+          /* iOS-Madeira ml1401: recommit and zero the grown range.
+           *
+           * The shrink branch below decommits everything from CurrentL1Entries
+           * up to MAX_L1_ENTRIES and never recommits it. Growing again then
+           * doubles CurrentL1Entries over a range that is still
+           * MEM_RESERVE/PAGE_NOACCESS: AddL1Entry writes there from host C++
+           * and faults, and until it does, the entries it is about to use are
+           * not the zeroes the lookup path assumes. That is the same defect the
+           * DroidDeck FH6 build ships as fex/0003-l1-recommit-on-grow.patch,
+           * where it is described as a hard hang when Forza Horizon 6 enters
+           * the world; on iOS the table is capped at 128K entries, so it reaches
+           * the shrink/regrow cycle sooner, not later.
+           *
+           * VirtualDontNeed(..., true) decommits and recommits, which leaves the
+           * whole doubled range committed, readable and zero. */
+          FEXCore::Allocator::VirtualDontNeed(reinterpret_cast<void*>(L1Pointer),
+                                              (CurrentL1Entries << 1) * sizeof(LookupCacheEntry), true);
+
           CurrentL1Entries <<= 1;
           L1PointerMask = CurrentL1Entries - 1;
 
