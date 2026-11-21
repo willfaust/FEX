@@ -135,7 +135,6 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
     // Start at maximum instead.
     CurrentL1Entries = MAX_L1_ENTRIES;
   }
-
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira: L2/L1 must start all-zero — nonzero stale bytes (the 0x69
    * pattern observed during JIT-pool dumps, or recycled-arena content) make

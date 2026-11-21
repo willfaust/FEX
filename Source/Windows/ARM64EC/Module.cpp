@@ -784,6 +784,15 @@ public:
     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
   }
 
+  void InvalidateGuestBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Entry) override {
+    FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
+    if (SMCChecks != FEXCore::Config::CONFIG_SMC_FULL) {
+      InvalidateGuestCodeRange(Thread, Entry, 1);
+      return;
+    }
+    InvalidationTracker->InvalidateGuestBlock(Entry);
+  }
+
   void MarkOvercommitRange(uint64_t Start, uint64_t Length) override {
     OvercommitTracker->MarkRange(Start, Length);
   }
