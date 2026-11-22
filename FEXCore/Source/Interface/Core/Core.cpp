@@ -1049,11 +1049,30 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
         }
 
-        /* The per-instruction CRC. fh6-fex 0002 replaces this with one CRC per 255-byte chunk at
-         * block entry, but that implementation rides on fh6-fex 0004 (crc32 helper, patchable
-         * CRC, the two-argument _ThreadRemoveCodeEntry), which is not ported yet. Until it is,
-         * this stays exactly as it was: every instruction validated, nothing narrowed. */
-        if ((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || HotSMCBlock) &&
+        /* fh6-fex 0002, partial port: writable-gated per-instruction CRC.
+         *
+         * Under SMCChecks=full the reference replaces this CRC with one CRC per 255-byte chunk
+         * at block entry. That chunk path needs fh6-fex 0004 (crc32 helper, patchable CRC, the
+         * two-argument _ThreadRemoveCodeEntry), which is not ported here, so this keeps the
+         * per-instruction CRC -- but stops paying for it on code that CANNOT change.
+         *
+         * The reference's own reasoning, which is the part that survives without 0004: a decoded
+         * range that was not writable cannot be rewritten by the guest without a protection
+         * change or a remap, and both of those invalidate cached blocks. So validating every
+         * instruction of non-writable code is pure cost under `full`, and it is what made
+         * FEX_SMCCHECKS=full unusably slow here (Steam's launch timed out, launch-client-error=46).
+         *
+         * That matters beyond performance: `full` is the configuration the reference requires for
+         * this game's anti-tamper ("the preset is Denuvo -- it turns on full code checks"), so it
+         * has to become affordable before it can be used at all.
+         *
+         * Provenance: 1774c2fd9 added ContainsWritableCode and then 01161827e removed it as
+         * collateral, because 0002's chunked-CRC half would not build without 0004 and the whole
+         * patch was dropped together. The flag and this gate build fine on their own, and the
+         * invalidation they depend on is 0001, which 01161827e itself ported properly. So the
+         * half that carries the reference's reasoning is restored here and the CRC half is not. */
+        if (((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL && BlockInfo->ContainsWritableCode) ||
+             Block.ForceFullSMCDetection || HotSMCBlock) &&
             DecodedInfo->InstSize != 0) {
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           std::array<uint8_t, 0x10> CodeOriginal;

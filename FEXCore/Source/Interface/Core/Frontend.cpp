@@ -99,6 +99,13 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
       return false;
     }
 
+    /// fh6-fex 0002 (partial port). A writable executable range can be rewritten by the guest
+    /// without any protection change, so blocks decoded from it need SMC validation. A range
+    /// that is NOT writable cannot change without a protect/remap, and those paths invalidate
+    /// cached blocks, so validation there is pure cost. Recorded per decode, in GenerateIR's
+    /// block loop.
+    BlockInfo.ContainsWritableCode |= RangeInfo.Writable;
+
     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
     if (Size > RangeRemainingSize) {
       Size -= RangeRemainingSize;
@@ -106,6 +113,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     }
   }
 
+  BlockInfo.ContainsWritableCode |= ExecutableRangeWritable;
   return true;
 }
 
@@ -1483,6 +1491,7 @@ bool Decoder::CheckIfCacheable(FEXCore::Core::InternalThreadState& Thread, const
 void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, const uint8_t* _InstStream, uint64_t PC, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
+  BlockInfo.ContainsWritableCode = false;
   BlockInfo.Blocks.clear();
   VisitedBlocks.clear();
   // Reset internal state management

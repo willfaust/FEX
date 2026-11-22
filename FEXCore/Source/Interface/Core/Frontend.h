@@ -49,6 +49,12 @@ public:
   struct DecodedBlockInformation final {
     uint64_t TotalInstructionCount;
     bool Is64BitMode {};
+    /// fh6-fex 0002 (partial port): set if any decoded byte came from a range that was
+    /// writable while decoding. Under SMCCHECKS=full the per-instruction CRC is only
+    /// meaningful for code that can actually self-modify; non-writable code can only
+    /// change through a protection change or remap, which the frontend invalidates.
+    /// See Core.cpp GenerateIR.
+    bool ContainsWritableCode {};
     fextl::vector<DecodedBlocks> Blocks;
     fextl::set<uint64_t> EntryPoints;
     fextl::set<uint64_t> CodePages; // Start addresses of all pages touching the block
