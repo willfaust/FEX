@@ -1017,7 +1017,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, Block.Entry - GuestRIP));
       }
 
-#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+// FEX_MADEIRA_IDIOM_TESTS: the x86-64 simulator test build compiles the idioms in so unittests/ASM/Madeira can run them.
+#if (defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)) || defined(FEX_MADEIRA_IDIOM_TESTS)
       // madeira-duo byte-copy-loop (OpDispatchBuilder::MatchByteCopyLoop): a block that is exactly a
       // byte-at-a-time copy loop becomes one forward MemCpy. Only where TSO is off for the whole block
       // (the TSO loop orders every byte store, MemCpy does not), not under full SMC checks or extended
