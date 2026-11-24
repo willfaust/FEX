@@ -444,6 +444,10 @@ public:
   };
   static bool MatchByteCopyLoop(const X86Tables::DecodedInst* Insts, size_t NumInsts, uint64_t Entry, ByteCopyLoop* Out);
   void EmitByteCopyLoop(const ByteCopyLoop& Loop, X86Tables::DecodedOp Jcc);
+  // madeira-duo memmove fast path (OpcodeDispatcher.cpp): the entry block of MSVC's memcpy/memmove
+  // gets an inline copy for small sizes in front of it.
+  static bool MatchCRTMemmove(const X86Tables::DecodedInst* Insts, size_t NumInsts, uint64_t Entry, uint64_t GuestBase);
+  void EmitCRTMemmoveFastPath();
   void CMPSOp(OpcodeArgs);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);

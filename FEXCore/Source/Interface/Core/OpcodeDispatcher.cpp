@@ -5414,3 +5414,98 @@ void OpDispatchBuilder::EmitByteCopyLoop(const ByteCopyLoop& Loop, X86Tables::De
   }
 }
 } // namespace FEXCore::IR
+
+/* madeira-duo memmove fast path.
+ *
+ * MSVC's memcpy and memmove are one routine (vcruntime memcpy.asm). It starts
+ *
+ *   mov rax, rcx
+ *   lea r10, [__ImageBase]
+ *   cmp r8, 15
+ *   ja  larger
+ *   nop (12 bytes)
+ *   mov r9d, [r10 + r8*4 + table]   ; one entry per size 0..15
+ *   add r9, r10
+ *   jmp r9
+ *
+ * and sizes above 15 go through further compares, a 128-byte loop and a second
+ * jump table for what is left. Translated, a small copy is two or three guest
+ * indirect branches (each a lookup of the next block) around a handful of loads
+ * and stores. In Path of Exile 2 the routine was 5.8% of all process CPU in a
+ * fight (run-1125a), with the loads and stores themselves about 15% of that.
+ *
+ * When a decoded block is this entry, an inline copy for 0..256 bytes between
+ * ranges that do not overlap (IR MadeiraSmallMove) goes in front of it. If it
+ * copied, the block returns as the routine would: RAX = the destination, then
+ * RET. If not (more than 256 bytes, or overlapping ranges) it has written
+ * nothing and the routine's own code runs, unchanged.
+ * Overlapping copies stay with the routine because a fault inside the inline
+ * copy is reported at the routine's first instruction: a guest handler that
+ * resumes there repeats the copy, which is only right while the source is
+ * untouched.
+ * On the copied path the volatile registers (RCX, RDX, R8-R11, XMM0-5) and
+ * the flags keep the caller's values where the routine would have left its
+ * own; the Windows x64 calling convention lets a callee leave anything there.
+ * The caller applies it only where TSO is off for the routine: the inline copy
+ * does not order its loads and stores. */
+namespace FEXCore::IR {
+bool OpDispatchBuilder::MatchCRTMemmove(const X86Tables::DecodedInst* Insts, size_t NumInsts, uint64_t Entry, uint64_t GuestBase) {
+  if (NumInsts != 4) {
+    return false;
+  }
+  static constexpr uint8_t MovRaxRcx[] = {0x48, 0x8B, 0xC1};
+  static constexpr uint8_t LeaR10Rip[] = {0x4C, 0x8D, 0x15};
+  static constexpr uint8_t CmpR8_15[] = {0x49, 0x83, 0xF8, 0x0F};
+  static constexpr uint8_t Ja32[] = {0x0F, 0x87};
+  if (Insts[0].PC != Entry || Insts[0].InstSize != 3 || memcmp(Insts[0].InstBytes, MovRaxRcx, 3) != 0 ||
+      Insts[1].PC != Entry + 3 || Insts[1].InstSize != 7 || memcmp(Insts[1].InstBytes, LeaR10Rip, 3) != 0 ||
+      Insts[2].PC != Entry + 10 || Insts[2].InstSize != 4 || memcmp(Insts[2].InstBytes, CmpR8_15, 4) != 0 ||
+      Insts[3].PC != Entry + 14 || Insts[3].InstSize != 6 || memcmp(Insts[3].InstBytes, Ja32, 2) != 0) {
+    return false;
+  }
+  // The LEA is of the image base.
+  int32_t Disp;
+  memcpy(&Disp, Insts[1].InstBytes + 3, 4);
+  if ((Entry + 10 + static_cast<int64_t>(Disp)) & 0xFFFF) {
+    return false;
+  }
+  // What follows the JA, read only when it sits on the page the JA ends on.
+  if (((Entry + 19) >> 12) != ((Entry + 45) >> 12)) {
+    return false;
+  }
+  static constexpr uint8_t Nop12[] = {0x66, 0x66, 0x66, 0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+  static constexpr uint8_t TableLoad[] = {0x47, 0x8B, 0x8C, 0x82};
+  static constexpr uint8_t AddJmp[] = {0x4D, 0x03, 0xCA, 0x41, 0xFF, 0xE1};
+  const uint8_t* Next = reinterpret_cast<const uint8_t*>(GuestBase + Entry + 20);
+  return memcmp(Next, Nop12, 12) == 0 && memcmp(Next + 12, TableLoad, 4) == 0 && memcmp(Next + 20, AddJmp, 6) == 0;
+}
+
+void OpDispatchBuilder::EmitCRTMemmoveFastPath() {
+  CalculateDeferredFlags();
+
+  Ref Dest = LoadGPRRegister(X86State::REG_RCX);
+  Ref Src = LoadGPRRegister(X86State::REG_RDX);
+  Ref Length = LoadGPRRegister(X86State::REG_R8);
+  Ref NotCopied = _MadeiraSmallMove(Dest, Src, Length);
+
+  auto CondJump_ = CondJump(NotCopied);
+  auto SlowBlock = CreateNewCodeBlockAtEnd();
+  SetTrueJumpTarget(CondJump_, SlowBlock);
+  auto FastBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
+  SetFalseJumpTarget(CondJump_, FastBlock);
+
+  // Copied: return the destination, as the routine's RET would.
+  SetCurrentCodeBlock(FastBlock);
+  StartNewBlock();
+  StoreGPRRegister(X86State::REG_RAX, LoadGPRRegister(X86State::REG_RCX));
+  const auto GPRSize = GetGPROpSize();
+  Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+  Ref NewRIP = Pop(GPRSize, SP);
+  StoreGPRRegister(X86State::REG_RSP, SP);
+  ExitFunction(NewRIP, BranchHint::Return);
+
+  // Not copied: the routine's own instructions follow in this block.
+  SetCurrentCodeBlock(SlowBlock);
+  StartNewBlock();
+}
+} // namespace FEXCore::IR

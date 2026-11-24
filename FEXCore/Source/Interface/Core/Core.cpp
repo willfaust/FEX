@@ -1052,6 +1052,32 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           continue;
         }
       }
+      // madeira-duo memmove fast path (OpDispatchBuilder::MatchCRTMemmove): the entry block of MSVC's
+      // memcpy/memmove gets an inline copy for up to 256 bytes (ranges that do not overlap) in front
+      // of it; the routine's own instructions follow for everything else. Only where TSO is off for the whole routine (no
+      // listed volatile access in its 0x700 bytes), and not under full SMC checks or extended debug
+      // info. MADEIRA_FEX_MEMMOVE=0 turns it off.
+      {
+        static int MemmoveOn = -1;
+        if (MemmoveOn < 0) {
+          const char* Env = getenv("MADEIRA_FEX_MEMMOVE");
+          MemmoveOn = !(Env && Env[0] == '0');
+        }
+        const bool TSOOff = !IsAtomicTSOEnabled() ||
+                            (BlockInForceTSOValidRange &&
+                             (InstForceTSOIt == ForceTSOInstructions.end() || *InstForceTSOIt >= Block.Entry + 0x700));
+        if (MemmoveOn && TSOOff && Config.Is64BitMode && !ExtendedDebugInfo && Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL &&
+            !Block.ForceFullSMCDetection && !HotSMCBlock &&
+            IR::OpDispatchBuilder::MatchCRTMemmove(Block.DecodedInstructions, InstsInBlock, Block.Entry, GetGuestBase())) {
+          static std::atomic<uint32_t> Said {0};
+          if (Said.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LogMan::Msg::IFmt("[memmove-fast] madeira-duo {:#x}: CRT memmove entry, inline copy for up to 256 bytes", Block.Entry);
+          }
+          Thread->OpDispatcher->FlushRegisterCache(true);
+          Thread->OpDispatcher->_GuestOpcode(Block.Entry - GuestRIP);
+          Thread->OpDispatcher->EmitCRTMemmoveFastPath();
+        }
+      }
 #endif
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;

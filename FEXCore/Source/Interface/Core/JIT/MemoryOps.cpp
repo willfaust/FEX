@@ -2393,6 +2393,128 @@ DEF_OP(MemSet) {
   }
 }
 
+DEF_OP(MadeiraSmallMove) {
+  // madeira-duo: copy of 0..256 bytes between ranges that do not overlap, inline.
+  // Result 0 = copied, 1 = nothing written (longer, or the ranges overlap).
+  //
+  // Overlapping ranges are left to the caller's slow path on purpose. A fault in here is reported
+  // at the guest instruction this op stands for, and a guest handler that resumes runs the whole
+  // op again; that is only right if no source byte has been overwritten by then.
+  // Only TMP1-4, VTMP1-2 and the result register are written. The three inputs and NZCV stay
+  // intact, so the slow path sees the state it started with.
+  const auto Op = IROp->C<IR::IROp_MadeiraSmallMove>();
+  const auto Miss = GetReg(Node);
+  const auto D = GetReg(Op->Dest);
+  const auto S = GetReg(Op->Src);
+  const auto L = GetReg(Op->Length);
+  const auto X = ARMEmitter::Size::i64Bit;
+
+  if (GuestBase || Miss == D || Miss == S || Miss == L) {
+    LoadConstant(X, Miss, 1);
+    return;
+  }
+
+  ARMEmitter::ForwardLabel From32 {}, Under16 {}, Under8 {}, Under4 {}, From64 {}, NotCopied {}, Copied {}, End {};
+
+  (void)cbz(X, L, &Copied);
+  sub(X, TMP1, L, 1);
+  lsr(X, TMP1, TMP1, 8);
+  (void)cbnz(X, TMP1, &NotCopied);   // more than 256 bytes
+  sub(X, TMP1, D, S);
+  asr(X, TMP2, TMP1, 63);
+  eor(X, TMP1, TMP1, TMP2);
+  sub(X, TMP1, TMP1, TMP2);          // the distance between the two starts
+  sub(X, TMP1, TMP1, L);
+  (void)tbnz(TMP1, 63, &NotCopied);  // less than the length: the ranges overlap
+
+  lsr(X, TMP1, L, 4);
+  (void)cbz(X, TMP1, &Under16);
+  lsr(X, TMP1, L, 5);
+  (void)cbnz(X, TMP1, &From32);
+
+  // 16..31: the first 16 and the last 16.
+  ldr(VTMP1.Q(), S, 0);
+  add(X, TMP1, S, L);
+  ldur(VTMP2.Q(), TMP1, -16);
+  str(VTMP1.Q(), D, 0);
+  add(X, TMP1, D, L);
+  stur(VTMP2.Q(), TMP1, -16);
+  (void)b(&Copied);
+
+  // 8..15: the first 8 and the last 8.
+  (void)Bind(&Under16);
+  (void)tbz(L, 3, &Under8);
+  ldr(TMP2, S, 0);
+  add(X, TMP1, S, L);
+  ldur(TMP3, TMP1, -8);
+  str(TMP2, D, 0);
+  add(X, TMP1, D, L);
+  stur(TMP3, TMP1, -8);
+  (void)b(&Copied);
+
+  // 4..7: the first 4 and the last 4.
+  (void)Bind(&Under8);
+  (void)tbz(L, 2, &Under4);
+  ldr(TMP2.W(), S, 0);
+  add(X, TMP1, S, L);
+  ldur(TMP3.W(), TMP1, -4);
+  str(TMP2.W(), D, 0);
+  add(X, TMP1, D, L);
+  stur(TMP3.W(), TMP1, -4);
+  (void)b(&Copied);
+
+  // 1..3: the bytes at 0, length / 2 and length - 1.
+  (void)Bind(&Under4);
+  lsr(X, TMP1, L, 1);
+  ldrb(TMP2.W(), S, 0);
+  ldrb(TMP3.W(), S, TMP1, ARMEmitter::ExtendedType::LSL_64, false);
+  add(X, TMP4, S, L);
+  ldurb(TMP4.W(), TMP4, -1);
+  strb(TMP2.W(), D, 0);
+  strb(TMP3.W(), D, TMP1, ARMEmitter::ExtendedType::LSL_64, false);
+  add(X, TMP1, D, L);
+  sturb(TMP4.W(), TMP1, -1);
+  (void)b(&Copied);
+
+  // 32..63: the first 32 and the last 32.
+  (void)Bind(&From32);
+  lsr(X, TMP1, L, 6);
+  (void)cbnz(X, TMP1, &From64);
+  add(X, Miss, S, L);
+  ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), S, 0);
+  ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, Miss, -32);
+  ldp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, Miss, -16);
+  add(X, Miss, D, L);
+  stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), D, 0);
+  stp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, Miss, -32);
+  stp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, Miss, -16);
+  (void)b(&Copied);
+
+  // 64..256: up 16 at a time until the last 16 bytes are reached, then those.
+  (void)Bind(&From64);
+  sub(X, TMP3, L, 1);
+  lsr(X, TMP3, TMP3, 4);
+  mov(X, TMP1, S);
+  mov(X, TMP2, D);
+  ARMEmitter::BackwardLabel Loop {};
+  (void)Bind(&Loop);
+  ldr<ARMEmitter::IndexType::POST>(VTMP1.Q(), TMP1, 16);
+  str<ARMEmitter::IndexType::POST>(VTMP1.Q(), TMP2, 16);
+  sub(X, TMP3, TMP3, 1);
+  (void)cbnz(X, TMP3, &Loop);
+  add(X, TMP1, S, L);
+  ldur(VTMP2.Q(), TMP1, -16);
+  add(X, TMP1, D, L);
+  stur(VTMP2.Q(), TMP1, -16);
+
+  (void)Bind(&Copied);
+  LoadConstant(X, Miss, 0);
+  (void)b(&End);
+  (void)Bind(&NotCopied);
+  LoadConstant(X, Miss, 1);
+  (void)Bind(&End);
+}
+
 DEF_OP(MemCpy) {
   const auto Op = IROp->C<IR::IROp_MemCpy>();
 

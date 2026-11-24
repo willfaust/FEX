@@ -727,6 +727,15 @@
         "HasSideEffects": true,
         "DestSize": "OpSize::i64Bit"
       },
+      "GPR = MadeiraSmallMove GPR:$Dest, GPR:$Src, GPR:$Length": {
+        "Desc": ["madeira-duo: copy of up to 256 bytes between ranges that do not overlap, emitted inline",
+                 "Returns 0 when the bytes were copied, 1 when nothing was written and the caller must take its slow path",
+                 "(more than 256 bytes, or overlapping ranges)",
+                 "Writes no guest register and no flag; uses the JIT temporaries"
+                ],
+        "HasSideEffects": true,
+        "DestSize": "OpSize::i64Bit"
+      },
       "CacheLineClear GPR:$Addr, i1:$Serialize": {
         "Desc": ["Does a 64 byte cacheline clear at the address specified",
                  "Only clears the data cachelines. Doesn't do any zeroing",
