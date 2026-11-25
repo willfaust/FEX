@@ -56,6 +56,12 @@ public:
     uint32_t Size {};            // Bytes, RET included
     uint32_t NumInstructions {}; // RET included
     FEXCore::X86Tables::DecodedInst* DecodedInstructions;
+
+    // madeira-duo memmove at call sites: the callee is MSVC's memcpy/memmove
+    // (OpDispatchBuilder::MatchCRTMemmove). No instructions are recorded; Size is the bytes matched.
+    bool IsCRTMemmove() const {
+      return NumInstructions == 0;
+    }
   };
 
   struct DecodedBlockInformation final {

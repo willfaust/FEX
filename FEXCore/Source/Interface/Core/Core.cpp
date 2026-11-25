@@ -1186,8 +1186,27 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
                 InlineLeaf = nullptr;
               }
             }
+            if (InlineLeaf && InlineLeaf->IsCRTMemmove()) {
+              // madeira-duo memmove at call sites: under the entry fast path's rule, TSO off for
+              // the whole routine (no listed volatile access in its 0x700 bytes).
+              bool RoutineTSOOff = !IsAtomicTSOEnabled();
+              if (!RoutineTSOOff && ForceTSOValidRanges.Contains({InlineLeaf->Entry, InlineLeaf->Entry + 0x700})) {
+                const auto It = ForceTSOInstructions.lower_bound(InlineLeaf->Entry);
+                RoutineTSOOff = It == ForceTSOInstructions.end() || *It >= InlineLeaf->Entry + 0x700;
+              }
+              if (!RoutineTSOOff) {
+                InlineLeaf = nullptr;
+              }
+            }
           }
-          if (InlineLeaf) {
+          if (InlineLeaf && InlineLeaf->IsCRTMemmove()) {
+            static std::atomic<uint32_t> Said {0};
+            if (Said.fetch_add(1, std::memory_order_relaxed) < 8) {
+              LogMan::Msg::IFmt("[memmove-site] madeira-duo call at {:#x} -> {:#x}: CRT memmove, inline copy for up to 256 bytes at the call site",
+                                DecodedInfo->PC, InlineLeaf->Entry);
+            }
+            Thread->OpDispatcher->InlineCRTMemmoveCall(DecodedInfo, InlineLeaf->Entry - GuestRIP, DecodedInfo->PC + DecodedInfo->InstSize - GuestRIP);
+          } else if (InlineLeaf) {
             Thread->OpDispatcher->InlineLeafCall(DecodedInfo);
           } else {
             std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
@@ -1269,7 +1288,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           HadInvalidInst = true;
         }
 
-        if (InlineLeaf && !HadDispatchError) {
+        if (InlineLeaf && !InlineLeaf->IsCRTMemmove() && !HadDispatchError) {
           // The callee's instructions, then its RET (see OpDispatchBuilder::InlineLeafReturn).
           static std::atomic<uint32_t> Said {0};
           if (Said.fetch_add(1, std::memory_order_relaxed) < 16) {

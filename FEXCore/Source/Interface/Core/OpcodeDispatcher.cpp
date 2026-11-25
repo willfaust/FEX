@@ -5568,4 +5568,75 @@ void OpDispatchBuilder::InlineLeafReturn(X86Tables::DecodedOp CallOp, uint64_t R
 
   BlockSetRIP = false;
 }
+
+/* madeira-duo memmove at call sites.
+ *
+ * The entry fast path (EmitCRTMemmoveFastPath) is one piece of host code shared by every
+ * caller: its size checks see every caller's lengths in turn, and each call still pays the
+ * call, the routine's block entry and the return lookup. In Path of Exile 2 the routine was
+ * 8.2% of process CPU in a map (run-1125b; 10-14% of the three frame threads), about 40% of
+ * that at the instructions right after its size branches and 10% in the return.
+ *
+ * At a direct CALL to the routine the same inline copy (IR MadeiraSmallMove) is emitted at
+ * the call site instead, between the CALL's push and the routine's RET:
+ *
+ *   push of the return address               as the CALL does
+ *   MadeiraSmallMove                         0..256 bytes, ranges that do not overlap
+ *     copied:      RAX = the destination, then the RET of the leaf inline (InlineLeafReturn):
+ *                  the word at [RSP] is compared with the return address pushed, RSP moves
+ *                  past it and the block carries on after the CALL
+ *     not copied:  nothing was written; the routine is entered as the CALL would enter it
+ *                  (same linked call exit), with its return address already on the stack
+ *
+ * A fault inside the copy is reported at the routine's first instruction with the return
+ * address pushed, exactly as with the entry fast path; a guest handler that resumes there
+ * runs the routine from its start, which is right because the ranges do not overlap and the
+ * three arguments are intact. The same marker covers the RET half: until RSP has moved the
+ * state is "at the routine's entry" with the copy done, and running it again changes
+ * nothing.
+ * The volatile registers and the flags keep the caller's values on the copied path, as
+ * with the entry fast path. */
+void OpDispatchBuilder::InlineCRTMemmoveCall(X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset) {
+  const auto GPRSize = GetGPROpSize();
+  const int64_t TargetOffset = CallOp->Src[0].Literal();
+  const uint64_t NextRIP = CallOp->PC + CallOp->InstSize;
+
+  // The CALL's push.
+  Push(GPRSize, GetRelocatedPC(CallOp));
+
+  FlushRegisterCache(true);
+  _GuestOpcode(EntryOffset);
+  CalculateDeferredFlags();
+
+  Ref Dest = LoadGPRRegister(X86State::REG_RCX);
+  Ref Src = LoadGPRRegister(X86State::REG_RDX);
+  Ref Length = LoadGPRRegister(X86State::REG_R8);
+  Ref NotCopied = _MadeiraSmallMove(Dest, Src, Length);
+
+  auto CondJump_ = CondJump(NotCopied);
+  auto CurrentBlock = GetCurrentBlock();
+
+  // Not copied: the call itself, minus the push.
+  auto SlowBlock = CreateNewCodeBlockAtEnd();
+  SetTrueJumpTarget(CondJump_, SlowBlock);
+  SetCurrentCodeBlock(SlowBlock);
+  StartNewBlock();
+  _GuestOpcode(EntryOffset);
+  ExitRelocatedPC(CallOp, TargetOffset, BranchHint::Call, GetRelocatedPC(CallOp), [&]() {
+    auto CallReturnJumpTarget = JumpTargets.find(NextRIP);
+    if (CallReturnJumpTarget != JumpTargets.end() && CallReturnJumpTarget->second.IsEntryPoint) {
+      return CallReturnJumpTarget->second.BlockEntry;
+    }
+    return InvalidNode;
+  }());
+
+  // Copied: return the destination, then the routine's RET.
+  auto FastBlock = CreateNewCodeBlockAfter(CurrentBlock);
+  SetFalseJumpTarget(CondJump_, FastBlock);
+  SetCurrentCodeBlock(FastBlock);
+  StartNewBlock();
+  StoreGPRRegister(X86State::REG_RAX, LoadGPRRegister(X86State::REG_RCX));
+  FlushRegisterCache(true);
+  InlineLeafReturn(CallOp, EntryOffset, NextOffset);
+}
 } // namespace FEXCore::IR

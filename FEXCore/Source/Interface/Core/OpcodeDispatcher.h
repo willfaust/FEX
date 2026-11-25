@@ -453,6 +453,9 @@ public:
   // the branch, and the callee's RET once its instructions have been emitted in between.
   void InlineLeafCall(FEXCore::X86Tables::DecodedOp CallOp);
   void InlineLeafReturn(FEXCore::X86Tables::DecodedOp CallOp, uint64_t RetOffset, uint64_t NextOffset);
+  // madeira-duo memmove at call sites: a direct CALL to MSVC's memcpy/memmove, with the inline
+  // small copy at the call site and the real call only for what it leaves alone.
+  void InlineCRTMemmoveCall(FEXCore::X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset);
   void CMPSOp(OpcodeArgs);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);

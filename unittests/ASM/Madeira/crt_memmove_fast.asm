@@ -2,7 +2,7 @@
 {
   "RegData": {
     "R15": "0",
-    "RBX": "4816"
+    "RBX": "9632"
   },
   "MemoryRegions": {
     "0x100000000": "196608"
@@ -10,11 +10,14 @@
 }
 %endif
 
-; madeira-duo: the memmove fast path (OpDispatchBuilder::MatchCRTMemmove).
+; madeira-duo: the memmove fast path (OpDispatchBuilder::MatchCRTMemmove), at the routine's entry
+; and at call sites (OpDispatchBuilder::InlineCRTMemmoveCall).
 ; A routine that starts like MSVC's memcpy/memmove is called for every length 0..300 at sixteen
 ; distances between source and destination, overlapping both ways included. Each result is compared
 ; with a plain REP MOVSB copy of the same bytes in a second buffer, bytes around the copy included.
-; R15 counts mismatches (and wrong return values), RBX the cases run.
+; Every case runs twice: through a direct CALL (the call-site copy) and through a CALL of a
+; register (the copy at the routine's entry).
+; R15 counts mismatches (and wrong return values, and a stack pointer that moved), RBX the cases run.
 ; R14 counts calls that reached the routine's own code: every call when the fast path is not
 ; compiled in, only the long and overlapping ones when it is. It is not checked here, since it
 ; depends on the block size the test runs with.
@@ -62,7 +65,20 @@ image_base:
   mov rdx, 0x100010000 + 600
   lea rcx, [rdx + rbp]
   mov r8, r12
+  mov rsi, rsp
+  mov rax, 0x100000000 + 0x2fff8  ; the pass counter, past the buffers
+  cmp qword [rax], 0
+  jne .by_register
   call crt_memmove
+  jmp .called
+.by_register:
+  lea rax, [rel crt_memmove]
+  call rax
+.called:
+  cmp rsi, rsp
+  je .sp_ok
+  inc r15
+.sp_ok:
   mov rdx, 0x100010000 + 600
   lea rcx, [rdx + rbp]
   cmp rax, rcx
@@ -92,7 +108,17 @@ image_base:
   cmp r12d, 301
   jne .len_loop
 
+  ; Second pass: the same cases through a register.
+  mov rax, 0x100000000 + 0x2fff8
+  inc qword [rax]
+  cmp qword [rax], 2
+  jne .restart
+
   hlt
+
+.restart:
+  xor r12d, r12d
+  jmp .len_loop
 
 deltas:
   dw -590, -256, -255, -100, -17, -16, -8, -1, 0, 1, 3, 16, 31, 100, 256, 590

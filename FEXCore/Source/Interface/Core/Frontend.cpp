@@ -8,6 +8,7 @@ $end_info$
 
 #include "Interface/Context/Context.h"
 #include "Interface/Core/Frontend.h"
+#include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include "Interface/Core/LookupCache.h"
 
@@ -1623,7 +1624,7 @@ static constexpr bool InlineLeafSkipsWritable = true;
 // [leaf-stats]: what became of the direct calls looked at, and which instructions kept callees out
 // (index = opcode, +256 for the 0F row). One line each time the number of calls doubles, from 1024.
 namespace {
-enum LeafStat { LS_CALLS, LS_INLINED, LS_BRANCH, LS_NOT_ALLOWED, LS_TOO_LONG, LS_NOT_DECODED, LS_COUNT };
+enum LeafStat { LS_CALLS, LS_INLINED, LS_BRANCH, LS_NOT_ALLOWED, LS_TOO_LONG, LS_NOT_DECODED, LS_MEMMOVE, LS_COUNT };
 std::atomic<uint32_t> LeafStats[LS_COUNT];
 std::atomic<uint32_t> LeafNotAllowedOps[512];
 
@@ -1659,12 +1660,12 @@ void NoteLeafOutcome(LeafStat Outcome) {
       }
     }
   }
-  LogMan::Msg::IFmt("[leaf-stats] madeira-duo direct calls {}: inlined {}, callee branches {}, instruction not allowed {}, too long {}, "
-                    "not decoded {}; not-allowed opcodes (0x1xx = 0F xx): {:#x} x{}, {:#x} x{}, {:#x} x{}, {:#x} x{}",
-                    Calls, LeafStats[LS_INLINED].load(std::memory_order_relaxed), LeafStats[LS_BRANCH].load(std::memory_order_relaxed),
-                    LeafStats[LS_NOT_ALLOWED].load(std::memory_order_relaxed), LeafStats[LS_TOO_LONG].load(std::memory_order_relaxed),
-                    LeafStats[LS_NOT_DECODED].load(std::memory_order_relaxed), TopIndex[0], TopCount[0], TopIndex[1], TopCount[1], TopIndex[2],
-                    TopCount[2], TopIndex[3], TopCount[3]);
+  LogMan::Msg::IFmt("[leaf-stats] madeira-duo direct calls {}: inlined {}, memmove {}, callee branches {}, instruction not allowed {}, "
+                    "too long {}, not decoded {}; not-allowed opcodes (0x1xx = 0F xx): {:#x} x{}, {:#x} x{}, {:#x} x{}, {:#x} x{}",
+                    Calls, LeafStats[LS_INLINED].load(std::memory_order_relaxed), LeafStats[LS_MEMMOVE].load(std::memory_order_relaxed),
+                    LeafStats[LS_BRANCH].load(std::memory_order_relaxed), LeafStats[LS_NOT_ALLOWED].load(std::memory_order_relaxed),
+                    LeafStats[LS_TOO_LONG].load(std::memory_order_relaxed), LeafStats[LS_NOT_DECODED].load(std::memory_order_relaxed), TopIndex[0],
+                    TopCount[0], TopIndex[1], TopCount[1], TopIndex[2], TopCount[2], TopIndex[3], TopCount[3]);
 }
 } // namespace
 
@@ -1675,10 +1676,19 @@ uint64_t Decoder::TryDecodeInlineLeaf(const uint8_t* _InstStream, const FEXCore:
     const char* Env = getenv("MADEIRA_FEX_LEAF_INLINE");
     LeafInlineOn = !(Env && Env[0] == '0');
   }
+  // madeira-duo memmove at call sites: a direct CALL to MSVC's memcpy/memmove gets the inline
+  // small copy at the call site (OpDispatchBuilder::InlineCRTMemmoveCall). Off with
+  // MADEIRA_FEX_MEMMOVE_SITES=0, and with MADEIRA_FEX_MEMMOVE=0 like the entry fast path.
+  static int MemmoveSitesOn = -1;
+  if (MemmoveSitesOn < 0) {
+    const char* Sites = getenv("MADEIRA_FEX_MEMMOVE_SITES");
+    const char* All = getenv("MADEIRA_FEX_MEMMOVE");
+    MemmoveSitesOn = !(Sites && Sites[0] == '0') && !(All && All[0] == '0');
+  }
   constexpr size_t MaxLeafInsts = 12;
   constexpr uint64_t MaxLeafBytes = 64;
 
-  if (!LeafInlineOn || !BlockInfo.Is64BitMode || CallInst->OP != 0xE8 || !CallInst->TableInfo ||
+  if ((!LeafInlineOn && !MemmoveSitesOn) || !BlockInfo.Is64BitMode || CallInst->OP != 0xE8 || !CallInst->TableInfo ||
       !(CallInst->TableInfo->Flags & FEXCore::X86Tables::InstFlags::FLAGS_CALL) || (CallInst->Flags & DecodeFlags::FLAG_OPERAND_SIZE)) {
     return 0;
   }
@@ -1756,8 +1766,33 @@ uint64_t Decoder::TryDecodeInlineLeaf(const uint8_t* _InstStream, const FEXCore:
 
   HitNonExecutableRange = false;
   HitBadRelocation = false;
+
+  // The decode stopped at a branch after three instructions: the shape of MSVC's memcpy/memmove
+  // entry (mov rax, rcx; lea r10, [image base]; cmp r8, 15; ja). The JA is in the slot after them.
+  constexpr uint32_t CRTMemmoveMatchedBytes = 46;
+  if (MemmoveSitesOn && !Complete && Outcome == LS_BRANCH && Count == 3 && Offset == 14 &&
+      DecodedSize + 4 < std::min<uint64_t>(MaxInst, DefaultDecodedBufferSize)) {
+    // The bytes after the JA are read from the same mapping the instructions came from.
+    const uint64_t HostBase = reinterpret_cast<uint64_t>(InstStream.AdjustedInstStream) - Offset - Target;
+    if (FEXCore::IR::OpDispatchBuilder::MatchCRTMemmove(&DecodedBuffer[Start], 4, Target, HostBase)) {
+      NoteLeafOutcome(LS_MEMMOVE);
+      DecodedSize = Start;
+      BlockInfo.InlineLeaves.push_back({
+        .CallPC = CallInst->PC,
+        .Entry = Target,
+        .Size = CRTMemmoveMatchedBytes,
+        .NumInstructions = 0,
+        .DecodedInstructions = nullptr,
+      });
+      for (uint64_t Page = Target & FEXCore::Utils::FEX_PAGE_MASK; Page < Target + CRTMemmoveMatchedBytes; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        BlockInfo.CodePages.insert(Page);
+      }
+      return 0;
+    }
+  }
+
   NoteLeafOutcome(Outcome);
-  if (!Complete) {
+  if (!Complete || !LeafInlineOn) {
     DecodedSize = Start;
     return 0;
   }
