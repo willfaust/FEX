@@ -2490,22 +2490,23 @@ DEF_OP(MadeiraSmallMove) {
   stp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, Miss, -16);
   (void)b(&Copied);
 
-  // 64..256: up 16 at a time until the last 16 bytes are reached, then those.
+  // 64..256: up 32 at a time until the last 32 bytes are reached, then those. (length - 1) / 32
+  // rounds of the loop cover at least all but the last 32 bytes and never pass the end.
   (void)Bind(&From64);
   sub(X, TMP3, L, 1);
-  lsr(X, TMP3, TMP3, 4);
+  lsr(X, TMP3, TMP3, 5);
   mov(X, TMP1, S);
   mov(X, TMP2, D);
   ARMEmitter::BackwardLabel Loop {};
   (void)Bind(&Loop);
-  ldr<ARMEmitter::IndexType::POST>(VTMP1.Q(), TMP1, 16);
-  str<ARMEmitter::IndexType::POST>(VTMP1.Q(), TMP2, 16);
+  ldp<ARMEmitter::IndexType::POST>(VTMP1.Q(), VTMP2.Q(), TMP1, 32);
+  stp<ARMEmitter::IndexType::POST>(VTMP1.Q(), VTMP2.Q(), TMP2, 32);
   sub(X, TMP3, TMP3, 1);
   (void)cbnz(X, TMP3, &Loop);
   add(X, TMP1, S, L);
-  ldur(VTMP2.Q(), TMP1, -16);
+  ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP1, -32);
   add(X, TMP1, D, L);
-  stur(VTMP2.Q(), TMP1, -16);
+  stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP1, -32);
 
   (void)Bind(&Copied);
   LoadConstant(X, Miss, 0);
