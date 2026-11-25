@@ -513,6 +513,17 @@ struct CpuStateFrame {
    * null when the ring is off. Published to the thread's TEB at 0x1710 (the
    * ActivityId field, unused by Wine) so the fault reporters can dump it. */
   uint64_t* IosBlockRing {};
+
+  /* madeira-duo inline copies (IR MadeiraSmallMove), per thread.
+   * MadeiraMoveForm: with MADEIRA_FEX_MOVE_NOPUSH=2, which form of the call-site copy this thread
+   * runs: 0 = between the CALL's push and the routine's RET, 1 = with no push at all. Threads take
+   * the two forms in turn as they start, so two threads doing the same work compare them in one run.
+   * MadeiraMoveCount / MadeiraMoveBytes: copies done inline and their bytes, counted by the emitted
+   * code when MADEIRA_FEX_MOVE_CENSUS=1. Slot 0 = at the routine's entry, 1 = call site with the
+   * push, 2 = call site without. Reported as [move-t]. */
+  uint64_t MadeiraMoveForm {};
+  uint64_t MadeiraMoveCount[3] {};
+  uint64_t MadeiraMoveBytes[3] {};
 };
 
 #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
@@ -528,6 +539,8 @@ static_assert(offsetof(CpuStateFrame, IosEcCodeBitMap) % 8 == 0 && offsetof(CpuS
               "IosEcCodeBitMap is loaded with a scaled LDR");
 #endif
 static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
+static_assert(offsetof(CpuStateFrame, MadeiraMoveForm) % 8 == 0 && offsetof(CpuStateFrame, MadeiraMoveBytes) + 24 <= 32760,
+              "the emitted code reaches these with one scaled load or store");
 static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
 static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
                                                                                             "than architecture maximum 32768");

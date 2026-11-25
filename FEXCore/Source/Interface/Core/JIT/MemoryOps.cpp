@@ -2429,6 +2429,27 @@ DEF_OP(MadeiraSmallMove) {
     const char* Env = getenv("MADEIRA_FEX_SMALLMOVE_TREE");
     return !(Env && Env[0] == '0');
   }();
+
+  // MADEIRA_FEX_MOVE_CENSUS=1: every copy done here is added to the thread's counters for the op's
+  // slot (CpuStateFrame::MadeiraMoveCount / MadeiraMoveBytes, reported as [move-t]). Six
+  // instructions a copy, no flags, TMP1 only; off unless asked for.
+  static const bool Census = [] {
+    const char* Env = getenv("MADEIRA_FEX_MOVE_CENSUS");
+    return Env && Env[0] == '1';
+  }();
+  const auto CountCopy = [&]() {
+    if (!Census || Op->Slot > 2) {
+      return;
+    }
+    const auto CountOffset = offsetof(FEXCore::Core::CpuStateFrame, MadeiraMoveCount) + 8 * Op->Slot;
+    const auto BytesOffset = offsetof(FEXCore::Core::CpuStateFrame, MadeiraMoveBytes) + 8 * Op->Slot;
+    ldr(TMP1, STATE, CountOffset);
+    add(X, TMP1, TMP1, 1);
+    str(TMP1, STATE, CountOffset);
+    ldr(TMP1, STATE, BytesOffset);
+    add(X, TMP1, TMP1, L);
+    str(TMP1, STATE, BytesOffset);
+  };
   if (Tree) {
     ARMEmitter::ForwardLabel From17 {}, From65 {}, Under4 {}, Slow {}, NotCopied {}, Copied {}, End {};
     const auto Index = ARMEmitter::ExtendedType::LSL_64;
@@ -2525,6 +2546,7 @@ DEF_OP(MadeiraSmallMove) {
     (void)Bind(&Slow);
     (void)cbnz(X, L, &NotCopied);      // more than 256 bytes; a length of 0 is a copy already done
     (void)Bind(&Copied);
+    CountCopy();
     LoadConstant(X, Miss, 0);
     (void)b(&End);
     (void)Bind(&NotCopied);
@@ -2628,6 +2650,7 @@ DEF_OP(MadeiraSmallMove) {
   stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP1, -32);
 
   (void)Bind(&Copied);
+  CountCopy();
   LoadConstant(X, Miss, 0);
   (void)b(&End);
   (void)Bind(&NotCopied);

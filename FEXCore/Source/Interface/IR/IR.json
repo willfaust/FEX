@@ -728,11 +728,12 @@
         "HasSideEffects": true,
         "DestSize": "OpSize::i64Bit"
       },
-      "GPR = MadeiraSmallMove GPR:$Dest, GPR:$Src, GPR:$Length": {
+      "GPR = MadeiraSmallMove GPR:$Dest, GPR:$Src, GPR:$Length, u8:$Slot": {
         "Desc": ["madeira-duo: copy of up to 256 bytes between ranges that do not overlap, emitted inline",
                  "Returns 0 when the bytes were copied, 1 when nothing was written and the caller must take its slow path",
                  "(more than 256 bytes, or overlapping ranges)",
-                 "Writes no guest register and no flag; uses the JIT temporaries"
+                 "Writes no guest register and no flag; uses the JIT temporaries",
+                 "Slot names the thread's counter pair a copy is added to when the census is on (CpuStateFrame::MadeiraMoveCount)"
                 ],
         "HasSideEffects": true,
         "DestSize": "OpSize::i64Bit"

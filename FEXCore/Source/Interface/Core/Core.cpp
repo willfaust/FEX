@@ -518,6 +518,15 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
   LogMan::Msg::EFmt("[TI-IC] passmanager");
 
   Thread->CurrentFrame->State.L1Pointer = Thread->LookupCache->GetL1Pointer();
+
+  // madeira-duo: with MADEIRA_FEX_MOVE_NOPUSH=2 threads take the two forms of the call-site copy in
+  // turn as they start (MADEIRA_FEX_MOVE_FORM=0/1 gives every thread the same one).
+  if (IR::OpDispatchBuilder::MadeiraMoveNoPushMode() == 2) {
+    static std::atomic<uint32_t> NextForm {0};
+    const char* Forced = getenv("MADEIRA_FEX_MOVE_FORM");
+    Thread->CurrentFrame->MadeiraMoveForm =
+      Forced && (Forced[0] == '0' || Forced[0] == '1') ? uint64_t(Forced[0] - '0') : (NextForm.fetch_add(1, std::memory_order_relaxed) & 1);
+  }
   Thread->CurrentFrame->State.L1Mask = Thread->LookupCache->GetScaledL1PointerMask();
 
   Thread->CurrentFrame->Pointers.L2Pointer = Thread->LookupCache->GetPagePointer();

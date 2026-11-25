@@ -1143,6 +1143,15 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   }
 
   /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] Arm64JIT: IR block loop done, emitting final branches...");
+  // madeira-duo: a call exit in the last block of the function still returns into this function.
+  // Between blocks the next block's start sends the return landing to the return block; after the
+  // last block nothing did, and the landing ran off the end of the code. The call-site copy without
+  // the push ends functions this way (its slow path is the whole CALL, placed last).
+  if (PendingCallReturnTargetLabel) {
+    b_OrRestart(PendingCallReturnTargetLabel);
+    PendingCallReturnTargetLabel = nullptr;
+  }
+
   // Make sure last branch is generated. It certainly can't be eliminated here.
   if (PendingTargetLabel) {
     if (PendingTargetLabel->Backward.Location) {

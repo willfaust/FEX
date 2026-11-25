@@ -5486,7 +5486,7 @@ void OpDispatchBuilder::EmitCRTMemmoveFastPath() {
   Ref Dest = LoadGPRRegister(X86State::REG_RCX);
   Ref Src = LoadGPRRegister(X86State::REG_RDX);
   Ref Length = LoadGPRRegister(X86State::REG_R8);
-  Ref NotCopied = _MadeiraSmallMove(Dest, Src, Length);
+  Ref NotCopied = _MadeiraSmallMove(Dest, Src, Length, 0);
 
   auto CondJump_ = CondJump(NotCopied);
   auto SlowBlock = CreateNewCodeBlockAtEnd();
@@ -5596,7 +5596,62 @@ void OpDispatchBuilder::InlineLeafReturn(X86Tables::DecodedOp CallOp, uint64_t R
  * nothing.
  * The volatile registers and the flags keep the caller's values on the copied path, as
  * with the entry fast path. */
+/* MADEIRA_FEX_MOVE_NOPUSH picks the form of the call-site copy:
+ *   0 (default)  the copy sits between the CALL's push and the routine's RET, as described above
+ *   1            no push on the copied path (InlineCRTMemmoveCallBare)
+ *   2            each thread runs one of the two, by CpuStateFrame::MadeiraMoveForm, so two threads
+ *                doing the same work compare the forms in one run */
+int OpDispatchBuilder::MadeiraMoveNoPushMode() {
+  static const int Mode = [] {
+    const char* Env = getenv("MADEIRA_FEX_MOVE_NOPUSH");
+    return Env && Env[0] >= '0' && Env[0] <= '2' && !Env[1] ? Env[0] - '0' : 0;
+  }();
+  return Mode;
+}
+
 void OpDispatchBuilder::InlineCRTMemmoveCall(X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset) {
+  const int Mode = MadeiraMoveNoPushMode();
+  if (Mode == 0) {
+    InlineCRTMemmoveCallPushed(CallOp, EntryOffset, NextOffset);
+    return;
+  }
+  if (Mode == 1) {
+    InlineCRTMemmoveCallBare(CallOp, EntryOffset, NextOffset);
+    return;
+  }
+
+  // Both forms, chosen by the thread. Nothing of the CALL has happened when the form is read.
+  const uint64_t CallOffset = NextOffset - CallOp->InstSize;
+  FlushRegisterCache(true);
+  CalculateDeferredFlags();
+  Ref Form = _LoadContext(OpSize::i64Bit, RegClass::GPR, offsetof(Core::CpuStateFrame, MadeiraMoveForm));
+  auto FormJump = CondJump(Form);
+
+  auto PushedBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
+  SetFalseJumpTarget(FormJump, PushedBlock);
+  SetCurrentCodeBlock(PushedBlock);
+  StartNewBlock();
+  _GuestOpcode(CallOffset);
+  InlineCRTMemmoveCallPushed(CallOp, EntryOffset, NextOffset);
+  auto PushedDone = Jump();
+
+  auto BareBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
+  auto JoinBlock = CreateNewCodeBlockAfter(BareBlock);
+  SetJumpTarget(PushedDone, JoinBlock);
+  SetTrueJumpTarget(FormJump, BareBlock);
+  SetCurrentCodeBlock(BareBlock);
+  StartNewBlock();
+  InlineCRTMemmoveCallBare(CallOp, EntryOffset, NextOffset);
+  auto BareDone = Jump();
+  SetJumpTarget(BareDone, JoinBlock);
+
+  SetCurrentCodeBlock(JoinBlock);
+  StartNewBlock();
+  _GuestOpcode(NextOffset);
+  BlockSetRIP = false;
+}
+
+void OpDispatchBuilder::InlineCRTMemmoveCallPushed(X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset) {
   const auto GPRSize = GetGPROpSize();
   const int64_t TargetOffset = CallOp->Src[0].Literal();
   const uint64_t NextRIP = CallOp->PC + CallOp->InstSize;
@@ -5611,7 +5666,7 @@ void OpDispatchBuilder::InlineCRTMemmoveCall(X86Tables::DecodedOp CallOp, uint64
   Ref Dest = LoadGPRRegister(X86State::REG_RCX);
   Ref Src = LoadGPRRegister(X86State::REG_RDX);
   Ref Length = LoadGPRRegister(X86State::REG_R8);
-  Ref NotCopied = _MadeiraSmallMove(Dest, Src, Length);
+  Ref NotCopied = _MadeiraSmallMove(Dest, Src, Length, 1);
 
   auto CondJump_ = CondJump(NotCopied);
   auto CurrentBlock = GetCurrentBlock();
@@ -5638,5 +5693,63 @@ void OpDispatchBuilder::InlineCRTMemmoveCall(X86Tables::DecodedOp CallOp, uint64
   StoreGPRRegister(X86State::REG_RAX, LoadGPRRegister(X86State::REG_RCX));
   FlushRegisterCache(true);
   InlineLeafReturn(CallOp, EntryOffset, NextOffset);
+}
+
+/* The call-site copy with no push on the copied path.
+ *
+ *   MadeiraSmallMove                         with the CALL not yet started
+ *     copied:      RAX = the destination; the block carries on after the CALL. The return
+ *                  address was never written to the stack and RSP never moved.
+ *     not copied:  nothing was written; the whole CALL runs (push, then the routine).
+ *
+ * What differs from the routine run for real: the eight bytes below RSP keep their old content
+ * (the routine would have left the return address there), and a fault inside the copy is
+ * reported at the CALL instruction with nothing pushed, not inside the routine. A guest handler
+ * that resumes there runs the CALL again, which is right because the ranges do not overlap and
+ * the three arguments are intact. The volatile registers and the flags keep the caller's
+ * values, as with the other form. */
+void OpDispatchBuilder::InlineCRTMemmoveCallBare(X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset) {
+  const auto GPRSize = GetGPROpSize();
+  const int64_t TargetOffset = CallOp->Src[0].Literal();
+  const uint64_t NextRIP = CallOp->PC + CallOp->InstSize;
+  const uint64_t CallOffset = NextOffset - CallOp->InstSize;
+
+  FlushRegisterCache(true);
+  _GuestOpcode(CallOffset);
+  CalculateDeferredFlags();
+
+  Ref Dest = LoadGPRRegister(X86State::REG_RCX);
+  Ref Src = LoadGPRRegister(X86State::REG_RDX);
+  Ref Length = LoadGPRRegister(X86State::REG_R8);
+  Ref NotCopied = _MadeiraSmallMove(Dest, Src, Length, 2);
+
+  auto CondJump_ = CondJump(NotCopied);
+  auto CurrentBlock = GetCurrentBlock();
+
+  // Not copied: the CALL as it always was.
+  auto SlowBlock = CreateNewCodeBlockAtEnd();
+  SetTrueJumpTarget(CondJump_, SlowBlock);
+  SetCurrentCodeBlock(SlowBlock);
+  StartNewBlock();
+  _GuestOpcode(CallOffset);
+  Push(GPRSize, GetRelocatedPC(CallOp));
+  ExitRelocatedPC(CallOp, TargetOffset, BranchHint::Call, GetRelocatedPC(CallOp), [&]() {
+    auto CallReturnJumpTarget = JumpTargets.find(NextRIP);
+    if (CallReturnJumpTarget != JumpTargets.end() && CallReturnJumpTarget->second.IsEntryPoint) {
+      return CallReturnJumpTarget->second.BlockEntry;
+    }
+    return InvalidNode;
+  }());
+
+  // Copied: return the destination and carry on after the CALL.
+  auto FastBlock = CreateNewCodeBlockAfter(CurrentBlock);
+  SetFalseJumpTarget(CondJump_, FastBlock);
+  SetCurrentCodeBlock(FastBlock);
+  StartNewBlock();
+  StoreGPRRegister(X86State::REG_RAX, LoadGPRRegister(X86State::REG_RCX));
+  FlushRegisterCache(true);
+  _GuestOpcode(NextOffset);
+
+  BlockSetRIP = false;
 }
 } // namespace FEXCore::IR

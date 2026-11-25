@@ -456,6 +456,9 @@ public:
   // madeira-duo memmove at call sites: a direct CALL to MSVC's memcpy/memmove, with the inline
   // small copy at the call site and the real call only for what it leaves alone.
   void InlineCRTMemmoveCall(FEXCore::X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset);
+  void InlineCRTMemmoveCallPushed(FEXCore::X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset);
+  void InlineCRTMemmoveCallBare(FEXCore::X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset);
+  static int MadeiraMoveNoPushMode();
   void CMPSOp(OpcodeArgs);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);

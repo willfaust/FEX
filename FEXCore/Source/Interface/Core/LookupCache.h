@@ -319,6 +319,7 @@ public:
      * needs a coarse rate, so look at the clock once per 256 hits; the hit COUNT
      * stays exact. */
     if (L2L3CacheHits & 0xff) return;
+    IosReportMoves(Thread);
 #endif
     const auto CurrentTime = std::chrono::system_clock::now();
     const auto Period = CurrentTime - LastPeriod;
@@ -634,6 +635,30 @@ private:
     IosL1MissesAtReport = IosL1Misses;
   }
 
+
+  /* madeira-duo [move-t]: this thread's inline-copy counters (emitted code counts them when
+   * MADEIRA_FEX_MOVE_CENSUS=1), about every 10 s while they move. Totals since the thread started. */
+  uint64_t IosMoveReportTicks {};
+  uint64_t IosMoveReported {};
+  void IosReportMoves(FEXCore::Core::InternalThreadState* Thread) {
+    const auto* Frame = Thread->CurrentFrame;
+    const uint64_t Total = Frame->MadeiraMoveCount[0] + Frame->MadeiraMoveCount[1] + Frame->MadeiraMoveCount[2];
+    if (Total == IosMoveReported) {
+      return;
+    }
+    uint64_t Now, Frequency;
+    __asm volatile("mrs %0, cntvct_el0" : "=r"(Now));
+    __asm volatile("mrs %0, cntfrq_el0" : "=r"(Frequency));
+    if (IosMoveReportTicks && Now - IosMoveReportTicks < Frequency * 10) {
+      return;
+    }
+    IosMoveReportTicks = Now;
+    IosMoveReported = Total;
+    LogMan::Msg::EFmt("[move-t] tid={:04x} form={} copies/bytes since the thread started: at entry {}/{}, call site with push {}/{}, "
+                      "call site without push {}/{}",
+                      IosCurrentTid(), Frame->MadeiraMoveForm, Frame->MadeiraMoveCount[0], Frame->MadeiraMoveBytes[0],
+                      Frame->MadeiraMoveCount[1], Frame->MadeiraMoveBytes[1], Frame->MadeiraMoveCount[2], Frame->MadeiraMoveBytes[2]);
+  }
 
 public:
   /* madeira-duo (20 Nov 2026): pool-copy alias redirects on this thread (Core.cpp alias-first and
