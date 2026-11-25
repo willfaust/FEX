@@ -448,6 +448,11 @@ public:
   // gets an inline copy for small sizes in front of it.
   static bool MatchCRTMemmove(const X86Tables::DecodedInst* Insts, size_t NumInsts, uint64_t Entry, uint64_t GuestBase);
   void EmitCRTMemmoveFastPath();
+
+  // madeira-duo leaf inline (Frontend.cpp, Decoder::TryDecodeInlineLeaf): the CALL's push without
+  // the branch, and the callee's RET once its instructions have been emitted in between.
+  void InlineLeafCall(FEXCore::X86Tables::DecodedOp CallOp);
+  void InlineLeafReturn(FEXCore::X86Tables::DecodedOp CallOp, uint64_t RetOffset, uint64_t NextOffset);
   void CMPSOp(OpcodeArgs);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);

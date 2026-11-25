@@ -5508,4 +5508,64 @@ void OpDispatchBuilder::EmitCRTMemmoveFastPath() {
   SetCurrentCodeBlock(SlowBlock);
   StartNewBlock();
 }
+
+/* madeira-duo leaf inline (dispatcher half; the decoder half is in Frontend.cpp).
+ *
+ * At a direct CALL whose callee the decoder recorded as an inline leaf, GenerateIR emits
+ *
+ *   InlineLeafCall      the CALL's push of the return address, no branch
+ *   the callee's instructions, each through its ordinary handler
+ *   InlineLeafReturn    the callee's RET
+ *
+ * The guest stack, registers and flags go through exactly the states they would with the
+ * call made: the return address is really pushed, so a callee that reads its stack
+ * arguments, or faults, sees and shows what it always did. The RET first compares the
+ * word at [RSP] with the return address pushed by this call. Equal (always, unless the
+ * callee replaced it): RSP moves past it and the block carries on at the instruction
+ * after the CALL, with no lookup and no branch. Not equal: an ordinary RET to whatever is
+ * there.
+ * The markers keep faults and suspends attributed to the right guest address: the slow
+ * path sits at the end of the function, so it carries the RET's address itself, and the
+ * fast path names the return address once RSP has moved. */
+void OpDispatchBuilder::InlineLeafCall(X86Tables::DecodedOp CallOp) {
+  Push(GetGPROpSize(), GetRelocatedPC(CallOp));
+}
+
+void OpDispatchBuilder::InlineLeafReturn(X86Tables::DecodedOp CallOp, uint64_t RetOffset, uint64_t NextOffset) {
+  const auto GPRSize = GetGPROpSize();
+
+  _GuestOpcode(RetOffset);
+  CalculateDeferredFlags();
+
+  // Flag-free compare: the guest flags in NZCV survive.
+  Ref Top = _LoadMem(RegClass::GPR, OpSize::i64Bit, LoadGPRRegister(X86State::REG_RSP), Invalid(), OpSize::i64Bit, MemOffsetType::SXTX, 1);
+  Ref Other = _Xor(OpSize::i64Bit, Top, GetRelocatedPC(CallOp));
+  auto CondJump_ = CondJump(Other);
+
+  auto CurrentBlock = GetCurrentBlock();
+  auto SlowBlock = CreateNewCodeBlockAtEnd();
+  SetTrueJumpTarget(CondJump_, SlowBlock);
+
+  // Another return address is on the stack: the ordinary RET.
+  SetCurrentCodeBlock(SlowBlock);
+  StartNewBlock();
+  _GuestOpcode(RetOffset);
+  {
+    Ref SP = _RMWHandle(LoadGPRRegister(X86State::REG_RSP));
+    Ref NewRIP = Pop(GPRSize, SP);
+    StoreGPRRegister(X86State::REG_RSP, SP);
+    ExitFunction(NewRIP, BranchHint::Return);
+  }
+
+  // This call's return address: drop it and carry on after the CALL.
+  auto FastBlock = CreateNewCodeBlockAfter(CurrentBlock);
+  SetFalseJumpTarget(CondJump_, FastBlock);
+  SetCurrentCodeBlock(FastBlock);
+  StartNewBlock();
+  StoreGPRRegister(X86State::REG_RSP, Add(OpSize::i64Bit, LoadGPRRegister(X86State::REG_RSP), 8));
+  FlushRegisterCache(true);
+  _GuestOpcode(NextOffset);
+
+  BlockSetRIP = false;
+}
 } // namespace FEXCore::IR

@@ -190,8 +190,9 @@
         "JITDispatchOverride": "NoOp"
       },
 
-      "GuestOpcode u32:$GuestEntryOffset": {
-        "Desc": ["Marks the beginning of a guest opcode"],
+      "GuestOpcode u64:$GuestEntryOffset": {
+        "Desc": ["Marks the beginning of a guest opcode",
+                 "The offset is from the function entry, modulo 2^64: an inlined leaf (madeira-duo) may sit below it"],
         "HasSideEffects": true
       },
 

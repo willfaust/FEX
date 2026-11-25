@@ -979,6 +979,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     }
 #endif
 
+    // madeira-duo leaf inline (OpDispatchBuilder::InlineLeafReturn): not with per-instruction code
+    // validation or extended debug info, which both want the instruction stream as written.
+    const bool LeafInlineUsable = !BlockInfo->InlineLeaves.empty() && Config.Is64BitMode && !ExtendedDebugInfo &&
+                                  Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL && !HotSMCBlock;
+
     for (size_t j = 0; j < CodeBlocks->size(); ++j) {
       const FEXCore::Frontend::Decoder::DecodedBlocks& Block = CodeBlocks->at(j);
 
@@ -1107,6 +1112,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 #endif
 
         bool IsLocked = DecodedInfo->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK;
+        const FEXCore::Frontend::Decoder::InlineLeaf* InlineLeaf {nullptr};
 
         // Do a partial register cache flush before every instruction. This
         // prevents cross-instruction static register caching, while allowing
@@ -1171,7 +1177,21 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
-          std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+          if (LeafInlineUsable && i + 1 == InstsInBlock && !Block.ForceFullSMCDetection && DecodedInfo->OP == 0xE8 &&
+              (TableInfo->Flags & X86Tables::InstFlags::FLAGS_CALL)) {
+            InlineLeaf = BlockInfo->FindInlineLeaf(DecodedInfo->PC);
+            if (InlineLeaf && HasCustomIRHandlers.load(std::memory_order_relaxed)) {
+              std::shared_lock lk(CustomIRMutex);
+              if (CustomIRHandlers.contains(InlineLeaf->Entry)) {
+                InlineLeaf = nullptr;
+              }
+            }
+          }
+          if (InlineLeaf) {
+            Thread->OpDispatcher->InlineLeafCall(DecodedInfo);
+          } else {
+            std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+          }
           if (Thread->OpDispatcher->HadDecodeFailure()) {
             HadDispatchError = true;
           } else {
@@ -1247,6 +1267,59 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
 
           HadInvalidInst = true;
+        }
+
+        if (InlineLeaf && !HadDispatchError) {
+          // The callee's instructions, then its RET (see OpDispatchBuilder::InlineLeafReturn).
+          static std::atomic<uint32_t> Said {0};
+          if (Said.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LogMan::Msg::IFmt("[leaf-inline] madeira-duo call at {:#x} -> {:#x} ({} instructions, {} bytes) compiled inline", DecodedInfo->PC,
+                              InlineLeaf->Entry, InlineLeaf->NumInstructions, InlineLeaf->Size);
+          }
+          const bool LeafInTSOValidRange = ForceTSOValidRanges.Contains({InlineLeaf->Entry, InlineLeaf->Entry + InlineLeaf->Size});
+          uint64_t LeafAddress = InlineLeaf->Entry;
+          bool LeafLeft = false;
+          for (size_t k = 0; k + 1 < InlineLeaf->NumInstructions; ++k) {
+            const FEXCore::X86Tables::DecodedInst* LeafInst = &InlineLeaf->DecodedInstructions[k];
+            Thread->OpDispatcher->FlushRegisterCache(true);
+            if (Thread->OpDispatcher->CanHaveSideEffects(LeafInst->TableInfo, LeafInst)) {
+              Thread->OpDispatcher->_GuestOpcode(LeafAddress - GuestRIP);
+            }
+            Thread->OpDispatcher->ResetHandledLock();
+            Thread->OpDispatcher->ResetDecodeFailure();
+            IR::ForceTSOMode LeafTSO = IR::ForceTSOMode::NoOverride;
+            if (LeafInTSOValidRange) {
+              LeafTSO = ForceTSOInstructions.contains(LeafAddress) ? IR::ForceTSOMode::ForceEnabled : IR::ForceTSOMode::ForceDisabled;
+            } else if (LeafInst->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
+              LeafTSO = IR::ForceTSOMode::ForceEnabled;
+            }
+            Thread->OpDispatcher->SetForceTSO(LeafTSO);
+            std::invoke(LeafInst->TableInfo->OpcodeDispatcher.OpDispatch, Thread->OpDispatcher, LeafInst);
+            if (Thread->OpDispatcher->HadDecodeFailure()) {
+              // Leave to the instruction itself: compiled as its own block it is handled as it always was.
+              Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, LeafAddress - GuestRIP));
+              LeafLeft = true;
+              break;
+            }
+            LeafAddress += LeafInst->InstSize;
+            TotalInstructionsLength += LeafInst->InstSize;
+            ++TotalInstructions;
+            if (Thread->OpDispatcher->NeedsBlockEnder()) {
+              Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, LeafAddress - GuestRIP));
+              LeafLeft = true;
+              break;
+            }
+          }
+          if (LeafLeft) {
+            break;
+          }
+          Thread->OpDispatcher->FlushRegisterCache(true);
+          Thread->OpDispatcher->ResetHandledLock();
+          Thread->OpDispatcher->ResetDecodeFailure();
+          Thread->OpDispatcher->SetForceTSO(IR::ForceTSOMode::NoOverride);
+          Thread->OpDispatcher->InlineLeafReturn(DecodedInfo, LeafAddress - GuestRIP, DecodedInfo->PC + DecodedInfo->InstSize - GuestRIP);
+          TotalInstructionsLength += InlineLeaf->DecodedInstructions[InlineLeaf->NumInstructions - 1].InstSize;
+          ++TotalInstructions;
         }
 
         const bool NeedsBlockEnd = (HadDispatchError && TotalInstructions > 0) ||
