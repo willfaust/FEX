@@ -278,10 +278,29 @@ inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) 
  * actually scrubbed: a nonzero return is the proof the stale-content hazard
  * is real for that allocation (and it was scrubbed); zero means the memset
  * was pure footprint waste. */
+/* MADEIRA: MADEIRA_FEX_ZERO_SCRUB=0 skips the pass. The note above holds on Linux, where a read of an
+ * untouched anonymous page maps the shared zero page. Darwin has no such page: the read fault hands the
+ * task a private zero-filled page, so verifying by read makes the whole range resident. On the iPhone
+ * every thread's call-return stack (8 MiB) and L1 table (2 MiB) showed up fully resident seconds after
+ * launch ([phys-map], Path of Exile 2, 25 Nov 2026): about 640 page faults a thread and 10 MiB of
+ * footprint each, ~350 MiB with 35 threads alive. The pass found no stale byte in 15,182 thread
+ * creations over 121 sessions (the stale= lines of both callers), so the hazard it guards against did
+ * not occur there. Unset or anything else: the pass runs as before. Read once. */
+inline bool ZeroScrubEnabled() {
+  static const bool Enabled = [] {
+    const char* Env = getenv("MADEIRA_FEX_ZERO_SCRUB");
+    return !(Env && Env[0] == '0');
+  }();
+  return Enabled;
+}
+
 inline size_t ZeroScrub(void* Base, size_t Size) {
   const size_t Page = 16384;
   char* P = static_cast<char*>(Base);
   size_t Scrubbed = 0;
+  if (!ZeroScrubEnabled()) {
+    return 0;
+  }
   for (size_t Off = 0; Off < Size; Off += Page) {
     const size_t Chunk = (Size - Off < Page) ? (Size - Off) : Page;
     const uint64_t* Q = reinterpret_cast<const uint64_t*>(P + Off);
