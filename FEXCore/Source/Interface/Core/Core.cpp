@@ -129,9 +129,44 @@ static volatile uint64_t g_madeira_thr_count[4] = {0,0,0,0};
 static volatile uint64_t g_madeira_thr_last_rip[4] = {0,0,0,0};
 #endif
 
-/* iOS-Madeira 2026-05-18 low-noise CompileBlock instrumentation counters. */
+/* iOS-Madeira low-noise CompileBlock instrumentation counters. */
 static volatile uint64_t g_cb_total = 0;
 static volatile uint64_t g_cb_real_compiles = 0;
+
+/* ml1338: WHICH code is being compiled during a compile storm.
+ *
+ * The 2026-11-27 session collapsed 60 -> 5.6 fps between 15:16 and 15:21 with
+ * true compiles at 477K-543K/min against a 8-13K/min baseline (40-60x), GPU at
+ * ~20 ms of each 50-80 ms frame (so the wall is CPU) and no growth in JIT-pool
+ * buffer allocations -- i.e. a storm of small compiles, not new code volume.
+ * The summary printed a "hottest_rip" from a bouncing counter that is useless
+ * for this (its repeat count overflows negative), so it never named the code.
+ *
+ * Keep a small cumulative histogram of the GuestRIP passed to true compiles and
+ * print the top few. A storm concentrated on a handful of RIPs means those
+ * blocks are being recompiled (invalidation/thrash); a storm spread over
+ * thousands of distinct RIPs means the guest really is running new code. That
+ * distinction decides the fix, and one run answers it. Diagnostic only:
+ * benign races on these fields cost nothing, and nothing here allocates (a
+ * LogMan/fmt call inside the compile path re-enters rpmalloc -- see ml620). */
+#define CB_RIP_SLOTS 16
+static struct { uint64_t rip; uint64_t n; } g_cb_rip_hist[CB_RIP_SLOTS];
+static volatile uint64_t g_cb_rip_seq = 0;
+static volatile uint64_t g_cb_reals_last_summary = 0;
+
+static void cb_note_compile_rip(uint64_t Rip) {
+  unsigned i;
+  for (i = 0; i < CB_RIP_SLOTS; i++) {
+    if (g_cb_rip_hist[i].rip == Rip) { g_cb_rip_hist[i].n++; return; }
+  }
+  for (i = 0; i < CB_RIP_SLOTS; i++) {
+    if (g_cb_rip_hist[i].rip == 0) { g_cb_rip_hist[i].rip = Rip; g_cb_rip_hist[i].n = 1; return; }
+  }
+  /* Table full: replace a pseudo-random slot. Bounded work, no locking. */
+  i = (unsigned)(__sync_add_and_fetch(&g_cb_rip_seq, 1) % CB_RIP_SLOTS);
+  g_cb_rip_hist[i].rip = Rip;
+  g_cb_rip_hist[i].n = 1;
+}
 
 #if defined(FEX_IOS_HOST) && defined(_WIN32)
 /* iOS-Madeira ml460 (#75): pool-tail sweeper, implemented by the ARM64EC
@@ -2662,6 +2697,38 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                         Frame ? Frame->State.L1Mask : 0,
                         (T && T->LookupCache) ? T->LookupCache->GetL1Pointer() : 0);
 
+      /* ml1338: compile burst rate + the code it is compiling. `dcompiles` is
+       * the true-compile delta since the previous summary (this summary prints
+       * every 16384 lookups, so at the measured 65-125K lookups/s that is a
+       * few times a second and the number is directly comparable across runs).
+       * The top RIPs answer the one question the 2026-11-27 storm left open:
+       * a few RIPs repeating = thrash/invalidation, thousands = genuinely new
+       * code. Read before formatting so a torn histogram cannot mislead. */
+      {
+        uint64_t RealsNow = reals;
+        uint64_t PrevReals = g_cb_reals_last_summary;
+        g_cb_reals_last_summary = RealsNow;
+        uint64_t Top3Rip[3] = {0, 0, 0};
+        uint64_t Top3N[3] = {0, 0, 0};
+        unsigned i, k;
+        for (i = 0; i < CB_RIP_SLOTS; i++) {
+          uint64_t N = g_cb_rip_hist[i].n;
+          uint64_t R = g_cb_rip_hist[i].rip;
+          if (!R || !N) continue;
+          for (k = 0; k < 3; k++) {
+            if (N > Top3N[k]) {
+              for (unsigned j = 2; j > k; j--) { Top3N[j] = Top3N[j - 1]; Top3Rip[j] = Top3Rip[j - 1]; }
+              Top3N[k] = N; Top3Rip[k] = R;
+              break;
+            }
+          }
+        }
+        LogMan::Msg::EFmt("[CB_COMPILE] dcompiles={} cumulative={} top_rip[0]=0x{:x}x{} "
+                          "top_rip[1]=0x{:x}x{} top_rip[2]=0x{:x}x{}",
+                          RealsNow - PrevReals, RealsNow,
+                          Top3Rip[0], Top3N[0], Top3Rip[1], Top3N[1], Top3Rip[2], Top3N[2]);
+      }
+
       /* iOS-Madeira ml622: drain the rpmalloc remote-free CAS snapshot HERE —
        * outside rpmalloc, where formatting is safe. The allocator side only ever
        * copies scalars into a POD and sets a flag; it must never format, because
@@ -2982,6 +3049,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // iOS-Madeira: cache miss reached — count as true compile.
   __sync_add_and_fetch(&g_cb_real_compiles, 1);
+  cb_note_compile_rip(GuestRIP);   /* ml1338: name the code a compile storm is compiling */
 
   // Accumulate a JIT count now, as even if another thread raced us, it should count as a compile.
   FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedJITCount, 1);
@@ -3280,8 +3348,6 @@ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Fra
     // reaches a stale copy through its own cache, an older buffer's links, or a racing link detects
     // the mismatch itself and erases it from the map it looks up in. Clear only this thread's
     // L1+L2 locally and queue the shared map erase for the batched async worker.
-    QueueSMCInvalidate(Thread, GuestRIP);
-    QueueSMCInvalidate(Thread, GuestRIP);
     QueueSMCInvalidate(Thread, GuestRIP);
     return;
   }
