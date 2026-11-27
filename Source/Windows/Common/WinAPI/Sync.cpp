@@ -92,7 +92,7 @@ DLLEXPORT_FUNC(WINBOOL, SleepConditionVariableSRW, (PCONDITION_VARIABLE Conditio
   LARGE_INTEGER Time;
   // A negative value indicates a relative time measured in 100ns intervals.
   Time.QuadPart = static_cast<ULONGLONG>(dwMilliseconds) * -10000;
-  return RtlSleepConditionVariableSRW(ConditionVariable, SRWLock, dwMilliseconds == INFINITE ? nullptr : &Time, Flags);
+  return RtlSleepConditionVariableSRW(ConditionVariable, SRWLock, dwMilliseconds == INFINITE ? nullptr : &Time, Flags) == STATUS_SUCCESS;
 }
 
 DLLEXPORT_FUNC(WINBOOL, InitOnceExecuteOnce, (PINIT_ONCE InitOnce, PINIT_ONCE_FN InitFn, void* Parameter, void** Context)) {

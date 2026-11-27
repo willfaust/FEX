@@ -130,12 +130,11 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
 
   if (DynamicL1Cache()) {
     // Start at minimum size when dynamic.
-    L1PointerMask = MIN_L1_ENTRIES - 1;
+    CurrentL1Entries = MIN_L1_ENTRIES;
   } else {
     // Start at maximum instead.
-    L1PointerMask = MAX_L1_ENTRIES - 1;
+    CurrentL1Entries = MAX_L1_ENTRIES;
   }
-
 #ifdef FEX_IOS_HOST
   /* iOS-Madeira: L2/L1 must start all-zero — nonzero stale bytes (the 0x69
    * pattern observed during JIT-pool dumps, or recycled-arena content) make
@@ -149,6 +148,11 @@ LookupCache::LookupCache(FEXCore::Context::ContextImpl* CTX)
   size_t StaleL1 = FEXCore::Allocator::ZeroScrub(reinterpret_cast<void*>(L1Pointer), MAX_L1_SIZE);
   LogMan::Msg::EFmt("[TI-IC] zero-scrub rev=ml606 l2-stale=0x{:x} l1-stale=0x{:x}", StaleL2, StaleL1);
 #endif
+  /* PORTED fh6-fex 0001: keep CurrentL1Entries in sync with L1PointerMask.
+   * InvalidateCache masks by L1PointerMask while InvalidateUntrackedRange sweeps [0,
+   * CurrentL1Entries); if the two disagree, a block can survive an invalidation (stale
+   * translation) or a slot outside the mask can be swept. Both must move together. */
+  L1PointerMask = CurrentL1Entries - 1;
 }
 
 LookupCache::~LookupCache() {
@@ -196,11 +200,29 @@ void LookupCache::ClearCache(const LookupCacheWriteLockToken& lk) {
   Shared->ClearCache(lk);
 }
 
+GuestToHostMap::~GuestToHostMap() {
+  for (uint8_t* Base : OwnedPoolArenas) {
+    FEXCore::Allocator::VirtualFree(Base, PoolArenaSize);
+#ifdef FEX_IOS_HOST
+    GetGlobalLivePoolArenas().fetch_sub(1, std::memory_order_relaxed);
+#endif
+  }
+  OwnedPoolArenas.clear();
+}
+
 void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
   // Allocate a new pointer from the BlockLinks pma again.
   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
   // All code is gone, clear the block list
   BlockList.clear();
+  Stash.clear();
+  PoolSlots.clear();
+  // Keep PoolArenaCount / PoolArenaBase / OwnedPoolArenas intact: other threads
+  // may still execute inside existing arenas until ~GuestToHostMap(), so resetting
+  // PoolArenaCount to 0 would both break InPoolArena() and let AddPoolArena()
+  // allocate past MaxPoolArenas on top of the still-owned arenas.
+  PoolArenaCursor = nullptr;
+  PoolArenaEnd = nullptr;
 }
 
 } // namespace FEXCore

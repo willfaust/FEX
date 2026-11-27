@@ -34,6 +34,9 @@ struct IosAliasEntry {
 };
 constexpr int kMaxEntries = 256;
 
+constexpr int kAliasHashSize = 1024;
+constexpr uint64_t kAliasHashMask = kAliasHashSize - 1;
+
 // extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
 // can reach the table via adrp/:lo12: — it translates the branch target
 // PE VA → pool VA inline before jumping to native EC code. That asm relies
@@ -41,14 +44,31 @@ constexpr int kMaxEntries = 256;
 extern "C" {
 IosAliasEntry IosAliasEntries[kMaxEntries];
 volatile int IosAliasCount = 0;
-/* ml1116: the entry that satisfied the last translation, checked first by
- * Module.S before the walk. A pointer (one atomic 8-byte store) rather than a
- * copy of the fields, so a reader can never see a torn entry; a retired entry
- * has Size 0 and simply misses. The walk itself now runs NEWEST-FIRST: the
- * images the game calls (its own EC ntdll/kernel32/kernelbase, the D3D12
- * runtime) are registered late, so oldest-first cost ~150 iterations per
- * x64->EC call at up to a million calls a second. */
+/* ml1116: legacy single-slot hint (kept for ABI compatibility). */
 IosAliasEntry* volatile IosAliasLast = nullptr;
+/* Direct-mapped O(1) alias caches indexed by (addr >> 16) & 1023 (64 KB PE
+ * allocation granularity). Readers verify [Base, Base+Size) so hash collisions
+ * or retired entries (Size == 0) safely fall back to the linear walk with zero
+ * shared writes on hit. */
+IosAliasEntry* volatile IosAliasHash[kAliasHashSize];
+IosAliasEntry* volatile IosAliasRevHash[kAliasHashSize];
+}
+
+static void IosAliasHashPopulate(IosAliasEntry* E, uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
+  const uint64_t PeStart = PeBase >> 16;
+  const uint64_t PeEnd = (PeBase + Size - 1) >> 16;
+  uint64_t n = PeEnd - PeStart + 1;
+  if (n > kAliasHashSize) n = kAliasHashSize;
+  for (uint64_t k = 0; k < n; k++) {
+    __atomic_store_n(&IosAliasHash[(PeStart + k) & kAliasHashMask], E, __ATOMIC_RELEASE);
+  }
+  const uint64_t JitStart = JitBase >> 16;
+  const uint64_t JitEnd = (JitBase + Size - 1) >> 16;
+  uint64_t rn = JitEnd - JitStart + 1;
+  if (rn > kAliasHashSize) rn = kAliasHashSize;
+  for (uint64_t k = 0; k < rn; k++) {
+    __atomic_store_n(&IosAliasRevHash[(JitStart + k) & kAliasHashMask], E, __ATOMIC_RELEASE);
+  }
 }
 
 namespace {
@@ -271,7 +291,9 @@ void ios_fex_mono_count_helper(int Miss) {
  */
 static constexpr uint64_t kIosSubfloorFloor = 0x100000000ull;
 static constexpr uint64_t kIosSubfloorHighMark = 1ull << 63;
+static constexpr uint64_t kIosHotSubfloorPageMark = 1ull << 62;
 static constexpr int kMaxSubfloorEntries = 8;
+static constexpr int kMaxHotSubfloorPages = 64;
 static uint64_t g_SubfloorCeiling = kIosSubfloorFloor;
 
 struct IosSubfloorEntry {
@@ -282,6 +304,64 @@ struct IosSubfloorEntry {
 };
 static IosSubfloorEntry g_Subfloor[kMaxSubfloorEntries];
 static int g_SubfloorCount;
+
+uint64_t IosSubfloorToReal(uint64_t Addr);
+
+// Hot guest-RIP pages outside subfloor images that repeatedly read a subfloor
+// window (e.g. KUSER_SHARED_DATA at 0x7ffe0000). Promoted lock-free from
+// ios_subfloor_service via BTCpu64IosAddAliasMapping(page | kIosHotSubfloorPageMark, ...)
+// and drained on a Windows thread in CompileBlock to invalidate the page once.
+struct IosHotSubfloorPage {
+  uint64_t GuestPage;
+  uint64_t LowBase;
+  uint64_t RealBase;
+  uint64_t Size;
+};
+static IosHotSubfloorPage g_HotSubfloorPages[kMaxHotSubfloorPages];
+static std::atomic<int> g_HotSubfloorPageAlloc {0};
+static std::atomic<int> g_HotSubfloorDrainCursor {0};
+
+static void IosHotSubfloorPageAdd(uint64_t GuestPage, uint64_t WinLow, uint64_t WinSize) {
+  GuestPage &= ~0xFFFULL;
+  if (!GuestPage || !WinSize) {
+    return;
+  }
+  const uint64_t WinReal = IosSubfloorToReal(WinLow);
+  if (WinReal == WinLow) {
+    return;
+  }
+  const int cur = g_HotSubfloorPageAlloc.load(std::memory_order_acquire);
+  const int lim = cur < kMaxHotSubfloorPages ? cur : kMaxHotSubfloorPages;
+  for (int i = 0; i < lim; ++i) {
+    if (__atomic_load_n(&g_HotSubfloorPages[i].Size, __ATOMIC_ACQUIRE) &&
+        g_HotSubfloorPages[i].GuestPage == GuestPage) {
+      return;
+    }
+  }
+  int slot = g_HotSubfloorPageAlloc.fetch_add(1, std::memory_order_acq_rel);
+  if (slot >= kMaxHotSubfloorPages) {
+    return;
+  }
+  g_HotSubfloorPages[slot].GuestPage = GuestPage;
+  g_HotSubfloorPages[slot].LowBase = WinLow;
+  g_HotSubfloorPages[slot].RealBase = WinReal;
+  __atomic_store_n(&g_HotSubfloorPages[slot].Size, WinSize, __ATOMIC_RELEASE);
+}
+
+extern "C" uint64_t IosPopHotSubfloorPageToInvalidate() {
+  int cur = g_HotSubfloorDrainCursor.load(std::memory_order_relaxed);
+  const int alloc = g_HotSubfloorPageAlloc.load(std::memory_order_acquire);
+  const int lim = alloc < kMaxHotSubfloorPages ? alloc : kMaxHotSubfloorPages;
+  while (cur < lim) {
+    if (!__atomic_load_n(&g_HotSubfloorPages[cur].Size, __ATOMIC_ACQUIRE)) {
+      return 0; // writer still publishing this slot; retry on next CompileBlock
+    }
+    if (g_HotSubfloorDrainCursor.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+      return g_HotSubfloorPages[cur].GuestPage;
+    }
+  }
+  return 0;
+}
 
 // low -> real, or Addr unchanged when it is not in a window.
 uint64_t IosSubfloorToReal(uint64_t Addr) {
@@ -316,6 +396,20 @@ extern "C" int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* S
       }
       *Low = lb; *Size = sz; *Real = rb;
       return 1;
+    }
+  }
+  const int hotCount = g_HotSubfloorPageAlloc.load(std::memory_order_acquire);
+  if (hotCount > 0) {
+    const uint64_t Page = Rip & ~0xFFFULL;
+    const int lim = hotCount < kMaxHotSubfloorPages ? hotCount : kMaxHotSubfloorPages;
+    for (int i = 0; i < lim; ++i) {
+      const uint64_t sz = __atomic_load_n(&g_HotSubfloorPages[i].Size, __ATOMIC_ACQUIRE);
+      if (sz && g_HotSubfloorPages[i].GuestPage == Page) {
+        *Low = g_HotSubfloorPages[i].LowBase;
+        *Size = sz;
+        *Real = g_HotSubfloorPages[i].RealBase;
+        return 1;
+      }
     }
   }
   return 0;
@@ -409,6 +503,11 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
     IosSubfloorAdd(PeBase & ~kIosSubfloorHighMark, JitBase, Size);
     return;
   }
+  /* Hot guest-RIP page promotion from ios_subfloor_service (lock-free). */
+  if (PeBase & kIosHotSubfloorPageMark) {
+    IosHotSubfloorPageAdd(PeBase & ~kIosHotSubfloorPageMark, JitBase, Size);
+    return;
+  }
 
   int count = g_EntryCount;
 
@@ -445,6 +544,7 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
       g_Entries[i].JitBase = JitBase;
       __sync_synchronize();
       g_Entries[i].Size = Size; // published last: readers see a complete entry
+      if (Size) IosAliasHashPopulate(&g_Entries[i], PeBase, JitBase, Size);
       return;
     }
   }
@@ -467,14 +567,23 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
   g_Entries[count].Size = Size;
   __sync_synchronize();
   g_EntryCount = count + 1;
+  if (Size) IosAliasHashPopulate(&g_Entries[count], PeBase, JitBase, Size);
 }
 
 uint64_t IosJitTranslate(uint64_t Addr) {
+  if (IosAliasEntry* E = __atomic_load_n(&IosAliasHash[(Addr >> 16) & kAliasHashMask], __ATOMIC_ACQUIRE)) {
+    uint64_t pb = E->PeBase;
+    uint64_t sz = E->Size;
+    if (Addr >= pb && Addr < pb + sz) {
+      return E->JitBase + (Addr - pb);
+    }
+  }
   int count = g_EntryCount;
   for (int i = 0; i < count; i++) {
     uint64_t pb = g_Entries[i].PeBase;
     uint64_t sz = g_Entries[i].Size;
     if (Addr >= pb && Addr < pb + sz) {
+      __atomic_store_n(&IosAliasHash[(Addr >> 16) & kAliasHashMask], &g_Entries[i], __ATOMIC_RELEASE);
       return g_Entries[i].JitBase + (Addr - pb);
     }
   }
@@ -484,6 +593,13 @@ uint64_t IosJitTranslate(uint64_t Addr) {
 uint64_t IosJitReverseTranslate(uint64_t Addr) {
   if (Addr < __atomic_load_n(&g_JitLow, __ATOMIC_ACQUIRE) || Addr >= __atomic_load_n(&g_JitHigh, __ATOMIC_ACQUIRE)) {
     return Addr;
+  }
+  if (IosAliasEntry* E = __atomic_load_n(&IosAliasRevHash[(Addr >> 16) & kAliasHashMask], __ATOMIC_ACQUIRE)) {
+    uint64_t jb = E->JitBase;
+    uint64_t sz = E->Size;
+    if (Addr >= jb && Addr < jb + sz) {
+      return E->PeBase + (Addr - jb);
+    }
   }
   int count = g_EntryCount;
   for (int i = 0; i < count; i++) {

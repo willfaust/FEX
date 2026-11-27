@@ -26,6 +26,10 @@
 #include <utility>
 #include <xxhash.h>
 
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+extern "C" uint64_t IosSubfloorToReal(uint64_t Addr);
+#endif
+
 namespace FEXCore::IR {
 enum class VectorCompareType {
   // SSE comparisons.
@@ -2506,6 +2510,19 @@ private:
       return AtomicTSO ? _LoadMemTSO(Class, Size, EA, Invalid(), Align, MemOffsetType::SXTX, 1)
                        : _LoadMem(Class, Size, EA, Invalid(), Align, MemOffsetType::SXTX, 1);
     }
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+    // Compile-time KUSER_SHARED_DATA (0x7ffe0000..0x7ffe0fff) rewrite for direct absolute
+    // memory reads: avoids __PAGEZERO Mach exception traps with zero runtime overhead.
+    if (!A.Base && !A.Index && !A.Segment && A.Offset >= 0x7ffe0000LL && A.Offset < 0x7ffe1000LL) {
+      const uint64_t GuestAddr = static_cast<uint64_t>(A.Offset);
+      const uint64_t RealAddr = IosSubfloorToReal(GuestAddr);
+      if (RealAddr != GuestAddr) {
+        Ref EA = Constant(RealAddr);
+        return AtomicTSO ? _LoadMemTSO(Class, Size, EA, Invalid(), Align, MemOffsetType::SXTX, 1)
+                         : _LoadMem(Class, Size, EA, Invalid(), Align, MemOffsetType::SXTX, 1);
+      }
+    }
+#endif
     const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
 
     if (AtomicTSO) {
@@ -2550,7 +2567,7 @@ private:
     const bool AtomicTSO = IsTSOEnabled(Class) && !A.NonTSO;
 
     // Use ldp if possible, otherwise fallback on two loads.
-    if (!AtomicTSO && !A.Segment && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
+    if (!AtomicTSO && !A.Segment && !IosXl.On && Size >= OpSize::i32Bit && Size <= OpSize::i128Bit) {
       const auto B = SelectPairAddressMode(A, Size);
       return LoadMemPair(Class, Size, B.Base, B.Offset);
     }

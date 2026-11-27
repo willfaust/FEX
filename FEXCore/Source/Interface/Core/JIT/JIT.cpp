@@ -16,18 +16,31 @@ $end_info$
 #endif
 
 #if defined(FEX_IOS_HOST) && !defined(__APPLE__)
-// iOS-Madeira 2026-07-06: cross-modifying code flushes MUST go through the
-// kernel (NtFlushInstructionCache → __clear_cache → sys_icache_invalidate),
-// which IPIs every core so remote PEs take the required context
-// synchronization. The old inline dc/ic asm only broadcast the cache
-// maintenance — a core already executing near the target kept stale
-// icache lines (prefill NOPs) and slid into block-tail data: every
-// Thumper-desktop ILL pc was exactly 64-byte cache-line aligned.
+#include <cstddef>
+#include <cstdint>
+// Inline Darwin sys_icache_invalidate sequence for dual-mapped JIT RX pages.
+// Avoids millions of PE -> Wine Unix NtFlushInstructionCache syscalls during
+// pool-stub cloning and block compilation while preserving exact ARMv8-A
+// cache-maintenance semantics: clean D-cache to PoU only when CTR_EL0.IDC==0
+// (Apple Silicon has IDC=1), then dsb ish -> ic ivau (64B lines) -> dsb ish -> isb.
 extern "C" long NtFlushInstructionCache(void* Handle, const void* Addr, unsigned long long Size);
 namespace {
+inline void IosFlushJitICache(const void* RXAddr, size_t Size) {
+  if (!RXAddr || !Size) {
+    return;
+  }
+  uintptr_t Start = reinterpret_cast<uintptr_t>(RXAddr) & ~63ULL;
+  uintptr_t End = reinterpret_cast<uintptr_t>(RXAddr) + Size;
+  __asm__ volatile("dsb ish" ::: "memory");
+  for (uintptr_t Cur = Start; Cur < End; Cur += 64) {
+    __asm__ volatile("ic ivau, %0" :: "r"(Cur) : "memory");
+  }
+  __asm__ volatile("dsb ish\n\tisb" ::: "memory");
+}
+
 inline void IOSFlushOneInstr(void* RWAddr, void* RXAddr) {
   (void)RWAddr; // dcache clean by RX VA reaches the same physical lines (PIPT)
-  NtFlushInstructionCache(reinterpret_cast<void*>(~0ull), RXAddr, 4);
+  IosFlushJitICache(RXAddr, 4);
 }
 }  // namespace
 #endif
@@ -519,7 +532,7 @@ void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
   }
 }
 
-static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
+[[maybe_unused]] static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
   auto BranchOffset = JumpThunkStartAddress / 4 - CallerAddress / 4;
@@ -547,25 +560,15 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, 
 }
 
 static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
-  uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
-  uint32_t BranchInst = 0;
-  ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
-  // Restore branch +2 instructions to jump to the linker block
-  BranchEmit.b(0x2);
-
-  std::atomic_ref<uint32_t>(*FEXCore::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress))).store(BranchInst, std::memory_order::relaxed);
-#ifdef __APPLE__
-  __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))),
-                          reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))) + 4);
-  sys_icache_invalidate(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
-#elif defined(FEX_IOS_HOST)
-  IOSFlushOneInstr(FEXCore::DualMap::WriteAddr(reinterpret_cast<void*>(JumpThunkStartAddress)),
-                   reinterpret_cast<void*>(JumpThunkStartAddress));
-#else
-  ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
+  // Data-only delink: linked thunk is `ldr TMP1, HostCode; br TMP1`. Point HostCode at the
+  // thunk's own linker stub (insn +8) so incoming jumps leave without rewriting live code
+  // or flushing icache across threads.
+  const uintptr_t LinkerInsn = reinterpret_cast<uintptr_t>(Record) - 0x10 + 8;
+  auto* WriteRec = FEXCore::DualMap::WriteAddr(Record);
+  std::atomic_ref<uint64_t>(WriteRec->HostCode).store(LinkerInsn, std::memory_order::seq_cst);
+#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_arm64ec)
+  asm volatile("dc cvau, %0; dsb ish" : : "r"(&WriteRec->HostCode) : "memory");
 #endif
-
-  // No need to reset HostCode here as the exit linker pointer is stored separately, and if the block is relinked it will be updated.
 }
 
 uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
@@ -622,20 +625,13 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     }
   }
 
+  // Pool stub slots are written over in place, so no link record may live inside one.
+  if (Thread->LookupCache->Shared->InPoolArena(reinterpret_cast<uintptr_t>(Record))) {
+    return HostCode;
+  }
+
   // See ExitFunction in BranchOps.cpp for an assembly level view of the handled cases.
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
-  uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
-  auto BranchOffset = HostCode / 4 - CallerAddress / 4;
-
-  // The known-call marker is the `adr TMP1, <l_CallReturn>` a linked CALL emits before its branch.
-  // Without the shadow-stack push (CallRetStackUsed() false) it sits one instruction closer to the
-  // callsite and its immediate is 4 bytes smaller; both values follow the same switch as the
-  // emission in BranchOps.cpp.
-  const uint32_t KnownCallMarkerImm = CallRetStackUsed() ? 0xC : 0x8;
-  const uintptr_t KnownCallMarkerDisp = CallRetStackUsed() ? 0x8 : 0x4;
-  uint32_t ExpectedKnownCallMarkerInst = 0;
-  ARMEmitter::Emitter ExpectedKnownCallMarkerEmit(reinterpret_cast<uint8_t*>(&ExpectedKnownCallMarkerInst), 4);
-  ExpectedKnownCallMarkerEmit.adr(TMP1, KnownCallMarkerImm);
 
   // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
   auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
@@ -643,61 +639,33 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   // Lock here is necessary to prevent simultaneous linking and delinking
   auto lk = Thread->LookupCache->AcquireWriteLock();
 
-  // For non-calls, this would extend into the block's code, however that's fine as an out-of-range adr would never
-  // be generated avoiding any false positives.
-  uintptr_t KnownCallMarkerAddr = CallerAddress - KnownCallMarkerDisp;
-  uint32_t KnownCallMarkerInst = *reinterpret_cast<uint32_t*>(KnownCallMarkerAddr);
-  if (ARMEmitter::Emitter::IsInt26(BranchOffset)) {
-    // Directly patch the callsite with the appropriate branch instruction.
-    uint32_t BranchInst = 0;
-    ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
-
-    if (KnownCallMarkerInst == ExpectedKnownCallMarkerInst) {
-      BranchEmit.bl(BranchOffset);
-      Thread->LookupCache->AddBlockLink(
-        GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, true); }, lk);
-    } else {
-      BranchEmit.b(BranchOffset);
-      Thread->LookupCache->AddBlockLink(
-        GuestRip, Record, [](FEXCore::Context::ExitFunctionLinkData* Record) { DirectBlockDelinker(Record, false); }, lk);
-    }
-
-    std::atomic_ref<uint32_t>(*FEXCore::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(CallerAddress))).store(BranchInst, std::memory_order::relaxed);
-#ifdef __APPLE__
-    __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))),
-                            reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(CallerAddress))) + 4);
-    sys_icache_invalidate(reinterpret_cast<void*>(CallerAddress), 4);
-#elif defined(FEX_IOS_HOST)
-    IOSFlushOneInstr(FEXCore::DualMap::WriteAddr(reinterpret_cast<void*>(CallerAddress)),
-                     reinterpret_cast<void*>(CallerAddress));
-#else
-    ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(CallerAddress), 4);
-#endif
-  } else {
-    // This case is common between calls and jumps as the thunk callsite can be left untouched.
-    std::atomic_ref<uint64_t>(FEXCore::DualMap::WriteAddr(Record)->HostCode).store(HostCode, std::memory_order::seq_cst);
-#ifdef ARCHITECTURE_arm64
-    // Make memory write visible to other threads reading the same location
-    asm volatile("dc cvau, %0; dsb ish" : : "r"(&FEXCore::DualMap::WriteAddr(Record)->HostCode) :);
+  // Always link through HostCode (data). First conversion of the thunk from `b +8` to `ldr`
+  // still needs one icache flush; after that delink/relink is a pure pointer store.
+  auto* WriteRec = FEXCore::DualMap::WriteAddr(Record);
+  std::atomic_ref<uint64_t>(WriteRec->HostCode).store(HostCode, std::memory_order::seq_cst);
+#if defined(ARCHITECTURE_arm64) || defined(ARCHITECTURE_arm64ec)
+  // Make memory write visible to other threads reading the same location
+  asm volatile("dc cvau, %0; dsb ish" : : "r"(&WriteRec->HostCode) : "memory");
 #endif
 
-    uint32_t LdrInst = 0;
-    ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
-    LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
-    std::atomic_ref<uint32_t>(*FEXCore::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress))).store(LdrInst, std::memory_order::relaxed);
+  uint32_t LdrInst = 0;
+  ARMEmitter::Emitter LdrEmit(reinterpret_cast<uint8_t*>(&LdrInst), 4);
+  LdrEmit.ldr(TMP1, reinterpret_cast<uint64_t>(&Record->HostCode) - JumpThunkStartAddress);
+  auto* WriteThunk = FEXCore::DualMap::WriteAddr(reinterpret_cast<uint32_t*>(JumpThunkStartAddress));
+  std::atomic_ref<uint32_t> ThunkWord(*WriteThunk);
+  if (ThunkWord.load(std::memory_order::relaxed) != LdrInst) {
+    ThunkWord.store(LdrInst, std::memory_order::relaxed);
 #ifdef __APPLE__
-    __builtin___clear_cache(reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))),
-                            reinterpret_cast<char*>(FEXCore::DualMap::WriteAddr(reinterpret_cast<uint8_t*>(JumpThunkStartAddress))) + 4);
+    __builtin___clear_cache(reinterpret_cast<char*>(WriteThunk), reinterpret_cast<char*>(WriteThunk) + 4);
     sys_icache_invalidate(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
 #elif defined(FEX_IOS_HOST)
-    IOSFlushOneInstr(FEXCore::DualMap::WriteAddr(reinterpret_cast<void*>(JumpThunkStartAddress)),
-                     reinterpret_cast<void*>(JumpThunkStartAddress));
+    IOSFlushOneInstr(reinterpret_cast<void*>(WriteThunk), reinterpret_cast<void*>(JumpThunkStartAddress));
 #else
     ARMEmitter::Emitter::ClearICache(reinterpret_cast<void*>(JumpThunkStartAddress), 4);
 #endif
-
-    Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
   }
+
+  Thread->LookupCache->AddBlockLink(GuestRip, Record, IndirectBlockDelinker, lk);
 
   return HostCode;
 }
@@ -1431,16 +1399,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     sys_icache_invalidate(CodeBegin, CodeOnlySize);
   }
 #elif defined(FEX_IOS_HOST)
-  // iOS-Madeira 2026-07-06: route the whole-block flush through
-  // NtFlushInstructionCache (kernel-coordinated __clear_cache /
-  // sys_icache_invalidate) instead of inline dc/ic asm. The inline
-  // broadcast never forced the required ISB on OTHER cores — a core
-  // entering a freshly-published block through stale (prefill-NOP)
-  // icache lines slid into the block tail and ILL'd at a 64-byte line
-  // boundary. The kernel IPI in the blessed flush closes that window;
-  // dcache clean by RX VA reaches the physical lines dirtied via the
-  // RW alias (PIPT). Pool RX pages are readable, so dc-by-RX is safe.
-  NtFlushInstructionCache(reinterpret_cast<void*>(~0ull), CodeBegin, CodeOnlySize);
+  IosFlushJitICache(CodeBegin, CodeOnlySize);
 #else
   ClearICache(CodeBegin, CodeOnlySize);
 #endif
@@ -1470,6 +1429,184 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 #endif
 
   DebugData->HostCodeSize = CodeData.Size;
+  DebugData->Relocations = &Relocations;
+
+  this->IR = nullptr;
+
+  return std::move(CodeData);
+}
+
+void Arm64JITCore::SetRelocatablePadding(bool Enable) {
+  ForceRelocatablePadding = Enable;
+}
+
+bool Arm64JITCore::IsLatestMap(const FEXCore::GuestToHostMap* Map) {
+  return CurrentCodeBuffer && CurrentCodeBuffer->LookupCache.get() == Map && CodeBuffers.GetLatest()->LookupCache.get() == Map;
+}
+
+uint8_t* Arm64JITCore::GetCurrentCodeBufferBase() const {
+  return CurrentCodeBuffer ? CurrentCodeBuffer->Ptr : nullptr;
+}
+
+void Arm64JITCore::OverwriteCode(uint8_t* Dest, std::span<const uint8_t> HostBytes) {
+  memcpy(FEXCore::DualMap::WriteAddr(Dest), HostBytes.data(), HostBytes.size());
+#ifdef __APPLE__
+  {
+    auto* RWBegin = FEXCore::DualMap::WriteAddr(Dest);
+    __builtin___clear_cache(reinterpret_cast<char*>(RWBegin), reinterpret_cast<char*>(RWBegin) + HostBytes.size());
+    sys_icache_invalidate(Dest, HostBytes.size());
+  }
+#elif defined(FEX_IOS_HOST)
+  IosFlushJitICache(Dest, HostBytes.size());
+#else
+  ClearICache(Dest, HostBytes.size());
+#endif
+}
+
+uint8_t* Arm64JITCore::AllocateCode(size_t Size) {
+  const size_t AlignedSize = FEXCore::AlignUp(Size, 16);
+#ifdef FEX_IOS_HOST
+  uint64_t IosStampTeb = 0;
+  bool IosNestedS = false;
+  __asm volatile("mov %0, x18" : "=r"(IosStampTeb));
+  if (IosStampTeb && *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) ==
+                       reinterpret_cast<uint64_t>(&CodeBuffers.CodeBufferWriteMutex)) {
+    IosNestedS = true;
+  }
+  const bool IosUnpubMode = IosStampTeb && *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16d0) != 0;
+  if (IosUnpubMode) {
+    return nullptr;
+  }
+  std::unique_lock<std::remove_reference_t<decltype(CodeBuffers.CodeBufferWriteMutex)>> CodeBufferLock;
+  if (!IosNestedS) {
+    CodeBufferLock = std::unique_lock {CodeBuffers.CodeBufferWriteMutex};
+    if (IosStampTeb) {
+      *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = reinterpret_cast<uint64_t>(&CodeBuffers.CodeBufferWriteMutex);
+    }
+  }
+#else
+  auto CodeBufferLock = std::unique_lock {CodeBuffers.CodeBufferWriteMutex};
+#endif
+
+  if (auto Prev = CheckCodeBufferUpdate()) {
+    FEXCore::Core::ResetCallRetStack(ThreadState, "jit-rollover");
+    auto lk = ThreadState->LookupCache->AcquireWriteLock();
+    ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+  }
+
+  size_t Off = FEXCore::AlignUp(CodeBuffers.LatestOffset, 16);
+  if ((Off + AlignedSize) > CurrentCodeBuffer->UsableSize()) {
+    SetBuffer(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->AllocatedSize);
+#if defined(__APPLE__) || defined(FEX_IOS_HOST)
+    SetWriteOffset(FEXCore::DualMap::WriteOffset);
+#endif
+    CTX->ClearCodeCache(ThreadState);
+    CodeBuffers.LatestOffset = GetCursorOffset();
+    Off = FEXCore::AlignUp(CodeBuffers.LatestOffset, 16);
+    if ((Off + AlignedSize) > CurrentCodeBuffer->UsableSize()) {
+#ifdef FEX_IOS_HOST
+      if (IosStampTeb && !IosNestedS) {
+        *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = 0;
+      }
+#endif
+      return nullptr;
+    }
+  }
+
+  uint8_t* Dest = CurrentCodeBuffer->Ptr + Off;
+  CodeBuffers.LatestOffset = Off + AlignedSize;
+
+#ifdef FEX_IOS_HOST
+  if (IosStampTeb && !IosNestedS) {
+    *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = 0;
+  }
+#endif
+  return Dest;
+}
+
+CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes) {
+  CPUBackend::CompiledCode Result {};
+  const size_t AlignedSize = FEXCore::AlignUp(HostBytes.size(), 16);
+  uint8_t* Dest = nullptr;
+  {
+#ifdef FEX_IOS_HOST
+    uint64_t IosStampTeb = 0;
+    bool IosNestedS = false;
+    __asm volatile("mov %0, x18" : "=r"(IosStampTeb));
+    if (IosStampTeb && *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) ==
+                         reinterpret_cast<uint64_t>(&CodeBuffers.CodeBufferWriteMutex)) {
+      IosNestedS = true;
+    }
+    const bool IosUnpubMode = IosStampTeb && *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16d0) != 0;
+    if (IosUnpubMode) {
+      return Result;
+    }
+    std::unique_lock<std::remove_reference_t<decltype(CodeBuffers.CodeBufferWriteMutex)>> CodeBufferLock;
+    if (!IosNestedS) {
+      CodeBufferLock = std::unique_lock {CodeBuffers.CodeBufferWriteMutex};
+      if (IosStampTeb) {
+        *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = reinterpret_cast<uint64_t>(&CodeBuffers.CodeBufferWriteMutex);
+      }
+    }
+#else
+    auto CodeBufferLock = std::unique_lock {CodeBuffers.CodeBufferWriteMutex};
+#endif
+
+    if (auto Prev = CheckCodeBufferUpdate()) {
+      FEXCore::Core::ResetCallRetStack(ThreadState, "jit-rollover");
+      auto lk = ThreadState->LookupCache->AcquireWriteLock();
+      ThreadState->LookupCache->ChangeGuestToHostMapping(*Prev, *CurrentCodeBuffer->LookupCache, lk);
+    }
+
+    size_t Off = FEXCore::AlignUp(CodeBuffers.LatestOffset, 16);
+    if ((Off + AlignedSize) > CurrentCodeBuffer->UsableSize()) {
+      SetBuffer(CurrentCodeBuffer->Ptr, CurrentCodeBuffer->AllocatedSize);
+#if defined(__APPLE__) || defined(FEX_IOS_HOST)
+      SetWriteOffset(FEXCore::DualMap::WriteOffset);
+#endif
+      CTX->ClearCodeCache(ThreadState);
+      CodeBuffers.LatestOffset = GetCursorOffset();
+      Off = FEXCore::AlignUp(CodeBuffers.LatestOffset, 16);
+      if ((Off + AlignedSize) > CurrentCodeBuffer->UsableSize()) {
+#ifdef FEX_IOS_HOST
+        if (IosStampTeb && !IosNestedS) {
+          *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = 0;
+        }
+#endif
+        return Result;
+      }
+    }
+
+    Dest = CurrentCodeBuffer->Ptr + Off;
+    memcpy(FEXCore::DualMap::WriteAddr(Dest), HostBytes.data(), HostBytes.size());
+    CodeBuffers.LatestOffset = Off + AlignedSize;
+
+#ifdef FEX_IOS_HOST
+    if (IosStampTeb && !IosNestedS) {
+      *reinterpret_cast<uint64_t*>(IosStampTeb + 0x16e8) = 0;
+    }
+#endif
+  }
+
+#ifdef __APPLE__
+  {
+    auto* RWBegin = FEXCore::DualMap::WriteAddr(Dest);
+    __builtin___clear_cache(reinterpret_cast<char*>(RWBegin), reinterpret_cast<char*>(RWBegin) + HostBytes.size());
+    sys_icache_invalidate(Dest, HostBytes.size());
+  }
+#elif defined(FEX_IOS_HOST)
+  IosFlushJitICache(Dest, HostBytes.size());
+#else
+  ClearICache(Dest, HostBytes.size());
+#endif
+  Result.BlockBegin = Dest;
+  Result.Size = HostBytes.size();
+  return Result;
+  DebugData->Relocations = &Relocations;
+
+  this->IR = nullptr;
+
+  return std::move(CodeData);
   DebugData->Relocations = &Relocations;
 
   this->IR = nullptr;

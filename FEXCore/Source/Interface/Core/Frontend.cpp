@@ -99,6 +99,13 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
       return false;
     }
 
+    /// fh6-fex 0002 (partial port). A writable executable range can be rewritten by the guest
+    /// without any protection change, so blocks decoded from it need SMC validation. A range
+    /// that is NOT writable cannot change without a protect/remap, and those paths invalidate
+    /// cached blocks, so validation there is pure cost. Recorded per decode, in GenerateIR's
+    /// block loop.
+    BlockInfo.ContainsWritableCode |= RangeInfo.Writable;
+
     uint64_t RangeRemainingSize = ExecutableRangeEnd - Address;
     if (Size > RangeRemainingSize) {
       Size -= RangeRemainingSize;
@@ -106,6 +113,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
     }
   }
 
+  BlockInfo.ContainsWritableCode |= ExecutableRangeWritable;
   return true;
 }
 
@@ -1483,6 +1491,7 @@ bool Decoder::CheckIfCacheable(FEXCore::Core::InternalThreadState& Thread, const
 void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, const uint8_t* _InstStream, uint64_t PC, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
+  BlockInfo.ContainsWritableCode = false;
   BlockInfo.Blocks.clear();
   VisitedBlocks.clear();
   // Reset internal state management
@@ -1637,13 +1646,21 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
           InstStream -= PCOffset;
           EraseBlock = true;
         } else {
-          LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
-                            BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST       ? "Invalid" :
-                            BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST        ? "NoExec" :
-                            BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION     ? "BadRelocation" :
-                            BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
-                                                                                             "PartialDecode",
-                            OpAddress);
+          bool DoLog = true;
+          if (BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST) {
+            static std::atomic<uint64_t> InvalidEntryLogCount {0};
+            const uint64_t N = InvalidEntryLogCount.fetch_add(1, std::memory_order_relaxed);
+            DoLog = (N < 32) || ((N & 1023) == 0);
+          }
+          if (DoLog) {
+            LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
+                              BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST       ? "Invalid" :
+                              BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST        ? "NoExec" :
+                              BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION     ? "BadRelocation" :
+                              BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
+                                                                                               "PartialDecode",
+                              OpAddress);
+          }
         }
         break;
       }
@@ -1689,6 +1706,7 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
   for (auto& Block : BlockInfo.Blocks) {
     Block.IsEntryPoint = BlockInfo.EntryPoints.contains(Block.Entry);
   }
+
 }
 
 } // namespace FEXCore::Frontend

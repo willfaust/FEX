@@ -11,6 +11,7 @@ $end_info$
 
 #include "Interface/Core/JIT/JITClass.h"
 #include "Interface/Core/JIT/DebugData.h"
+#include "Utils/crc32.h"
 
 #include <FEXCore/Core/Thunks.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -582,77 +583,141 @@ DEF_OP(Thunk) {
 
 DEF_OP(ValidateCode) {
   auto Op = IROp->C<IR::IROp_ValidateCode>();
-  auto OldCode = Op->CodeOriginal.data();
-  // Guest window: this reads guest code bytes to compare against the recorded originals, so it is
-  // a guest load. Base must stay live across the whole unrolled check, which the reserved
-  // REG_GUEST_ADDR_TMP guarantees (TMP1/TMP2 are consumed by the comparison).
-  auto Base = GetGuestMemReg(Op->Header.Args[0]).X();
-  int len = Op->CodeLength;
-  int Offset = 0;
-  ARMEmitter::ForwardLabel Fail;
-
+  // Guest window: this reads guest code bytes to compute CRC32C against the expected CRC.
+  // Base stays live across the whole unrolled check via REG_GUEST_ADDR_TMP (leaving TMP1/TMP2 free).
+  auto Base = GetGuestMemReg(Op->Address).X();
+  const auto CRC32Reg = GetReg(Op->CRC32);
   const auto Dst = GetReg(Node);
 
-  auto EmitCheck = [&](size_t Size, auto&& LoadData) {
-    while (len >= Size) {
-      LoadData();
-      sub(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
-      cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP1, &Fail);
-      len -= Size;
-      Offset += Size;
-    }
-  };
+  mov(ARMEmitter::Size::i32Bit, TMP1, ARMEmitter::Reg::zr);
+  int len = Op->CodeLength;
+  int Offset = 0;
 
-  EmitCheck(8, [&]() {
-    ldr(TMP1, Base, Offset);
-    LoadConstant(ARMEmitter::Size::i64Bit, TMP2, *(const uint64_t*)(OldCode + Offset));
-  });
+  while (len >= 8) {
+    ldr(TMP2, Base, Offset);
+    crc32cx(TMP1, TMP1, TMP2);
+    len -= 8;
+    Offset += 8;
+  }
 
-  EmitCheck(4, [&]() {
-    ldr(TMP1.W(), Base, Offset);
-    LoadConstant(ARMEmitter::Size::i32Bit, TMP2, *(const uint32_t*)(OldCode + Offset));
-  });
+  if (len >= 4) {
+    ldr(TMP2.W(), Base, Offset);
+    crc32cw(TMP1.W(), TMP1.W(), TMP2.W());
+    len -= 4;
+    Offset += 4;
+  }
 
-  EmitCheck(2, [&]() {
-    ldrh(TMP1.W(), Base, Offset);
-    LoadConstant(ARMEmitter::Size::i32Bit, TMP2, *(const uint16_t*)(OldCode + Offset));
-  });
+  if (len >= 2) {
+    ldrh(TMP2.W(), Base, Offset);
+    crc32ch(TMP1.W(), TMP1.W(), TMP2.W());
+    len -= 2;
+    Offset += 2;
+  }
 
-  EmitCheck(1, [&]() {
-    ldrb(TMP1.W(), Base, Offset);
-    LoadConstant(ARMEmitter::Size::i32Bit, TMP2, *(const uint8_t*)(OldCode + Offset));
-  });
+  if (len >= 1) {
+    ldrb(TMP2.W(), Base, Offset);
+    crc32cb(TMP1.W(), TMP1.W(), TMP2.W());
+  }
 
-  ARMEmitter::ForwardLabel End;
-  LoadConstant(ARMEmitter::Size::i32Bit, Dst, 0);
-  b_OrRestart(&End);
-  BindOrRestart(&Fail);
+  if (ThreadState->PoolPatchableCRC) {
+    InsertGuestPatchableCRCMove(TMP2, Entry, static_cast<uint8_t>(Op->CodeLength), ThreadState->PoolPatchableCRCValue);
+    sub(ARMEmitter::Size::i32Bit, Dst, TMP1, TMP2);
+  } else {
+    sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
+  }
+  /* ml1341: there used to be a second, unconditional
+   * `sub(Dst, TMP1, CRC32Reg)` here -- a patch hunk that landed twice and was
+   * committed. It rewrote the comparison to (crc - patchable) - crc, or to
+   * crc - 2*crc on the plain path, so Dst was essentially never zero and the
+   * MATCH branch (which is what proves the guest bytes are unchanged and skips
+   * invalidation) was almost unreachable.
+   *
+   * Measured on device 2026-11-27 with ml1340: 1,152,383,876 of 1,152,385,024
+   * L1 misses arrived with ValidateCRC set -- 99.9999% -- all on one or two
+   * guest RIPs, at a sustained 7.6-8.0M misses/s, one core pinned and the GPU
+   * idle. That is this comparison failing every time, forcing a per-RIP
+   * revalidation (and a CRC32 over the guest bytes) on every entry to a hot
+   * block instead of once. It is the difference between 60 fps and 0. */
+
+  ARMEmitter::ForwardLabel Match, End;
+  cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &Match);
+
   LoadConstant(ARMEmitter::Size::i32Bit, Dst, 1);
+  b_OrRestart(&End);
+  BindOrRestart(&Match);
+  str(ARMEmitter::XReg::zr, STATE, offsetof(FEXCore::Core::CpuStateFrame, LastSMCInvalidateRIP));
   BindOrRestart(&End);
 }
 
 DEF_OP(ThreadRemoveCodeEntry) {
-  PushDynamicRegs(TMP4);
-  SpillStaticRegs(TMP4);
+  auto Op = IROp->C<IR::IROp_ThreadRemoveCodeEntry>();
+  // Restore host SP before jumping out of this block to LoopTop or the dispatcher handler.
+  ResetStack();
 
-  // Arguments are passed as follows:
-  // X0: Thread
-  // X1: RIP
-  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, STATE.R());
+  const bool SameEntryAndRIP = (Op->EntryToInvalidate.ID() == Op->NewRIP.ID()) || ThreadState->PoolPatchableCRC;
+  if (!SameEntryAndRIP) {
+    // Fast path: this thread already queued this entry for async SMC erase.
+    // Keep SRA and NZCV live, clear thread-local L1+L2 for EntryToInvalidate,
+    // store NewRIP to State.rip, and jump straight to DispatcherLoopTop.
+    // Uses sub+cbz/cbnz so NZCV is preserved for both fast and slow paths.
+    ARMEmitter::ForwardLabel Slow, SkipL1, SkipL2;
+    mov(ARMEmitter::Size::i64Bit, TMP1, GetReg(Op->EntryToInvalidate));
+    mov(ARMEmitter::Size::i64Bit, TMP2, GetReg(Op->NewRIP));
+    sub(ARMEmitter::Size::i64Bit, TMP3, TMP1, TMP2);
+    cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &Slow);
+    ldr(TMP3, STATE, offsetof(FEXCore::Core::CpuStateFrame, LastSMCInvalidateRIP));
+    sub(ARMEmitter::Size::i64Bit, TMP3, TMP1, TMP3);
+    cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &Slow);
+    str(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
 
-  // TODO: Relocations don't seem to be wired up to this...?
-  LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, Entry, CPU::Arm64Emitter::PadType::AUTOPAD);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+    and_(ARMEmitter::Size::i64Bit, TMP4, TMP4, TMP1.R(), ARMEmitter::ShiftType::LSL,
+         FEXCore::ilog2(sizeof(FEXCore::LookupCache::LookupCacheEntry)));
+    add(TMP3, TMP3, TMP4);
+    ldr(TMP4, TMP3, 8);
+    sub(ARMEmitter::Size::i64Bit, TMP4, TMP4, TMP1);
+    cbnz_OrRestart(ARMEmitter::Size::i64Bit, TMP4, &SkipL1);
+    str(ARMEmitter::XReg::zr, TMP3, 8);
+    BindOrRestart(&SkipL1);
 
-  ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadRemoveCodeEntryFromJIT));
-  if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
-    GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
-  } else {
-    blr(ARMEmitter::Reg::r2);
+    ldr(TMP3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.L2Pointer));
+    cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &SkipL2);
+    {
+      const uint64_t VirtualMemorySize = CTX->Config.VirtualMemSize;
+      if (std::popcount(VirtualMemorySize) == 1) {
+        and_(ARMEmitter::Size::i64Bit, TMP4, TMP1, VirtualMemorySize - 1);
+      } else {
+        LoadConstant(ARMEmitter::Size::i64Bit, TMP4, VirtualMemorySize);
+        and_(ARMEmitter::Size::i64Bit, TMP4, TMP1, TMP4);
+      }
+    }
+    lsr(ARMEmitter::Size::i64Bit, TMP2, TMP4, 12);
+    ldr(TMP3, TMP3, TMP2, ARMEmitter::ExtendedType::LSL_64, 3);
+    cbz_OrRestart(ARMEmitter::Size::i64Bit, TMP3, &SkipL2);
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP4, 0x0FFF);
+    add(TMP3, TMP3, TMP2, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(FEXCore::LookupCache::LookupCacheEntry)));
+    stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, TMP3, 0);
+    BindOrRestart(&SkipL2);
+
+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.DispatcherLoopTop));
+    br(TMP1);
+
+    BindOrRestart(&Slow);
   }
-  FillStaticRegs();
 
-  // Fix the stack and any values that were stepped on
-  PopDynamicRegs();
+  // Pass EntryToInvalidate in x12 and NewRIP in x13 to the shared dispatcher handler,
+  // which spills static regs + NZCV, updates State.rip, calls ThreadRemoveCodeEntryFromJIT,
+  // refills static regs + NZCV, and branches to LoopTop.
+  mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r12, GetReg(Op->EntryToInvalidate));
+  if (Op->EntryToInvalidate.ID() == Op->NewRIP.ID()) {
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r13, ARMEmitter::Reg::r12);
+  } else {
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r13, GetReg(Op->NewRIP));
+  }
+  ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, ThreadDispatchRemoveCodeEntryPtr));
+  br(TMP1);
+  br(ARMEmitter::XReg::x2);
+  br(ARMEmitter::XReg::x2);
 }
 
 DEF_OP(CPUID) {

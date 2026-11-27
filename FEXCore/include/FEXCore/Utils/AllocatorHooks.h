@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <sys/types.h>
 
 namespace FEXCore::Allocator {
@@ -188,6 +189,37 @@ inline void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true) {
   // Zero the page-aligned region, preserving permissions.
   MEMORY_BASIC_INFORMATION Info;
   ::VirtualQuery(Ptr, &Info, sizeof(Info));
+  /* iOS-Madeira ml1400: never decommit past the region the caller actually owns.
+   *
+   * This used to pass Size straight to VirtualFree(MEM_DECOMMIT) after a
+   * VirtualQuery whose RegionSize it then ignored. Windows fails such a call
+   * atomically; Wine is more forgiving and can decommit whatever is committed
+   * further along the VA, so an over-long Size takes out a NEIGHBOUR. The
+   * LookupCache shrink path is exactly that shape: it computes
+   * (MAX_L1_ENTRIES - CurrentL1Entries) * sizeof(LookupCacheEntry) from a
+   * CURRENT size, so after any earlier shrink the span can run past the end of
+   * the L1 allocation.
+   *
+   * A neighbour taken out this way is left MEM_RESERVE / PAGE_NOACCESS, which is
+   * the measured state of the page FH6 dies executing
+   * ([av-region] state=00002000 prot=00000001): an execute fault on memory that
+   * was decommitted, not code that was never mapped. Clamp to the queried
+   * region and say so, because a clamp firing is proof the hazard is live.
+   * MADEIRA_DONTNEED_NO_CLAMP=1 restores the old unclamped behaviour. */
+  static int no_clamp = -1;
+  if (no_clamp < 0) {
+    const char* e = getenv("MADEIRA_DONTNEED_NO_CLAMP");
+    no_clamp = (e && *e && *e != '0') ? 1 : 0;
+  }
+  if (!no_clamp && Info.RegionSize && Size > Info.RegionSize) {
+    static int clamp_n;
+    if (clamp_n++ < 16) {
+      LogMan::Msg::EFmt("[dontneed-clamp] #{} {:#x}+{:#x} exceeds region {:#x}+{:#x}; clamping", clamp_n - 1,
+                        reinterpret_cast<uintptr_t>(Ptr), Size,
+                        reinterpret_cast<uintptr_t>(Info.BaseAddress), Info.RegionSize);
+    }
+    Size = Info.RegionSize;
+  }
   ::VirtualFree(Ptr, Size, MEM_DECOMMIT);
   if (Recommit) {
     ::VirtualAlloc(Ptr, Size, MEM_COMMIT, Info.Protect);

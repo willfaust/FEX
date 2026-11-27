@@ -179,8 +179,13 @@ DEF_OP(StoreRegister) {
   const auto RegClass = Reg.AsRegClass();
 
   if (RegClass == IR::RegClass::GPRFixed) {
-    // Always use 64-bit, it's faster. Upper bits ignored for 32-bit mode.
-    mov(ARMEmitter::Size::i64Bit, GetReg(Reg), GetReg(Op->Value));
+    // hbidmov: skip identity SRA copies.
+    const auto Dst = GetReg(Reg);
+    const auto Src = GetReg(Op->Value);
+    if (Dst.Idx() != Src.Idx()) {
+      // Always use 64-bit, it's faster. Upper bits ignored for 32-bit mode.
+      mov(ARMEmitter::Size::i64Bit, Dst, Src);
+    }
   } else if (RegClass == IR::RegClass::FPRFixed) {
     const auto regSize = HostSupportsAVX256 ? IR::OpSize::i256Bit : IR::OpSize::i128Bit;
     LOGMAN_THROW_A_FMT(IROp->Size == regSize, "expected sized");
@@ -188,10 +193,12 @@ DEF_OP(StoreRegister) {
     const auto guest = GetVReg(Reg);
     const auto host = GetVReg(Op->Value);
 
-    if (HostSupportsAVX256) {
-      mov(ARMEmitter::SubRegSize::i64Bit, guest.Z(), PRED_TMP_32B.Merging(), host.Z());
-    } else {
-      mov(guest.Q(), host.Q());
+    if (guest.Idx() != host.Idx()) {
+      if (HostSupportsAVX256) {
+        mov(ARMEmitter::SubRegSize::i64Bit, guest.Z(), PRED_TMP_32B.Merging(), host.Z());
+      } else {
+        mov(guest.Q(), host.Q());
+      }
     }
   } else {
     LOGMAN_THROW_A_FMT(false, "Unhandled Op->Class {}", RegClass);

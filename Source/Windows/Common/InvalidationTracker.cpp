@@ -27,6 +27,20 @@ extern "C" void ios_fex_mono_arm(uint64_t Base, uint64_t End);
 extern "C" int IosSubfloorEnum(int Index, uint64_t* Low, uint64_t* Real, uint64_t* Size);  // ml1207, IosJitAlias.cpp
 #endif
 
+#ifdef FEX_IOS_HOST
+/* MADEIRA 16K traps: the iOS host page is 16 KB and Wine gives it the union of its four 4 KB
+ * pages' protections. A write trap armed on one 4 KB page left the host page writable whenever
+ * a sibling was untrapped (or hot), so writes to the trapped page were never seen and stale
+ * translations ran on: Project Zomboid's JVM, its code cache plain memory ([x64-rwx]), sat in
+ * Runtime1::patch_code at 100% because C1's patched call sites kept running the old code.
+ * The Escapists 2 (WOW64, Mono's call patch looped ~40,000 times a second) had the same bug.
+ * So traps are armed and released, write faults invalidate, and pages turn hot per host page. */
+static constexpr uint64_t MADEIRA_TRAP_PAGE_SIZE = 0x4000;
+#else
+static constexpr uint64_t MADEIRA_TRAP_PAGE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE;
+#endif
+static constexpr uint64_t MADEIRA_TRAP_PAGE_MASK = ~(MADEIRA_TRAP_PAGE_SIZE - 1);
+
 namespace FEX::Windows {
 uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
 #ifdef FEX_IOS_HOST
@@ -57,7 +71,10 @@ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX, const s
   , Threads {Threads} {
 #endif
   FEX_CONFIG_OPT(SMCChecks, SMCCHECKS);
-  SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE);
+  // FULL validates every instruction's bytes before it runs, so write-trapping RWX pages adds a
+  // fault per store without catching anything new, and it makes the guest observe PAGE_EXECUTE_READ
+  // where Windows would report RWX.
+  SMCDetectionDisabled = (SMCChecks == FEXCore::Config::CONFIG_SMC_NONE || SMCChecks == FEXCore::Config::CONFIG_SMC_FULL);
 
   MEMORY_BASIC_INFORMATION Info;
   uint64_t Address = 0;
@@ -129,6 +146,10 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
       if (EffectiveRWX) {
         LogMan::Msg::DFmt("Add SMC interval: {:X} - {:X}", AlignedBase, AlignedBase + AlignedSize);
         RWXIntervals.Insert(ProtInterval);
+      } else {
+        // Code made read-only again (e.g. after in-place decryption) can no longer be written, and
+        // an RWX write-trap here would wrongly grant write access.
+        RWXIntervals.Remove(ProtInterval);
       }
       if (DEPDisabled && !HasExec) {
         DEPPromotedIntervals.Insert(ProtInterval);
@@ -158,8 +179,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
                           ProtInterval.End, AlignedSize >> 20, Prot);
         return false;
       }
-      LogMan::Msg::EFmt("[iOS-xrem] via=protect tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                        ProtInterval.Offset, ProtInterval.End);
+      {
+        static std::atomic<uint32_t> ProtectRemoveCount;
+        const auto N = ProtectRemoveCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (N <= 40 || !(N & 255)) {
+          LogMan::Msg::EFmt("[iOS-xrem] via=protect #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                            ProtInterval.Offset, ProtInterval.End);
+        }
+      }
       XIntervals.Remove(ProtInterval);
       RWXIntervals.Remove(ProtInterval);
       if (DEPDisabled) {
@@ -462,8 +489,14 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
 
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
-    LogMan::Msg::EFmt("[iOS-xrem] via=section tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                      SectionBase, SectionBase + SectionSize);
+    {
+      static std::atomic<uint32_t> SectionRemoveCount;
+      const auto N = SectionRemoveCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (N <= 40 || !(N & 255)) {
+        LogMan::Msg::EFmt("[iOS-xrem] via=section #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                          SectionBase, SectionBase + SectionSize);
+      }
+    }
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
     ForgetHotSMCPages(SectionBase, SectionBase + SectionSize);
@@ -486,29 +519,62 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
   const auto AlignedSize = std::max(Size, (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK);
 
-  InvalidateIntervalInternal(AlignedBase, AlignedSize);
-
   if (Free) {
-    std::unique_lock Lock(IntervalsLock);
-    // ml437 (#74): this fires on EVERY guest free/decommit (the ml201 probe is
-    // unconditional) — ml436 logged 4,234 lines of ordinary heap decommit
-    // churn, drowning the log and costing a dprintf syscall per free. The
-    // signal (which path removes a tracked range) is preserved by the first 40
-    // plus a 1-in-64 sample.
-    static std::atomic<uint32_t> AlignedRemoveCount;
-    const auto N = AlignedRemoveCount.fetch_add(1) + 1;
-    if (N <= 40 || !(N & 63)) {
-      LogMan::Msg::EFmt("[iOS-xrem] via=aligned #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
-                        AlignedBase, AlignedBase + AlignedSize);
+    bool WasExecutable = false;
+    {
+      std::unique_lock Lock(IntervalsLock);
+      const FEXCore::IntervalList<uint64_t>::Interval FreeInterval {AlignedBase, AlignedBase + AlignedSize};
+      WasExecutable = XIntervals.Intersect(FreeInterval);
+      if (WasExecutable) {
+        /* ml437 (#74): this fires on EVERY guest free/decommit (the ml201 probe is
+         * unconditional) — ml436 logged 4,234 lines of ordinary heap decommit churn,
+         * drowning the log and costing a dprintf syscall per free. Keep the signal with
+         * the first 40 plus a 1-in-64 sample. */
+        static std::atomic<uint32_t> AlignedRemoveCount;
+        const auto N = AlignedRemoveCount.fetch_add(1) + 1;
+        if (N <= 40 || !(N & 63)) {
+          LogMan::Msg::EFmt("[iOS-xrem] via=aligned #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                            AlignedBase, AlignedBase + AlignedSize);
+        }
+        XIntervals.Remove(FreeInterval);
+        RWXIntervals.Remove(FreeInterval);
+        ForgetHotSMCPages(AlignedBase, AlignedBase + AlignedSize);
+      }
     }
-    XIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
-    RWXIntervals.Remove({AlignedBase, AlignedBase + AlignedSize});
-    ForgetHotSMCPages(AlignedBase, AlignedBase + AlignedSize);
+    if (!WasExecutable) {
+      return;
+    }
+  } else if (AlignedBase + AlignedSize > AlignedBase) {
+    // Code is only ever decoded from pages in XIntervals (QueryExecutableRange inserts any VMA it
+    // recovers), and every removal from XIntervals invalidates. Writes into memory that is not
+    // executable, such as file reads into data buffers, cannot reach a translation.
+    std::shared_lock Lock(IntervalsLock);
+    if (!XIntervals.Intersect({AlignedBase, AlignedBase + AlignedSize})) {
+      return;
+    }
+  }
+
+  InvalidateIntervalInternal(AlignedBase, AlignedSize);
+}
+
+/* PORTED fh6-fex 0001: under full SMC, dropping one block is enough. Called when FEX needs to
+ * re-translate at a GuestRIP, which happens on every decrypt-then-execute step: dropping the
+ * whole page there threw away every other function's translation too, and the recompile storm
+ * that followed is the stall the reference package fixed. */
+void InvalidationTracker::InvalidateGuestBlock(uint64_t Entry) {
+  std::scoped_lock CodeLock(CTX.GetCodeInvalidationMutex());
+  CTX.InvalidateCodeBuffersBlock(Entry);
+  for (auto Thread : Threads) {
+    CTX.InvalidateThreadCachedBlock(Thread.second, Entry);
   }
 }
 
+
 void InvalidationTracker::ReprotectRWXIntervals(uint64_t Address, uint64_t Size) {
-  ProtectRWXIntervalsInternal(Address, Size, false);
+  // Full SMC already CRC-checks writable blocks at entry. Re-trapping the trampoline pool after
+  // every compile was NtProtect + fault at tens of kHz.
+  (void)Address;
+  (void)Size;
 }
 
 bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc, uint64_t FaultAddress,
@@ -537,25 +603,37 @@ bool InvalidationTracker::HandleRWXAccessViolation(FEXCore::Core::InternalThread
   if (NeedsInvalidate) {
     // MADEIRA: a page that turns hot here is invalidated below as usual, once: from then on nothing
     // compiled from it relies on the write trap.
-    if (CountSMCWriteFault(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK)) {
+    if (CountSMCWriteFault(FaultAddress & MADEIRA_TRAP_PAGE_MASK)) {
       static std::atomic<uint32_t> HotLogCount {0};
       if (HotLogCount.fetch_add(1, std::memory_order_relaxed) < 16) {
         LogMan::Msg::EFmt("[smc-hot] page {:#x} took {} write faults within a second: no longer write-protected, its blocks "
                           "validate their code per instruction (MADEIRA_SMC_HOT_PAGE=0 disables)",
-                          FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, HotPageThreshold);
+                          FaultAddress & MADEIRA_TRAP_PAGE_MASK, HotPageThreshold);
       }
     }
     // IntervalsLock cannot be held during invalidation
     {
       const bool Locked = LockCodeInvalidationUnlessHeld("write-fault", FaultAddress);
 
-      InvalidateIntervalInternalLocked(FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE);
+      const uint64_t TrapPage = FaultAddress & MADEIRA_TRAP_PAGE_MASK;
+      InvalidateIntervalInternalLocked(TrapPage, MADEIRA_TRAP_PAGE_SIZE);
 
       // Invalidate, then unprotect the faulting page with the compilation lock held to ensure that any racing invalidations are not dropped.
-      ULONG TmpProt;
-      void* TmpAddress = reinterpret_cast<void*>(FaultAddress);
-      SIZE_T TmpSize = 1;
-      NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, UntrapProt, &TmpProt);
+      // MADEIRA 16K traps: every RWX 4 KB page of the host page, each with its own untrap protection.
+      for (uint64_t Page = TrapPage; Page < TrapPage + MADEIRA_TRAP_PAGE_SIZE; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        ULONG PageUntrapProt = UntrapProt;
+        if ((Page ^ FaultAddress) & FEXCore::Utils::FEX_PAGE_MASK) {
+          std::shared_lock Lock(IntervalsLock);
+          if (!RWXIntervals.Query(Page).Enclosed) {
+            continue;
+          }
+          PageUntrapProt = GetUntrapProt(Page);
+        }
+        ULONG TmpProt;
+        void* TmpAddress = reinterpret_cast<void*>(Page);
+        SIZE_T TmpSize = FEXCore::Utils::FEX_PAGE_SIZE;
+        NtProtectVirtualMemory(NtCurrentProcess(), &TmpAddress, &TmpSize, PageUntrapProt, &TmpProt);
+      }
       if (Locked) {
         CTX.GetCodeInvalidationMutex().unlock();
       }
@@ -580,7 +658,7 @@ bool InvalidationTracker::IsHotSMCPage(uint64_t Address) const {
   if (!Used) {
     return false;
   }
-  const auto Page = Address & FEXCore::Utils::FEX_PAGE_MASK;
+  const auto Page = Address & MADEIRA_TRAP_PAGE_MASK;
   for (uint32_t i = 0; i < Used; ++i) {
     if (HotPages[i].load(std::memory_order_acquire) == Page) {
       return true;
@@ -600,7 +678,7 @@ bool InvalidationTracker::CountSMCWriteFault(uint64_t Page) {
   }
 
   // Direct-mapped: a page evicted by another one simply starts counting again.
-  auto& Slot = HotFaults[(Page >> FEXCore::Utils::FEX_PAGE_SHIFT) % HotFaultSlots];
+  auto& Slot = HotFaults[(Page / MADEIRA_TRAP_PAGE_SIZE) % HotFaultSlots];
   if (Slot.Page != Page || Now - Slot.WindowStart > Frequency) {
     Slot = {Page, Now, 0};
   }
@@ -726,22 +804,74 @@ FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionL
 
 // NOTE: IntervalsLock must be held (shared or exclusive) by the caller.
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRangeLocked(uint64_t Address) {
-#else
-FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
-  std::shared_lock Lock(IntervalsLock);
-#endif
   const auto XResult = XIntervals.Query(Address);
   if (!XResult.Enclosed) {
     return {};
   }
-  const auto RWXResult = RWXIntervals.Query(Address);
-  if (RWXResult.Enclosed) {
-    return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
-  } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
-    return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
+
+  /* MADEIRA: `Info` was never declared here, so this did not compile in a clean tree; the two
+   * uses below are the query result the function needs. Same declaration and same failure handling
+   * as InvalidateContainingSection above: an address that cannot be queried describes no range. */
+  MEMORY_BASIC_INFORMATION Info;
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info,
+                           sizeof(Info), nullptr)) {
+    return {};
   }
-  return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
+
+  const auto Base = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  const auto Size = static_cast<uint64_t>(Info.RegionSize);
+  const bool Writable = ProtIsWritable(Info.Protect);
+  {
+    std::unique_lock Lock(IntervalsLock);
+    FEXCore::IntervalList<uint64_t>::Interval Interval {Base, Base + Size};
+    XIntervals.Insert(Interval);
+    if (Writable) {
+      RWXIntervals.Insert(Interval);
+    }
+  }
+  LogMan::Msg::DFmt("Recovered executable VMA: {:X} - {:X} writable={}", Base, Base + Size, Writable);
+  return {Base, Size, Writable};
 }
+#else
+FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRange(uint64_t Address) {
+  {
+    std::shared_lock Lock(IntervalsLock);
+    const auto XResult = XIntervals.Query(Address);
+    if (XResult.Enclosed) {
+      const auto RWXResult = RWXIntervals.Query(Address);
+      if (RWXResult.Enclosed) {
+        return {RWXResult.Interval.Offset, RWXResult.Interval.End - RWXResult.Interval.Offset, true};
+      } else if (RWXResult.Size && RWXResult.Size < XResult.Size) {
+        return {XResult.Interval.Offset, RWXResult.Interval.Offset - XResult.Interval.Offset, false};
+      }
+      return {XResult.Interval.Offset, XResult.Interval.End - XResult.Interval.Offset, false};
+    }
+  }
+
+  /* PORTED fh6-fex 0004: a handler trampoline is VirtualAlloc'd RWX and can miss XIntervals when a
+   * later protect split the tracked range. Recover it from the live VMA so the decoder does not
+   * emit NoExec/#UD for valid cmp/jmp bytes. Note this only rescues MEM_COMMIT+executable; it says
+   * nothing about an address Wine answers MEM_RESERVE/NOACCESS for. */
+  MEMORY_BASIC_INFORMATION Info;
+  if (!VirtualQuery(reinterpret_cast<LPCVOID>(Address), &Info, sizeof(Info)) || Info.State != MEM_COMMIT || !ProtHasExec(Info.Protect)) {
+    return {};
+  }
+
+  const auto Base = reinterpret_cast<uint64_t>(Info.BaseAddress);
+  const auto Size = static_cast<uint64_t>(Info.RegionSize);
+  const bool Writable = ProtIsWritable(Info.Protect);
+  {
+    std::unique_lock Lock(IntervalsLock);
+    FEXCore::IntervalList<uint64_t>::Interval Interval {Base, Base + Size};
+    XIntervals.Insert(Interval);
+    if (Writable) {
+      RWXIntervals.Insert(Interval);
+    }
+  }
+  LogMan::Msg::DFmt("Recovered executable VMA: {:X} - {:X} writable={}", Base, Base + Size, Writable);
+  return {Base, Size, Writable};
+}
+#endif
 
 void InvalidationTracker::DetectMonoBackpatcherBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t HostPc) {
   if (!MonoBackpatcherDetectionPending) {
@@ -964,7 +1094,10 @@ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uin
 }
 
 bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t Size, bool ForWriteLocked) {
-  const auto End = Address + Size;
+  // MADEIRA 16K traps: whole host pages, see HandleRWXAccessViolation.
+  const auto End = (Address + Size + MADEIRA_TRAP_PAGE_SIZE - 1) & MADEIRA_TRAP_PAGE_MASK;
+  Address &= MADEIRA_TRAP_PAGE_MASK;
+  Size = End - Address;
   std::shared_lock Lock(IntervalsLock);
 
   if (SMCDetectionDisabled) {
@@ -998,12 +1131,12 @@ bool InvalidationTracker::ProtectRWXIntervalsInternal(uint64_t Address, uint64_t
       } else {
         // MADEIRA: never write-protect a hot page again; protect the runs of pages around it.
         uint64_t RunBegin = Address;
-        for (uint64_t Page = Address & FEXCore::Utils::FEX_PAGE_MASK; Page < ProtectEnd; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        for (uint64_t Page = Address & MADEIRA_TRAP_PAGE_MASK; Page < ProtectEnd; Page += MADEIRA_TRAP_PAGE_SIZE) {
           if (IsHotSMCPage(Page)) {
             if (RunBegin < std::max(Page, Address)) {
               Protect(RunBegin, std::max(Page, Address));
             }
-            RunBegin = std::min(Page + FEXCore::Utils::FEX_PAGE_SIZE, ProtectEnd);
+            RunBegin = std::min(Page + MADEIRA_TRAP_PAGE_SIZE, ProtectEnd);
           }
         }
         if (RunBegin < ProtectEnd) {

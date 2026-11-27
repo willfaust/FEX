@@ -20,7 +20,8 @@ namespace FEXCore::IR {
 static bool IsFragmentExit(FEXCore::IR::IROps Op) {
   switch (Op) {
   case OP_EXITFUNCTION:
-  case OP_BREAK: return true;
+  case OP_BREAK:
+  case OP_THREADREMOVECODEENTRY: return true;
   default: return false;
   }
 }

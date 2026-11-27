@@ -56,6 +56,14 @@ public:
 
   void ClearCache() override;
 
+  void SetRelocatablePadding(bool Enable) override;
+  [[nodiscard]]
+  CPUBackend::CompiledCode LoadCachedCode(std::span<const uint8_t> HostBytes) override;
+  bool IsLatestMap(const FEXCore::GuestToHostMap* Map) override;
+  uint8_t* AllocateCode(size_t Size) override;
+  void OverwriteCode(uint8_t* Dest, std::span<const uint8_t> HostBytes) override;
+  uint8_t* GetCurrentCodeBufferBase() const override;
+
   void ClearRelocations() override {
     Relocations.clear();
   }
@@ -633,6 +641,7 @@ private:
    * @param Constant - The guest RIP that will be relocated
    */
   void InsertGuestRIPMove(ARMEmitter::Register Reg, uint64_t Constant);
+  void InsertGuestPatchableCRCMove(ARMEmitter::Register Reg, uint64_t SiteAddress, uint8_t ValueSize, uint64_t ExpectedCRC);
 
   /**
    * @brief Inserts a named symbol as a literal in memory

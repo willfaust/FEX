@@ -81,6 +81,21 @@ DEF_OP(Break) {
   LoadConstant(ARMEmitter::Size::i64Bit, TMP1, Constant);
   str(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, SynchronousFaultData));
 
+#ifdef ARCHITECTURE_arm64ec
+  // FEX_FAST_UD=1: raise #UD through the syscall handler, which dispatches the pending
+  // SynchronousFaultData as a guest exception without a host SIGILL / Mach exception round-trip.
+  static const bool FastUD = [] {
+    const char* Env = std::getenv("FEX_FAST_UD");
+    return Env && Env[0] == '1';
+  }();
+  if (FastUD && Op->Reason.Signal == Core::FAULT_SIGILL) {
+    SpillStaticRegs(TMP1);
+    ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, ThreadDispatchSyscallHandlerPtr));
+    br(TMP1);
+    return;
+  }
+#endif
+
   switch (Op->Reason.Signal) {
   case Core::FAULT_SIGILL:
     ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.GuestSignal_SIGILL));

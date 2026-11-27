@@ -16,6 +16,7 @@
 namespace {
 void (*WineDbgOut)(const char* Message);
 FILE* LogFile;
+uint64_t (*AddressTranslator)(uint64_t) = nullptr;
 
 /* iOS-Madeira ml194: FEX's log output was being DISCARDED, which is why no LogMan
  * message (e.g. "[TI-IC] lookupcache-alloc") has ever appeared in madeira-log.txt and why
@@ -35,10 +36,19 @@ static void IosLogWrite(const char* Str, size_t Len) {
    * madeira-log.txt reliably. Keep WriteFile as a fallback. */
   static int (__cdecl *DbgOut)(const char*);
   static bool Resolved;
+  static bool Translated;
   if (!Resolved) {
     Resolved = true;
     DbgOut = reinterpret_cast<decltype(DbgOut)>(
         GetProcAddress(GetModuleHandleA("ntdll.dll"), "__wine_dbg_output"));
+  }
+  if (DbgOut && !Translated && AddressTranslator) {
+    const uint64_t Raw = reinterpret_cast<uint64_t>(DbgOut);
+    const uint64_t Jit = AddressTranslator(Raw);
+    if (Jit && Jit != Raw) {
+      DbgOut = reinterpret_cast<decltype(DbgOut)>(Jit);
+      Translated = true;
+    }
   }
   if (DbgOut) {
     DbgOut(Str);
@@ -85,8 +95,15 @@ static void AssertHandler(const char* Message) {
 } // namespace
 
 namespace FEX::Windows::Logging {
+void SetAddressTranslator(uint64_t (*Fn)(uint64_t)) {
+  AddressTranslator = Fn;
+}
+
 void Init() {
-#ifndef FEX_IOS_HOST
+#ifdef FEX_IOS_HOST
+  const char* DbgEnv = getenv("MADEIRA_FEX_DEBUG_LOG");
+  LogMan::Msg::SetDebugEnabled(DbgEnv && DbgEnv[0] && DbgEnv[0] != '0');
+#else
   FEX_CONFIG_OPT(SilentLog, SILENTLOG);
   if (SilentLog()) {
     return;

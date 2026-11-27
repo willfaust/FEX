@@ -32,11 +32,19 @@ namespace Throw {
 
 namespace Msg {
   MsgHandler Handler {};
+#ifdef FEX_IOS_HOST
+  bool DebugEnabled {false};
+#else
+  bool DebugEnabled {true};
+#endif
   void InstallHandler(MsgHandler _Handler) {
     Handler = _Handler;
   }
   void UnInstallHandler() {
     Handler = nullptr;
+  }
+  void SetDebugEnabled(bool Enabled) {
+    DebugEnabled = Enabled;
   }
 
   // iOS-Madeira ml115: last format string that reached MFmtImpl, exported so a
@@ -45,6 +53,9 @@ namespace Msg {
 extern "C" __attribute__((visibility("default"))) const char* LastDroppedFmt = nullptr;
 
 void MFmtImpl(DebugLevels level, const char* fmt, const fmt::format_args& args) {
+    if (level == DEBUG && !DebugEnabled) {
+      return;
+    }
     // iOS-Madeira (ml107/ml114): three separate child deaths traced to THIS
     // function — the allocator returned NULL on the logging thread and the
     // unchecked memmove inside vformat/fextl::string killed the process, so

@@ -498,7 +498,7 @@ void Arm64Emitter::LoadConstant(ARMEmitter::Size s, ARMEmitter::Register Reg, ui
     NOPPad = false;
   } else if (Pad == PadType::AUTOPAD) {
     // Force NOP padding to ensure relocated constants always have enough encoding space available
-    NOPPad = EnableCodeCaching;
+    NOPPad = EnableCodeCaching || ForceRelocatablePadding;
   }
 
   bool Is64Bit = s == ARMEmitter::Size::i64Bit;

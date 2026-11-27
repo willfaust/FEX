@@ -146,7 +146,8 @@ void IRValidation::Run(IREmitter* IREmit) {
       NodeIsLive.Set(ID.Value);
 
       switch (IROp->Op) {
-      case IR::OP_EXITFUNCTION: {
+      case IR::OP_EXITFUNCTION:
+      case IR::OP_THREADREMOVECODEENTRY: {
         CurrentBlock->HasExit = true;
         break;
       }

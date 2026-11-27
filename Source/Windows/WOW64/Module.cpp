@@ -2126,4 +2126,7 @@ extern "C" uint64_t IosSubfloorToReal(uint64_t Addr) {
 extern "C" int IosSubfloorWindowForCode(uint64_t, uint64_t*, uint64_t*, uint64_t*) {
   return 0;
 }
+extern "C" uint64_t IosPopHotSubfloorPageToInvalidate() {
+  return 0;
+}
 #endif
