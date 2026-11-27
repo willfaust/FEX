@@ -1685,8 +1685,15 @@ uint64_t Decoder::TryDecodeInlineLeaf(const uint8_t* _InstStream, const FEXCore:
     const char* All = getenv("MADEIRA_FEX_MEMMOVE");
     MemmoveSitesOn = !(Sites && Sites[0] == '0') && !(All && All[0] == '0');
   }
-  constexpr size_t MaxLeafInsts = 12;
-  constexpr uint64_t MaxLeafBytes = 64;
+  // madeira-duo leaf-long: MADEIRA_FEX_LEAF_MAX = the longest callee taken, in instructions (12-32, default 12,
+  // which keeps the 64-byte limit; above 12 the byte limit is 6 bytes an instruction). run-1127g: a quarter of
+  // the direct calls looked at stopped at the 12-instruction limit ([leaf-stats] too long 65,362 of 262,144).
+  static const size_t MaxLeafInsts = [] {
+    const char* Env = getenv("MADEIRA_FEX_LEAF_MAX");
+    const long N = Env ? strtol(Env, nullptr, 10) : 0;
+    return static_cast<size_t>(N >= 12 && N <= 32 ? N : 12);
+  }();
+  static const uint64_t MaxLeafBytes = MaxLeafInsts <= 12 ? 64 : MaxLeafInsts * 6;
 
   if ((!LeafInlineOn && !MemmoveSitesOn) || !BlockInfo.Is64BitMode || CallInst->OP != 0xE8 || !CallInst->TableInfo ||
       !(CallInst->TableInfo->Flags & FEXCore::X86Tables::InstFlags::FLAGS_CALL) || (CallInst->Flags & DecodeFlags::FLAG_OPERAND_SIZE)) {
