@@ -513,6 +513,11 @@ struct CpuStateFrame {
    * null when the ring is off. Published to the thread's TEB at 0x1710 (the
    * ActivityId field, unused by Wine) so the fault reporters can dump it. */
   uint64_t* IosBlockRing {};
+
+  // Appended past IosAliasHint/IosBlockRing so fixed Module.S offsets never move.
+  uint64_t LastSMCInvalidateRIP {};
+  uint64_t ThreadDispatchRemoveCodeEntryPtr {};
+  uint64_t ThreadDispatchSyscallHandlerPtr {};
 };
 
 #if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)

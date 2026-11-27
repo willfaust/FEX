@@ -200,11 +200,29 @@ void LookupCache::ClearCache(const LookupCacheWriteLockToken& lk) {
   Shared->ClearCache(lk);
 }
 
+GuestToHostMap::~GuestToHostMap() {
+  for (uint8_t* Base : OwnedPoolArenas) {
+    FEXCore::Allocator::VirtualFree(Base, PoolArenaSize);
+#ifdef FEX_IOS_HOST
+    GetGlobalLivePoolArenas().fetch_sub(1, std::memory_order_relaxed);
+#endif
+  }
+  OwnedPoolArenas.clear();
+}
+
 void GuestToHostMap::ClearCache(const LookupCacheWriteLockToken&) {
   // Allocate a new pointer from the BlockLinks pma again.
   BlockLinks = BlockLinks_pma->new_object<BlockLinksMapType>();
   // All code is gone, clear the block list
   BlockList.clear();
+  Stash.clear();
+  PoolSlots.clear();
+  // Keep PoolArenaCount / PoolArenaBase / OwnedPoolArenas intact: other threads
+  // may still execute inside existing arenas until ~GuestToHostMap(), so resetting
+  // PoolArenaCount to 0 would both break InPoolArena() and let AddPoolArena()
+  // allocate past MaxPoolArenas on top of the still-owned arenas.
+  PoolArenaCursor = nullptr;
+  PoolArenaEnd = nullptr;
 }
 
 } // namespace FEXCore

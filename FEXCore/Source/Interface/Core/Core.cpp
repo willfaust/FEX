@@ -31,6 +31,7 @@ $end_info$
 #include "Interface/IR/RegisterAllocationData.h"
 #include "Utils/Allocator.h"
 #include "Utils/Allocator/HostAllocator.h"
+#include "Utils/crc32.h"
 #include <FEXCore/Utils/SpinWaitLock.h>
 #include "Utils/variable_length_integer.h"
 
@@ -47,6 +48,12 @@ $end_info$
 #include <FEXCore/Utils/Event.h>
 #include <FEXCore/Utils/File.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/Threads.h>
+#include <chrono>
+#include <thread>
+#ifdef _WIN32
+extern "C" long __stdcall NtDelayExecution(unsigned char Alertable, const int64_t* DelayInterval);
+#endif
 #include "FEXCore/Utils/SignalScopeGuards.h"
 #include <FEXCore/Utils/Threads.h>
 #include <FEXCore/Utils/Profiler.h>
@@ -55,6 +62,7 @@ $end_info$
 #include <FEXCore/fextl/memory.h>
 #include <FEXCore/fextl/set.h>
 #include <FEXCore/fextl/sstream.h>
+#include <FEXCore/fextl/unordered_map.h>
 #include <FEXCore/fextl/vector.h>
 #include <FEXHeaderUtils/Syscalls.h>
 
@@ -87,6 +95,7 @@ int rpm_cas_snapshot_take(struct rpm_cas_snapshot* out);
 #include <stdio.h>
 #include <string_view>
 #include <sys/stat.h>
+#include <thread>
 #include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
@@ -132,10 +141,195 @@ extern "C" void IosMaybeSweepCodeBuffers(FEXCore::Core::InternalThreadState* Cal
 #endif
 
 namespace FEXCore::Context {
+
+namespace {
+// Read once in ContextImpl::ContextImpl so CompileBlock never takes the CRT env lock.
+int SMCBlockModeValue = 1;
+int PoolCloneModeValue = 1;
+int PoolSlotsModeValue = 1;
+int AsyncSMCModeValue = 0;
+
+// Batched async SMC invalidation (ported from DroidDeck 0004-jit-stability-and-smc-batching).
+// Taking GuestToHostMap's WritePriorityMutex write lock on a presenting/render thread causes
+// periodic frame-time stalls under SMCChecks=full. Instead, QueueSMCInvalidate clears the
+// calling thread's L1+L2 locally and hands the shared map erase to a background worker that
+// drains runs of up to 64 RIPs under a single write lock, pausing 500 us between runs when
+// more entries are queued so readers are not starved.
+struct SMCPendingEntry {
+  std::weak_ptr<FEXCore::CPU::CodeBuffer> Buffer;
+  uint64_t RIP {};
+  uint64_t Epoch {};
+};
+
+constexpr size_t SMCPendingCap = 16384;
+
+struct SMCInvalidateState {
+  SMCPendingEntry Entries[SMCPendingCap] {};
+  std::atomic<size_t> Count {0};
+  std::mutex Mutex;
+  Event WakeEvent;
+  std::once_flag StartOnce;
+  fextl::unique_ptr<FEXCore::Threads::Thread> WorkerThread;
+};
+
+SMCInvalidateState& GetSMCInvalidateState() {
+  static SMCInvalidateState State;
+  return State;
+}
+
+std::atomic<uint64_t> SMCStatQueued {0};
+std::atomic<uint64_t> SMCStatBatches {0};
+std::atomic<uint64_t> SMCStatSyncFallback {0};
+
+void* SMCInvalidateWorker(void*) {
+  auto& S = GetSMCInvalidateState();
+  LogMan::Msg::EFmt("[smc-worker] started (batch_max=256, cap={})", SMCPendingCap);
+  constexpr size_t BatchMax = 256;
+  SMCPendingEntry Batch[BatchMax];
+  uint64_t RIPs[BatchMax];
+  uint64_t Epochs[BatchMax];
+
+  for (;;) {
+    if (S.Count.load(std::memory_order_acquire) == 0) {
+      S.WakeEvent.Wait();
+    }
+
+    size_t N = 0;
+    {
+      std::lock_guard<std::mutex> lk(S.Mutex);
+      const size_t Count = S.Count.load(std::memory_order_relaxed);
+      N = Count < BatchMax ? Count : BatchMax;
+      if (N) {
+        for (size_t i = 0; i < N; ++i) {
+          Batch[i] = std::move(S.Entries[i]);
+        }
+        for (size_t i = N; i < Count; ++i) {
+          S.Entries[i - N] = std::move(S.Entries[i]);
+        }
+        for (size_t i = Count - N; i < Count; ++i) {
+          S.Entries[i] = {};
+        }
+        S.Count.store(Count - N, std::memory_order_release);
+      }
+    }
+    if (!N) {
+      continue;
+    }
+
+    for (size_t i = 0; i < N;) {
+      auto Strong = Batch[i].Buffer.lock();
+      if (!Strong || !Strong->LookupCache) {
+        ++i;
+        continue;
+      }
+      auto* Map = Strong->LookupCache.get();
+      size_t RunLen = 0;
+      RIPs[RunLen] = Batch[i].RIP;
+      Epochs[RunLen] = Batch[i].Epoch;
+      ++RunLen;
+      size_t j = i + 1;
+      while (j < N) {
+        auto Next = Batch[j].Buffer.lock();
+        if (!Next || Next->LookupCache.get() != Map) {
+          break;
+        }
+        RIPs[RunLen] = Batch[j].RIP;
+        Epochs[RunLen] = Batch[j].Epoch;
+        ++RunLen;
+        ++j;
+      }
+      Map->EraseMappingsOnly(RIPs, Epochs, RunLen);
+      SMCStatBatches.fetch_add(1, std::memory_order_relaxed);
+      i = j;
+    }
+    for (size_t i = 0; i < N; ++i) {
+      Batch[i].Buffer.reset();
+    }
+
+    if (S.Count.load(std::memory_order_acquire) != 0) {
+      // Leave WritePriorityMutex readers a window before taking the write lock again.
+#ifdef _WIN32
+      const int64_t Delay100ns = -2000; // 200 microseconds relative
+      NtDelayExecution(0, &Delay100ns);
+#else
+      std::this_thread::sleep_for(std::chrono::microseconds(200));
+#endif
+    }
+  }
+  return nullptr;
+}
+
+void QueueSMCInvalidate(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP) {
+  Thread->CurrentFrame->LastSMCInvalidateRIP = GuestRIP;
+  Thread->LookupCache->InvalidateLocalCache(GuestRIP);
+  auto* Map = Thread->LookupCache->GetSharedMap();
+  if (!Map) {
+    return;
+  }
+  if (!AsyncSMCModeValue) {
+    SMCStatSyncFallback.fetch_add(1, std::memory_order_relaxed);
+    Map->EraseMappingOnly(GuestRIP);
+    return;
+  }
+
+  auto WeakBuf = Thread->CPUBackend->GetCurrentCodeBufferWeak();
+  auto StrongBuf = WeakBuf.lock();
+  if (!StrongBuf || StrongBuf->LookupCache.get() != Map) {
+    SMCStatSyncFallback.fetch_add(1, std::memory_order_relaxed);
+    Map->EraseMappingOnly(GuestRIP);
+    return;
+  }
+
+  auto& S = GetSMCInvalidateState();
+  std::call_once(S.StartOnce, [&S] {
+    S.WorkerThread = FEXCore::Threads::Thread::Create(SMCInvalidateWorker, nullptr);
+  });
+  if (!S.WorkerThread) {
+    SMCStatSyncFallback.fetch_add(1, std::memory_order_relaxed);
+    Map->EraseMappingOnly(GuestRIP);
+    return;
+  }
+
+  const uint64_t QueueEpoch = Map->AddEpoch.load(std::memory_order_acquire);
+  bool Queued = false;
+  {
+    std::lock_guard<std::mutex> lk(S.Mutex);
+    const size_t Count = S.Count.load(std::memory_order_relaxed);
+    if (Count > 0 && S.Entries[Count - 1].RIP == GuestRIP) {
+      S.Entries[Count - 1].Epoch = QueueEpoch;
+      Queued = true;
+    } else if (Count < SMCPendingCap) {
+      S.Entries[Count] = {std::move(WeakBuf), GuestRIP, QueueEpoch};
+      S.Count.store(Count + 1, std::memory_order_release);
+      Queued = true;
+    }
+  }
+  if (!Queued) {
+    SMCStatSyncFallback.fetch_add(1, std::memory_order_relaxed);
+    Map->EraseMappingOnly(GuestRIP);
+    return;
+  }
+  SMCStatQueued.fetch_add(1, std::memory_order_relaxed);
+  S.WakeEvent.NotifyOne();
+}
+} // namespace
+
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
   , CodeCache {*this} {
+  if (const char* Env = std::getenv("FEX_SMC_BLOCK")) {
+    SMCBlockModeValue = !(Env[0] == '0' && Env[1] == '\0');
+  }
+  if (const char* Env = std::getenv("FEX_POOL_CLONE")) {
+    PoolCloneModeValue = !(Env[0] == '0' && Env[1] == '\0');
+  }
+  if (const char* Env = std::getenv("FEX_POOL_SLOTS")) {
+    PoolSlotsModeValue = !(Env[0] == '0' && Env[1] == '\0');
+  }
+  if (const char* Env = std::getenv("FEX_ASYNC_SMC")) {
+    AsyncSMCModeValue = !(Env[0] == '0' && Env[1] == '\0');
+  }
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
@@ -1003,6 +1197,60 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
       uint64_t BlockInstructionsLength {};
 
+      // Block-level SMC validation: one CRC32C per 255-byte chunk at block entry for writable
+      // code under SMCChecks=full (or ForceFullSMCDetection/HotSMCBlock), replacing per-instruction
+      // validation. FEX_SMC_BLOCK=0 restores per-instruction CRC.
+      const bool BlockSMC = SMCBlockModeValue && Block.Size != 0 &&
+                            ((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL && BlockInfo->ContainsWritableCode) ||
+                             Block.ForceFullSMCDetection || HotSMCBlock);
+      if (BlockSMC) {
+        Thread->OpDispatcher->FlushRegisterCache(true);
+        // Hash the exact bytes decoded by FrontendDecoder (not live guest memory), so a concurrent
+        // guest write during decode/IR cannot produce a matching CRC for stale IR.
+        fextl::vector<uint8_t> DecodedBytes;
+        DecodedBytes.reserve(Block.Size);
+        for (size_t k = 0; k < InstsInBlock; ++k) {
+          const auto& DI = Block.DecodedInstructions[k];
+          if (DI.InstSize != 0) {
+            DecodedBytes.insert(DecodedBytes.end(), DI.InstBytes, DI.InstBytes + DI.InstSize);
+          }
+        }
+        const bool UseDecodedBytes = (DecodedBytes.size() == Block.Size);
+        for (uint64_t off = 0; off < Block.Size;) {
+          const uint64_t chunk = std::min<uint64_t>(255, Block.Size - off);
+          auto addr = Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry + off - GuestRIP);
+          const uint8_t* bytes = UseDecodedBytes ? (DecodedBytes.data() + off) :
+                                                   reinterpret_cast<const uint8_t*>(GetGuestBase() + Block.Entry + off);
+          const auto value = FEXCore::Utils::crc32(bytes, chunk);
+          const bool PatchableCRC = Thread->PoolPatchable && BlockInfo->Blocks.size() == 1 && Block.Entry == GuestRIP &&
+                                    Block.NumInstructions <= 2 && Block.Size <= 20 && off == 0 &&
+                                    Thread->PoolPreSnapshotLen >= chunk;
+          Thread->PoolPatchableCRC = PatchableCRC;
+          if (PatchableCRC) {
+            // Embed the pre-decode snapshot CRC so any concurrent rewrite during
+            // decode/IR/codegen both triggers ValidateCode on entry and gets rejected
+            // by MakePoolTemplate instead of poisoning the template cache.
+            Thread->PoolPatchableCRCValue = FEXCore::Utils::crc32(Thread->PoolPreSnapshot.data(), chunk);
+          }
+          auto crc = Thread->OpDispatcher->Constant(PatchableCRC ? 0ULL : value);
+          auto changed = Thread->OpDispatcher->_ValidateCode(crc, addr, static_cast<uint8_t>(chunk));
+          auto mismatch = Thread->OpDispatcher->CondJump(changed);
+          auto current = Thread->OpDispatcher->GetCurrentBlock();
+          auto fail = Thread->OpDispatcher->CreateNewCodeBlockAtEnd();
+          Thread->OpDispatcher->SetTrueJumpTarget(mismatch, fail);
+          Thread->OpDispatcher->SetCurrentCodeBlock(fail);
+          Thread->OpDispatcher->StartNewBlock();
+          auto EntryRip = Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0);
+          auto ResumeRip = (Block.Entry == GuestRIP) ? EntryRip : Thread->OpDispatcher->_EntrypointOffset(GPRSize, Block.Entry - GuestRIP);
+          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryRip, ResumeRip);
+          auto next = Thread->OpDispatcher->CreateNewCodeBlockAfter(current);
+          Thread->OpDispatcher->SetFalseJumpTarget(mismatch, next);
+          Thread->OpDispatcher->SetCurrentCodeBlock(next);
+          Thread->OpDispatcher->StartNewBlock();
+          off += chunk;
+        }
+      }
+
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
 
@@ -1071,13 +1319,14 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
          * patch was dropped together. The flag and this gate build fine on their own, and the
          * invalidation they depend on is 0001, which 01161827e itself ported properly. So the
          * half that carries the reference's reasoning is restored here and the CRC half is not. */
-        if (((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL && BlockInfo->ContainsWritableCode) ||
+        if (!SMCBlockModeValue &&
+            ((Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL && BlockInfo->ContainsWritableCode) ||
              Block.ForceFullSMCDetection || HotSMCBlock) &&
             DecodedInfo->InstSize != 0) {
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
-          std::array<uint8_t, 0x10> CodeOriginal;
-          memcpy(CodeOriginal.data(), DecodedInfo->InstBytes, DecodedInfo->InstSize);
-          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CodeOriginal, InstAddressReg, DecodedInfo->InstSize);
+          const auto value = FEXCore::Utils::crc32(DecodedInfo->InstBytes, DecodedInfo->InstSize);
+          auto crc = Thread->OpDispatcher->Constant(value);
+          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(crc, InstAddressReg, DecodedInfo->InstSize);
 
           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
 
@@ -1087,8 +1336,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
           Thread->OpDispatcher->SetCurrentCodeBlock(CodeWasChangedBlock);
           Thread->OpDispatcher->StartNewBlock();
-          Thread->OpDispatcher->_ThreadRemoveCodeEntry();
-          Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, InstAddress - GuestRIP));
+          auto EntryToInvalidate = Thread->OpDispatcher->_EntrypointOffset(GPRSize, 0);
+          Thread->OpDispatcher->_ThreadRemoveCodeEntry(EntryToInvalidate, InstAddressReg);
 
           auto NextOpBlock = Thread->OpDispatcher->CreateNewCodeBlockAfter(CurrentBlock);
 
@@ -1373,6 +1622,7 @@ extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
 /* iOS-Madeira ml316: ExitToX64's FFS-bypass counters, defined in Module.cpp and written by
  * the bypass asm in Module.S. Reported below the same way as [cb-entry]. */
 extern "C" uint64_t IosFfsBypassLog[4];
+extern "C" uint64_t IosExitPoolLog[4];
 #else
 /* The WOW64 module (libwow64fex.dll) is a plain aarch64 PE with no Module.S, no EC entry thunks
  * and no FFS bypass, so the last two symbols above do not exist in its link. Zeroed storage and an
@@ -1380,6 +1630,7 @@ extern "C" uint64_t IosFfsBypassLog[4];
  * the module has no PE-image-to-pool alias table (its guest images are mapped normally). */
 extern "C" uint64_t IosCbEntryLog[8];
 static uint64_t IosFfsBypassLog[4] {};
+static uint64_t IosExitPoolLog[4] {};
 static inline uint64_t IosJitReverseTranslate(uint64_t Addr) {
   return Addr;
 }
@@ -1442,6 +1693,10 @@ static inline bool MonoBackpatcherBridgeArmed() {
   return ios_fex_mono_bridge_armed() != 0;
 }
 
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+extern "C" uint64_t IosPopHotSubfloorPageToInvalidate();
+#endif
+
 static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadState* Thread) {
   uint64_t BlockBegin = 0, HostPC = 0, FaultAddr = 0;
   if (!ios_fex_mono_take_pending(&BlockBegin, &HostPC, &FaultAddr)) {
@@ -1478,6 +1733,378 @@ static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadSt
   LogMan::Msg::EFmt("[mono-bridge] ml648 ACTIVATED mono backpatcher block {:#x} -- SWPAL storm should collapse", BlockEntry);
 }
 #endif
+
+namespace {
+constexpr uint64_t MaxX86InstSize = 15;
+
+// Pool-clone + pool-stub-slots: trampoline pools keep rewriting slots with
+// "one instruction; jmp rel32" (or lone ret) stubs whose instruction and absolute
+// jump target recur at other slots.
+// FEX_POOL_CLONE: 0 off, 1 (default) publish copies into reusable pool slots, 2 verify only.
+int GetPoolCloneMode() {
+  return PoolCloneModeValue;
+}
+
+struct PoolTemplate {
+  uint64_t Entry;
+  uint64_t Target;
+  uint32_t InsnLen;
+  uint32_t EntryOffset;
+  bool Writable;
+  std::array<uint8_t, MaxX86InstSize> Insn;
+  fextl::vector<uint8_t> Host;
+  fextl::vector<FEXCore::CPU::Relocation> Relocs;
+};
+
+struct PoolTemplateShard {
+  std::mutex Mutex;
+  fextl::unordered_map<uint64_t, fextl::shared_ptr<const PoolTemplate>> Map;
+};
+constexpr size_t PoolShards = 128;
+constexpr size_t PoolShardLimit = 512;
+PoolTemplateShard PoolTemplates[PoolShards];
+
+std::atomic<uint64_t> PoolStatHits {};
+std::atomic<uint64_t> PoolStatTemplates {};
+std::atomic<uint64_t> PoolStatSlotReuse {};
+std::atomic<uint64_t> PoolStatSlotNew {};
+std::atomic<uint64_t> PoolStatSlotFallback {};
+std::atomic<uint64_t> PoolStatArenas {};
+std::atomic<uint64_t> PoolStatCopyBytes {};
+std::atomic<uint64_t> PoolStatUniqueRips {};
+std::atomic<uint64_t> PoolStatSawCount1 {};
+std::atomic<uint64_t> PoolStatCapMiss {};
+std::atomic<uint64_t> PoolStatOffMiss {};
+std::atomic<uint64_t> PoolStatRejShape {};
+std::atomic<uint64_t> PoolStatRejReloc {};
+std::atomic<uint64_t> PoolStatRejCrc {};
+
+void MaybeLogPoolStats(uint64_t RealCompiles) {
+  const uint64_t Hits = PoolStatHits.load(std::memory_order_relaxed);
+  if (Hits == 0 || (Hits & 0xFFFFULL) != 0) {
+    return;
+  }
+  const uint64_t SlotNew = PoolStatSlotNew.load(std::memory_order_relaxed);
+  const uint64_t SlotReuse = PoolStatSlotReuse.load(std::memory_order_relaxed);
+  const uint64_t TotalPlaced = SlotNew + SlotReuse;
+  const uint64_t AvgSz = TotalPlaced ? PoolStatCopyBytes.load(std::memory_order_relaxed) / TotalPlaced : 0;
+  LogMan::Msg::EFmt("[pool-slot] hits={} templates={} slot_reuse={} slot_new={} slot_fb={} arenas={} "
+                    "rips={} c1={} avg_sz={} miss(cap/off)={}/{} "
+                    "rej(shape/reloc/crc)={}/{}/{} smc(q/b/fb)={}/{}/{} real_compiles={}",
+                    Hits, PoolStatTemplates.load(std::memory_order_relaxed),
+                    SlotReuse, SlotNew,
+                    PoolStatSlotFallback.load(std::memory_order_relaxed),
+                    PoolStatArenas.load(std::memory_order_relaxed),
+                    PoolStatUniqueRips.load(std::memory_order_relaxed),
+                    PoolStatSawCount1.load(std::memory_order_relaxed),
+                    AvgSz,
+                    PoolStatCapMiss.load(std::memory_order_relaxed),
+                    PoolStatOffMiss.load(std::memory_order_relaxed),
+                    PoolStatRejShape.load(std::memory_order_relaxed),
+                    PoolStatRejReloc.load(std::memory_order_relaxed),
+                    PoolStatRejCrc.load(std::memory_order_relaxed),
+                    SMCStatQueued.load(std::memory_order_relaxed),
+                    SMCStatBatches.load(std::memory_order_relaxed),
+                    SMCStatSyncFallback.load(std::memory_order_relaxed),
+                    RealCompiles);
+}
+
+uint64_t PoolKey(const uint8_t* Insn, uint64_t Len, uint64_t Target) {
+  uint64_t Key = 0x9E3779B97F4A7C15ULL ^ Target;
+  for (uint64_t i = 0; i < Len; ++i) {
+    Key = (Key ^ Insn[i]) * 0x100000001B3ULL;
+  }
+  Key = (Key ^ (Key >> 29)) * 0xBF58476D1CE4E5B9ULL;
+  return Key ^ (Key >> 32);
+}
+
+uint64_t PoolJmpTarget(const uint8_t* Code, uint64_t Entry, uint64_t InsnLen) {
+  int32_t Rel;
+  memcpy(&Rel, Code + InsnLen + 1, sizeof(Rel));
+  return Entry + InsnLen + 5 + static_cast<int64_t>(Rel);
+}
+
+fextl::shared_ptr<const PoolTemplate> FindPoolTemplate(uint64_t Key) {
+  auto& Shard = PoolTemplates[Key % PoolShards];
+  std::scoped_lock Lock(Shard.Mutex);
+  auto It = Shard.Map.find(Key);
+  return It == Shard.Map.end() ? nullptr : It->second;
+}
+
+void StorePoolTemplate(uint64_t Key, fextl::shared_ptr<const PoolTemplate> Template) {
+  auto& Shard = PoolTemplates[Key % PoolShards];
+  std::scoped_lock Lock(Shard.Mutex);
+  if (Shard.Map.size() >= PoolShardLimit) {
+    Shard.Map.clear();
+  }
+  Shard.Map[Key] = std::move(Template);
+}
+
+std::optional<uint64_t> ReadPaddedConstant(const uint8_t* Code) {
+  uint64_t Value = 0;
+  bool Any = false;
+  for (int i = 0; i < 4; ++i) {
+    uint32_t Inst;
+    memcpy(&Inst, Code + i * 4, sizeof(Inst));
+    if (Inst == 0xD503201F) {
+      continue;
+    }
+    const uint32_t Op = Inst & 0xFF800000;
+    if (Op != 0xD2800000 && Op != 0xF2800000) {
+      return std::nullopt;
+    }
+    const uint32_t Shift = ((Inst >> 21) & 3) * 16;
+    const uint64_t Imm = (Inst >> 5) & 0xFFFF;
+    Value = (Op == 0xD2800000 ? 0 : Value & ~(0xFFFFULL << Shift)) | (Imm << Shift);
+    Any = true;
+  }
+  return Any ? std::optional<uint64_t>(Value) : std::nullopt;
+}
+
+bool PatchPoolCopy(ContextImpl* CTX, const PoolTemplate& Template, uint64_t NewEntry, const uint8_t* Snapshot, uint8_t* Out) {
+  memcpy(Out, Template.Host.data(), Template.Host.size());
+  CPU::Arm64Emitter Emitter(CTX, Out, Template.Host.size());
+  const auto Move = [&](uint64_t Old) {
+    return Old == Template.Target ? Old : Old - Template.Entry + NewEntry;
+  };
+  for (const auto& Reloc : Template.Relocs) {
+    Emitter.SetCursorOffset(Reloc.Header.Offset);
+    switch (Reloc.Header.Type) {
+    case CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
+    case CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: break;
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL: Emitter.dc64(Move(Reloc.GuestRIP.GuestRIP)); break;
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE:
+      Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(Reloc.GuestRIP.RegisterIndex), Move(Reloc.GuestRIP.GuestRIP),
+                           CPU::Arm64Emitter::PadType::DOPAD);
+      break;
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: {
+      const auto& Data = Reloc.GuestPatchableData;
+      const uint64_t Value = FEXCore::Utils::crc32(Snapshot + (Data.SiteAddress - Template.Entry), Data.ValueSize);
+      Emitter.LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Register(Data.RegisterIndex), Value, CPU::Arm64Emitter::PadType::DOPAD);
+      break;
+    }
+    default: return false;
+    }
+  }
+  return true;
+}
+
+fextl::shared_ptr<PoolTemplate> MakePoolTemplate(uint64_t GuestBase, const Frontend::Decoder::DecodedBlockInformation& BlockInfo,
+                                                 uint64_t GuestRIP, uint64_t Length, bool Writable,
+                                                 const CPU::CPUBackend::CompiledCode& Code, uint64_t BlockBaseOffset,
+                                                 std::span<const CPU::Relocation> Relocs,
+                                                 const uint8_t* PreSnapshot, uint8_t PreSnapshotLen) {
+  if (!Writable) {
+    return nullptr;
+  }
+  if (BlockInfo.Blocks.size() != 1 || Code.EntryPoints.size() != 1) {
+    PoolStatRejShape.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  const auto& Block = BlockInfo.Blocks[0];
+  if (Block.Entry != GuestRIP || Block.Size != Length || Block.ForceFullSMCDetection) {
+    PoolStatRejShape.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  const bool RetStub = Block.NumInstructions == 1 && Length == 1;
+  uint64_t InsnLen = 1;
+  if (!RetStub) {
+    if (Block.NumInstructions != 2) {
+      PoolStatRejShape.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    const auto& Insn = Block.DecodedInstructions[0];
+    const auto& Jmp = Block.DecodedInstructions[1];
+    InsnLen = Insn.InstSize;
+    if (InsnLen == 0 || InsnLen > MaxX86InstSize || Jmp.InstSize != 5 || InsnLen + 5 != Length) {
+      PoolStatRejShape.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    if (Insn.TableInfo == nullptr ||
+        (Insn.TableInfo->Flags & (X86Tables::InstFlags::FLAGS_BLOCK_END | X86Tables::InstFlags::FLAGS_SETS_RIP | X86Tables::InstFlags::FLAGS_CALL))) {
+      PoolStatRejShape.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    const auto RipRelative = [](const X86Tables::DecodedOperand& Operand) {
+      return Operand.IsRIPRelative() || Operand.IsRIPRelativeRelocation();
+    };
+    if (RipRelative(Insn.Dest) || RipRelative(Insn.Src[0]) || RipRelative(Insn.Src[1]) || RipRelative(Insn.Src[2])) {
+      PoolStatRejShape.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+  }
+
+  std::array<uint8_t, MaxX86InstSize + 5> Snapshot;
+  memcpy(Snapshot.data(), reinterpret_cast<const void*>(GuestBase + GuestRIP), Length);
+  if (PreSnapshotLen < Length || memcmp(Snapshot.data(), PreSnapshot, Length) != 0) {
+    PoolStatRejCrc.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  uint64_t Target = 0;
+  if (RetStub) {
+    if (Snapshot[0] != 0xC3) {
+      return nullptr;
+    }
+  } else {
+    if (Snapshot[InsnLen] != 0xE9) {
+      return nullptr;
+    }
+    Target = PoolJmpTarget(Snapshot.data(), GuestRIP, InsnLen);
+    if (Target >= GuestRIP - 32 && Target < GuestRIP + Length + 32) {
+      return nullptr;
+    }
+  }
+
+  const auto EntryHost = Code.EntryPoints.begin()->second;
+  auto Template = fextl::make_shared<PoolTemplate>();
+  Template->Entry = GuestRIP;
+  Template->Target = Target;
+  Template->InsnLen = InsnLen;
+  Template->EntryOffset = static_cast<uint32_t>(EntryHost - Code.BlockBegin);
+  Template->Writable = Writable;
+  memcpy(Template->Insn.data(), Snapshot.data(), InsnLen);
+  Template->Host.assign(Code.BlockBegin, Code.BlockBegin + Code.Size);
+
+  bool HasCrc = false;
+  Template->Relocs.reserve(Relocs.size());
+  for (auto Reloc : Relocs) {
+    if (Reloc.Header.Offset < BlockBaseOffset) {
+      PoolStatRejReloc.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    Reloc.Header.Offset -= BlockBaseOffset;
+    const bool Literal = Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL ||
+                         Reloc.Header.Type == CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL;
+    if (Reloc.Header.Offset + (Literal ? 8 : 16) > Code.Size) {
+      PoolStatRejReloc.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    switch (Reloc.Header.Type) {
+    case CPU::RelocationTypes::RELOC_NAMED_SYMBOL_LITERAL:
+    case CPU::RelocationTypes::RELOC_NAMED_THUNK_MOVE: break;
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_LITERAL:
+    case CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE: {
+      const uint64_t Value = Reloc.GuestRIP.GuestRIP;
+      if (Value != Target && (Value < GuestRIP || Value > GuestRIP + Length)) {
+        PoolStatRejReloc.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+      }
+      if (Reloc.Header.Type == CPU::RelocationTypes::RELOC_GUEST_RIP_MOVE &&
+          ReadPaddedConstant(Template->Host.data() + Reloc.Header.Offset) != Value) {
+        PoolStatRejReloc.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+      }
+      break;
+    }
+    case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: {
+      const uint64_t Site = Reloc.GuestPatchableData.SiteAddress;
+      const uint64_t Size = Reloc.GuestPatchableData.ValueSize;
+      if (Site < GuestRIP || Site + Size > GuestRIP + Length) {
+        PoolStatRejCrc.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+      }
+      const uint64_t Expected = FEXCore::Utils::crc32(Snapshot.data() + (Site - GuestRIP), Size);
+      const auto Embedded = ReadPaddedConstant(Template->Host.data() + Reloc.Header.Offset);
+      if (!Embedded || *Embedded != Expected) {
+        PoolStatRejCrc.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+      }
+      HasCrc = true;
+      break;
+    }
+    default:
+      PoolStatRejReloc.fetch_add(1, std::memory_order_relaxed);
+      return nullptr;
+    }
+    Template->Relocs.push_back(Reloc);
+  }
+  if (!HasCrc) {
+    PoolStatRejCrc.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  return Template;
+}
+
+bool LoadIntoPoolSlot(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestRIP, std::span<const uint8_t> Bytes, uint32_t EntryOffset,
+                      const fextl::vector<uint64_t>& Pages, void** OutHost) {
+  auto* Map = Thread->LookupCache->Shared;
+  if (!Map || !Thread->CPUBackend->IsLatestMap(Map)) {
+    return false;
+  }
+  for (int Attempt = 0; Attempt < 2; ++Attempt) {
+    bool NeedArena = false;
+    {
+      auto MapLock = Map->AcquireWriteLock();
+      // Re-check BlockList under MapLock so racing threads never allocate or
+      // overwrite a second pool slot for the same guest rewrite.
+      if (const auto* Existing = Map->FindBlock(GuestRIP, MapLock)) {
+        if (Existing->GuestCRCLen != 0 &&
+            FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(GuestRIP), Existing->GuestCRCLen) == Existing->GuestCRC) {
+          Thread->LookupCache->CacheBlockMappingLocked(GuestRIP, *Existing, MapLock);
+          *OutHost = reinterpret_cast<void*>(Existing->HostCode);
+          return true;
+        }
+      }
+      bool Reused = false;
+      FEXCore::GuestToHostMap::PoolSlotDiag Diag {};
+      if (uint8_t* Slot = Map->GetPoolSlot(GuestRIP, static_cast<uint32_t>(Bytes.size()), EntryOffset, &NeedArena, &Reused, &Diag)) {
+        Thread->CPUBackend->OverwriteCode(Slot, Bytes);
+        void* Host = Slot + EntryOffset;
+        const auto& Entry = Map->AddBlockMapping(GuestRIP, Pages, Host, MapLock);
+        Thread->LookupCache->CacheBlockMappingLocked(GuestRIP, Entry, MapLock);
+        (Reused ? PoolStatSlotReuse : PoolStatSlotNew).fetch_add(1, std::memory_order_relaxed);
+        PoolStatCopyBytes.fetch_add(Bytes.size(), std::memory_order_relaxed);
+        if (Diag.NewRip) {
+          PoolStatUniqueRips.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (Diag.SawCount1) {
+          PoolStatSawCount1.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (Diag.CapMiss) {
+          PoolStatCapMiss.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (Diag.OffMiss) {
+          PoolStatOffMiss.fetch_add(1, std::memory_order_relaxed);
+        }
+        *OutHost = Host;
+        return true;
+      }
+    }
+    if (!NeedArena || Attempt) {
+      return false;
+    }
+    const uint32_t ArenaCap = FEXCore::GuestToHostMap::GetMaxPoolArenas();
+    if (Map->PoolArenaCount.load(std::memory_order_relaxed) >= ArenaCap
+#ifdef FEX_IOS_HOST
+        || FEXCore::GuestToHostMap::GetGlobalLivePoolArenas().load(std::memory_order_relaxed) >= ArenaCap
+#endif
+    ) {
+      return false;
+    }
+    // Allocate dedicated executable arena outside the 128 MB CodeBuffer so pool stubs
+    // never fill or wipe the main CodeBuffer. Owned by Map and freed in ~GuestToHostMap.
+    uint8_t* Arena = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(FEXCore::GuestToHostMap::PoolArenaSize, true));
+    if (!Arena) {
+      return false;
+    }
+    if (Thread->LookupCache->Shared != Map || !Thread->CPUBackend->IsLatestMap(Map)) {
+      FEXCore::Allocator::VirtualFree(Arena, FEXCore::GuestToHostMap::PoolArenaSize);
+      return false;
+    }
+    auto MapLock = Map->AcquireWriteLock();
+    if (Map->PoolArenaCursor && Map->PoolArenaCursor + 1024 <= Map->PoolArenaEnd) {
+      FEXCore::Allocator::VirtualFree(Arena, FEXCore::GuestToHostMap::PoolArenaSize);
+      continue;
+    }
+    if (!Map->AddPoolArena(Arena, true)) {
+      FEXCore::Allocator::VirtualFree(Arena, FEXCore::GuestToHostMap::PoolArenaSize);
+      return false;
+    }
+    PoolStatArenas.fetch_add(1, std::memory_order_relaxed);
+  }
+  return false;
+}
+} // namespace
 
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
@@ -1517,6 +2144,15 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   if (MonoBackpatcherBridgeArmed()) {
     IosMonoTryActivate(this, Thread);
   }
+#ifdef _WIN32
+  // Drain any hot guest-RIP pages promoted by ios_subfloor_service (e.g. tight
+  // KUSER_SHARED_DATA loops at 0x7ffe0000) so they recompile once with inline
+  // subfloor translation instead of trapping into the Mach exception handler.
+  while (uint64_t HotPage = IosPopHotSubfloorPageToInvalidate()) {
+    SyscallHandler->InvalidateGuestCodeRange(Thread, HotPage, FEXCore::Utils::FEX_PAGE_SIZE);
+    LogMan::Msg::EFmt("[iOS-subfloor-xlate] invalidated hot accessor page {:#x} for inline recompile", HotPage);
+  }
+#endif
 #endif
 
 #ifdef FEX_IOS_HOST
@@ -1556,6 +2192,17 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
       LogMan::Msg::EFmt("[ffs-bypass] taken={} (last EC target {:#x} called natively, x4/x5 preserved) "
                         "rejected={} (last non-EC target {:#x} emulated normally)",
                         IosFfsBypassLog[0], IosFfsBypassLog[1], IosFfsBypassLog[2], IosFfsBypassLog[3]);
+    }
+  }
+  {
+    static uint64_t PoolLast = 0;
+    static uint32_t PoolReports = 0;
+    const uint64_t PoolCount = IosExitPoolLog[0] + IosExitPoolLog[2];
+    if (PoolCount != PoolLast && PoolReports < 8) {
+      PoolLast = PoolCount;
+      PoolReports++;
+      LogMan::Msg::EFmt("[exit-pool] native={} (last {:#x}) rewritten={} (last pe {:#x})",
+                        IosExitPoolLog[0], IosExitPoolLog[1], IosExitPoolLog[2], IosExitPoolLog[3]);
     }
   }
 
@@ -1972,13 +2619,14 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Madeira 2026-05-18 low-noise summary. Replaces per-call log (which
-   * was producing ~180K lines/run for hot RIP 0x140028d46 alone, each
-   * amplified ~6× by Wine's file trace). Counters: g_cb_total bumped
-   * every CompileBlock call; g_cb_real_compiles bumped after cache miss
-   * proves we actually compile (see below at LookupCache fallthrough).
-   * Boyer-Moore-style 1-slot hot-RIP estimator. Summary every 16K calls. */
-  {
+  /* iOS-Madeira 2026-05-18 low-noise summary. Under MADEIRA_LEAN_DIAG=1 skip
+   * the global cache-line-bouncing atomics, 4-slot callret table, and FMOD
+   * HOTRIP probes on every CompileBlock call (~65-125K calls/sec in FH6). */
+  static const bool IosLeanDiag = []() {
+    const char* E = std::getenv("MADEIRA_LEAN_DIAG");
+    return E && E[0] == '1';
+  }();
+  if (!IosLeanDiag) {
     static volatile uint64_t g_cb_last_summary_total = 0;
     static volatile uint64_t g_cb_hot_rip = 0;
     static volatile uint64_t g_cb_hot_rip_count = 0;
@@ -2050,7 +2698,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * block dispatch, not just hot RIPs). 4-slot hash table keyed by Frame
    * pointer (unique per FEX thread). Identifies WHICH thread is leaking
    * callret entries vs healthy. */
-  {
+  if (!IosLeanDiag) {
     uintptr_t fk = reinterpret_cast<uintptr_t>(Frame);
     int slot = (int)((fk >> 6) & 3);
     /* Claim the slot if empty, or use if matches; ignore on collision. */
@@ -2072,7 +2720,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * initialization, which appears to trip a stack-cookie check on
    * ARM64EC mingw. POD types only — no constructors. Atomicity isn't
    * critical for telemetry; occasional torn reads are fine. */
-  {
+  if (!IosLeanDiag) {
     /* RIPs depend on FMOD's mapped base (0xeaa1d0000 in current runs).
      * The two critsection wrappers GPT identified live at fmod+0xba27a
      * and fmod+0xba2fa. Match on the FMOD-relative range rather than
@@ -2196,8 +2844,18 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
     // Is the code in the cache?
     // The backends only check L1 and L2, not L3
-    if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+    const bool AfterSMC = (Thread->CurrentFrame->LastSMCInvalidateRIP == GuestRIP);
+    if (AfterSMC) {
+      Thread->CurrentFrame->LastSMCInvalidateRIP = 0;
+    }
+    if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP, AfterSMC)) {
       return HostCode;
+    }
+    if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
+      uint64_t Reused = 0;
+      if (Thread->LookupCache->TryReuseAfterSMC(GuestRIP, &Reused) == 1) {
+        return Reused;
+      }
     }
   }
 #else
@@ -2206,10 +2864,121 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 
   // Is the code in the cache?
   // The backends only check L1 and L2, not L3
-  if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+  const bool AfterSMC = (Thread->CurrentFrame->LastSMCInvalidateRIP == GuestRIP);
+  if (AfterSMC) {
+    Thread->CurrentFrame->LastSMCInvalidateRIP = 0;
+  }
+  if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP, AfterSMC)) {
     return HostCode;
   }
+  if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
+    uint64_t Reused = 0;
+    if (Thread->LookupCache->TryReuseAfterSMC(GuestRIP, &Reused) == 1) {
+      return Reused;
+    }
+  }
 #endif
+  // FH6 pool-clone + pool-stub-slots fast path.
+  const int PoolCloneModeValue = GetPoolCloneMode();
+  const bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
+  HLE::ExecutableRangeInfo RangeInfo {};
+#ifdef FEX_IOS_HOST
+  const bool AllowPoolClone = !IosUnpublished && PoolCloneModeValue != 0 && MaxInst == 0 && !TFSet &&
+                              Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL;
+#else
+  const bool AllowPoolClone = PoolCloneModeValue != 0 && MaxInst == 0 && !TFSet &&
+                              Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL;
+#endif
+  if (AllowPoolClone) {
+    auto PoolRegion = SyscallHandler->LookupExecutableFileSection(Thread, GuestRIP);
+    if (!PoolRegion) {
+      RangeInfo = SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
+    }
+  }
+  const bool PoolCandidate = RangeInfo.Size != 0 && RangeInfo.Writable;
+  auto& PoolCopy = Thread->PoolCopy;
+  auto& PoolCopySize = Thread->PoolCopySize;
+  PoolCopySize = 0;
+  Thread->PoolPreSnapshotLen = 0;
+  if (PoolCandidate) {
+    std::array<uint8_t, MaxX86InstSize + 5> Snapshot;
+    const uint64_t RangeEnd = RangeInfo.Base + RangeInfo.Size;
+    const uint64_t Avail = RangeEnd > GuestRIP ? std::min<uint64_t>(Snapshot.size(), RangeEnd - GuestRIP) : 0;
+    memcpy(Snapshot.data(), reinterpret_cast<const void*>(GetGuestBase() + GuestRIP), Avail);
+    memcpy(Thread->PoolPreSnapshot.data(), Snapshot.data(), Avail);
+    Thread->PoolPreSnapshotLen = static_cast<uint8_t>(Avail);
+    std::array<std::pair<uint64_t, uint64_t>, MaxX86InstSize + 1> Candidates;
+    size_t NumCandidates = 0;
+    if (Avail >= 1 && Snapshot[0] == 0xC3) {
+      Candidates[NumCandidates++] = {1, 0};
+    }
+    for (uint64_t InsnLen = 1; InsnLen <= MaxX86InstSize && InsnLen + 5 <= Avail; ++InsnLen) {
+      if (Snapshot[InsnLen] == 0xE9) {
+        Candidates[NumCandidates++] = {InsnLen, PoolJmpTarget(Snapshot.data(), GuestRIP, InsnLen)};
+      }
+    }
+    for (size_t Candidate = 0; Candidate < NumCandidates; ++Candidate) {
+      const auto [InsnLen, Target] = Candidates[Candidate];
+      const auto Template = FindPoolTemplate(PoolKey(Snapshot.data(), InsnLen, Target));
+      if (!Template || Template->InsnLen != InsnLen || Template->Target != Target || Template->Writable != RangeInfo.Writable ||
+          memcmp(Template->Insn.data(), Snapshot.data(), InsnLen) != 0) {
+        continue;
+      }
+      if (Template->Host.size() > sizeof(PoolCopy) || !PatchPoolCopy(this, *Template, GuestRIP, Snapshot.data(), PoolCopy)) {
+        break;
+      }
+      PoolCopySize = static_cast<uint32_t>(Template->Host.size());
+      const uint32_t CopySize = PoolCopySize;
+      PoolCopySize = 0;
+      const uint64_t GuestLen = InsnLen + (Target ? 5 : 0);
+      if (memcmp(reinterpret_cast<const void*>(GetGuestBase() + GuestRIP), Snapshot.data(), GuestLen) != 0) {
+        break;
+      }
+      const fextl::set<uint64_t> EntrySet {GuestRIP};
+      const uint64_t LastByte = GuestRIP + GuestLen - 1;
+      const uint64_t Page0 = GuestRIP & FEXCore::Utils::FEX_PAGE_MASK;
+      const uint64_t Page1 = LastByte & FEXCore::Utils::FEX_PAGE_MASK;
+      fextl::vector<uint64_t> Pages;
+      Pages.push_back(Page0);
+      if (Page1 != Page0) {
+        Pages.push_back(Page1);
+      }
+      void* Host = nullptr;
+      bool UsedSlot = false;
+      if (PoolSlotsModeValue) {
+        for (uint64_t Page : Pages) {
+          if (Thread->LookupCache->AddBlockExecutableRange(Thread, EntrySet, Page, FEXCore::Utils::FEX_PAGE_SIZE)) {
+            SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+          }
+        }
+        UsedSlot = LoadIntoPoolSlot(Thread, GuestRIP, {PoolCopy, CopySize}, Template->EntryOffset, Pages, &Host);
+      }
+      if (!UsedSlot) {
+        // Allocate/load into CodeBuffer BEFORE AddBlockExecutableRange so a ClearCodeCache
+        // rollover inside LoadCachedCode registers CodePages on the new LookupCache->Shared.
+        auto Loaded = Thread->CPUBackend->LoadCachedCode({PoolCopy, CopySize});
+        if (!Loaded.BlockBegin) {
+          break;
+        }
+        for (uint64_t Page : Pages) {
+          if (Thread->LookupCache->AddBlockExecutableRange(Thread, EntrySet, Page, FEXCore::Utils::FEX_PAGE_SIZE)) {
+            SyscallHandler->MarkGuestExecutableRange(Thread, Page, FEXCore::Utils::FEX_PAGE_SIZE);
+          }
+        }
+        PoolStatSlotFallback.fetch_add(1, std::memory_order_relaxed);
+        Host = Loaded.BlockBegin + Template->EntryOffset;
+        Thread->LookupCache->AddBlockMapping(Thread, GuestRIP, Pages, Host);
+      }
+      PoolStatHits.fetch_add(1, std::memory_order_relaxed);
+      MaybeLogPoolStats(g_cb_real_compiles);
+#if defined(FEX_IOS_HOST) && defined(_WIN32)
+      if (!IosUnpublished) {
+        IosMaybeSweepCodeBuffers(Thread);
+      }
+#endif
+      return reinterpret_cast<uintptr_t>(Host);
+    }
+  }
 
   // iOS-Madeira: cache miss reached — count as true compile.
   __sync_add_and_fetch(&g_cb_real_compiles, 1);
@@ -2224,7 +2993,13 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     FEXCore::Utils::WritePriorityMutex::IosAdjustUnpublishedCompileDepth(1);
   }
 #endif
+  Thread->PoolPatchable = PoolCandidate;
+  Thread->PoolPatchableCRC = false;
+  Thread->CPUBackend->SetRelocatablePadding(PoolCandidate);
   auto [CompiledCode, DebugData, StartAddr, Length, NeedsAddGuestCodeRanges] = CompileCode(Thread, GuestRIP, MaxInst);
+  Thread->PoolPatchable = false;
+  Thread->PoolPatchableCRC = false;
+  Thread->CPUBackend->SetRelocatablePadding(false);
 #ifdef FEX_IOS_HOST
   if (IosUnpublished) {
     FEXCore::Utils::WritePriorityMutex::IosAdjustUnpublishedCompileDepth(-1);
@@ -2294,6 +3069,25 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
+  if (PoolCandidate && NeedsAddGuestCodeRanges && CompiledCode.BlockBegin) {
+    if (uint8_t* BufBase = Thread->CPUBackend->GetCurrentCodeBufferBase()) {
+      if (CompiledCode.BlockBegin >= BufBase) {
+        const uint64_t BlockBaseOff = static_cast<uint64_t>(CompiledCode.BlockBegin - BufBase);
+        std::span<const CPU::Relocation> Relocs;
+        if (DebugData->Relocations) {
+          Relocs = *DebugData->Relocations;
+        }
+        if (auto Template = MakePoolTemplate(GetGuestBase(), *Thread->FrontendDecoder->GetDecodedBlockInfo(), GuestRIP, Length,
+                                             RangeInfo.Writable, CompiledCode, BlockBaseOff, Relocs,
+                                             Thread->PoolPreSnapshot.data(), Thread->PoolPreSnapshotLen)) {
+          const uint64_t Key = PoolKey(Template->Insn.data(), Template->InsnLen, Template->Target);
+          StorePoolTemplate(Key, std::move(Template));
+          PoolStatTemplates.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
+  }
+
   // Clear any relocations that might have been generated
   if (!CodeCache.IsGeneratingCache) {
     Thread->CPUBackend->ClearRelocations();
@@ -2324,7 +3118,6 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
   }
 
   // Insert to lookup cache
-
   for (auto [GuestAddr, HostAddr] : CompiledCode.EntryPoints) {
     Thread->LookupCache->AddBlockMapping(Thread, GuestAddr, CodePages, HostAddr);
   }
@@ -2485,8 +3278,11 @@ void ContextImpl::ThreadRemoveCodeEntryFromJit(FEXCore::Core::CpuStateFrame* Fra
   if (CTX->Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL) {
     // Every block compiled from writable code validates its own bytes on entry, so a thread that
     // reaches a stale copy through its own cache, an older buffer's links, or a racing link detects
-    // the mismatch itself and erases it from the map it looks up in. Drop only this thread's block.
-    Thread->LookupCache->InvalidateBlock(GuestRIP);
+    // the mismatch itself and erases it from the map it looks up in. Clear only this thread's
+    // L1+L2 locally and queue the shared map erase for the batched async worker.
+    QueueSMCInvalidate(Thread, GuestRIP);
+    QueueSMCInvalidate(Thread, GuestRIP);
+    QueueSMCInvalidate(Thread, GuestRIP);
     return;
   }
 

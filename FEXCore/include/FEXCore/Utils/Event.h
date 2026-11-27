@@ -12,6 +12,9 @@ private:
   class Flag final {
   public:
     bool TestAndSet(bool SetValue = true) {
+      if (Value.load(std::memory_order_relaxed) == SetValue) {
+        return false;
+      }
       bool Expected = !SetValue;
       return Value.compare_exchange_strong(Expected, SetValue);
     }

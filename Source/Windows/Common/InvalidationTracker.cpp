@@ -179,8 +179,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
                           ProtInterval.End, AlignedSize >> 20, Prot);
         return false;
       }
-      LogMan::Msg::EFmt("[iOS-xrem] via=protect tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                        ProtInterval.Offset, ProtInterval.End);
+      {
+        static std::atomic<uint32_t> ProtectRemoveCount;
+        const auto N = ProtectRemoveCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (N <= 40 || !(N & 255)) {
+          LogMan::Msg::EFmt("[iOS-xrem] via=protect #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                            ProtInterval.Offset, ProtInterval.End);
+        }
+      }
       XIntervals.Remove(ProtInterval);
       RWXIntervals.Remove(ProtInterval);
       if (DEPDisabled) {
@@ -483,8 +489,14 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
 
   if (Free) {
     std::unique_lock Lock(IntervalsLock);
-    LogMan::Msg::EFmt("[iOS-xrem] via=section tracker={} {:#x}-{:#x}", static_cast<void*>(this),
-                      SectionBase, SectionBase + SectionSize);
+    {
+      static std::atomic<uint32_t> SectionRemoveCount;
+      const auto N = SectionRemoveCount.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (N <= 40 || !(N & 255)) {
+        LogMan::Msg::EFmt("[iOS-xrem] via=section #{} tracker={} {:#x}-{:#x}", N, static_cast<void*>(this),
+                          SectionBase, SectionBase + SectionSize);
+      }
+    }
     XIntervals.Remove({SectionBase, SectionBase + SectionSize});
     RWXIntervals.Remove({SectionBase, SectionBase + SectionSize});
     ForgetHotSMCPages(SectionBase, SectionBase + SectionSize);
@@ -794,6 +806,15 @@ FEXCore::IntervalList<uint64_t>::Interval InvalidationTracker::PromoteDEPRegionL
 FEXCore::HLE::ExecutableRangeInfo InvalidationTracker::QueryExecutableRangeLocked(uint64_t Address) {
   const auto XResult = XIntervals.Query(Address);
   if (!XResult.Enclosed) {
+    return {};
+  }
+
+  /* MADEIRA: `Info` was never declared here, so this did not compile in a clean tree; the two
+   * uses below are the query result the function needs. Same declaration and same failure handling
+   * as InvalidateContainingSection above: an address that cannot be queried describes no range. */
+  MEMORY_BASIC_INFORMATION Info;
+  if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info,
+                           sizeof(Info), nullptr)) {
     return {};
   }
 

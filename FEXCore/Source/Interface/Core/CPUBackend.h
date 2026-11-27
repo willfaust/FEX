@@ -16,6 +16,7 @@ $end_info$
 #include <FEXCore/fextl/map.h>
 
 #include <cstdint>
+#include <span>
 #ifdef FEX_IOS_HOST
 #include <atomic>
 #include <mutex>
@@ -189,6 +190,30 @@ namespace CPU {
 
     virtual void ClearCache() {}
 
+    virtual void SetRelocatablePadding(bool Enable) {}
+
+    [[nodiscard]]
+    virtual CompiledCode LoadCachedCode(std::span<const uint8_t> HostBytes) {
+      return {};
+    }
+
+    // True while Map is the map of this thread's current code buffer and of the newest one.
+    virtual bool IsLatestMap(const FEXCore::GuestToHostMap* Map) {
+      return false;
+    }
+
+    // Raw code buffer memory, 16-byte aligned.
+    virtual uint8_t* AllocateCode(size_t Size) {
+      return nullptr;
+    }
+
+    // Writes code over code buffer memory and makes it visible to instruction fetch.
+    virtual void OverwriteCode(uint8_t* Dest, std::span<const uint8_t> HostBytes) {}
+
+    virtual uint8_t* GetCurrentCodeBufferBase() const {
+      return nullptr;
+    }
+
     /**
      * @brief Clear any relocations after JIT compiling
      */
@@ -224,6 +249,10 @@ namespace CPU {
       return CodeBuffers;
     }
 #endif
+
+    std::weak_ptr<CodeBuffer> GetCurrentCodeBufferWeak() const {
+      return CurrentCodeBuffer;
+    }
 
   protected:
     // Max spill slot size in bytes. We need at most 32 bytes

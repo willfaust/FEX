@@ -761,6 +761,49 @@ void Dispatcher::EmitDispatcher() {
     (void)b(&LoopTop);
   }
 
+  {
+    // Out-of-line SMC invalidation handler:
+    // x12 = EntryToInvalidate, x13 = NewRIP; static regs and NZCV are still live.
+    // EmitSignalGuardedRegion only uses TMP1/TMP2 (x10/x11), leaving x12/x13 intact,
+    // and sets InSyscallCallback while C++ invalidation runs.
+    ThreadDispatchRemoveCodeEntry = GetCursorAddress<uint64_t>();
+
+    EmitSignalGuardedRegion([&]() {
+      SpillStaticRegs(TMP1);
+
+      str(ARMEmitter::XReg::x13, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.rip));
+      mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, ARMEmitter::Reg::r12);
+      mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, STATE.R());
+
+      ldr(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.ThreadRemoveCodeEntryFromJIT));
+      if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+        GenerateIndirectRuntimeCall<void, void*, uint64_t>(ARMEmitter::Reg::r2);
+      } else {
+        blr(ARMEmitter::Reg::r2);
+      }
+
+      FillStaticRegs();
+    });
+
+    (void)b(&LoopTop);
+  }
+
+  {
+    // Fast #UD (FEX_FAST_UD=1): static regs already spilled, stack reset, SynchronousFaultData set.
+    ThreadDispatchSyscallHandler = GetCursorAddress<uint64_t>();
+
+    ldr(ARMEmitter::XReg::x0, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerObj));
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, STATE.R());
+    mov(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, ARMEmitter::XReg::zr);
+    ldr(ARMEmitter::XReg::x3, STATE, offsetof(FEXCore::Core::CpuStateFrame, Pointers.SyscallHandlerFunc));
+    if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
+      GenerateIndirectRuntimeCall<uint64_t, void*, void*, void*>(ARMEmitter::Reg::r3);
+    } else {
+      blr(ARMEmitter::Reg::r3);
+    }
+    hlt(0);
+  }
+
   auto EmitLongALUOpHandler = [&](auto R, auto Offset) {
     auto Address = GetCursorAddress<uint64_t>();
 
@@ -2925,6 +2968,8 @@ void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread) 
     Ptrs.ExitFunctionLinker = ExitFunctionLinkerAddress;
     Ptrs.ThreadStopHandlerSpillSRA = ThreadStopHandlerAddressSpillSRA;
     Ptrs.ThreadPauseHandlerSpillSRA = ThreadPauseHandlerAddressSpillSRA;
+    Thread->CurrentFrame->ThreadDispatchRemoveCodeEntryPtr = ThreadDispatchRemoveCodeEntry;
+    Thread->CurrentFrame->ThreadDispatchSyscallHandlerPtr = ThreadDispatchSyscallHandler;
     Ptrs.GuestSignal_SIGILL = GuestSignal_SIGILL;
     Ptrs.GuestSignal_SIGTRAP = GuestSignal_SIGTRAP;
     Ptrs.GuestSignal_SIGSEGV = GuestSignal_SIGSEGV;

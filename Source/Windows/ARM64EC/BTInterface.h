@@ -18,6 +18,9 @@ NTSTATUS STDMETHODCALLTYPE NotifyMapViewOfSection(void* Unk1, void* Address, voi
 void STDMETHODCALLTYPE NotifyUnmapViewOfSection(void* Address, BOOL After, NTSTATUS Status);
 void STDMETHODCALLTYPE FlushInstructionCacheHeavy(const void* Address, SIZE_T Size);
 void STDMETHODCALLTYPE BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size);
+/* MADEIRA: x64 debug registers live in the emulator's thread state; ntdll asks for them here. */
+void STDMETHODCALLTYPE BTCpu64GetContext(HANDLE ThreadHandle, ARM64_NT_CONTEXT* Context);
+void STDMETHODCALLTYPE BTCpu64SetContext(HANDLE ThreadHandle, const ARM64_NT_CONTEXT* Context);
 void STDMETHODCALLTYPE BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size);
 void STDMETHODCALLTYPE BTCpu64NotifyReadFile(HANDLE Handle, void* Address, SIZE_T Size, BOOL After, NTSTATUS Status);
 BOOLEAN STDMETHODCALLTYPE BTCpu64IsProcessorFeaturePresent(UINT Feature);

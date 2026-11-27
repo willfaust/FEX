@@ -30,7 +30,17 @@ namespace CPU {
   // rotations of the one shared buffer). The pool-side allocator now grants
   // what the pool can afford and refuses the rest, and the ctor's halving
   // ladder handles a refusal, so the ceiling here is FEX's own branch range.
-  static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
+  //
+  // ml1318: Forza Horizon 6's tail census (setA.log, 65 carves, 424MB live of a
+  // 522MB budget) is 58 x 4MB buffers plus ONE 128MB carve -- a quarter of all
+  // code space held by a single generation -- and the budget's last page is
+  // gone: "TAIL REFUSED (FEX EC_CODE): want=0x400000 tail_resv=0x208d4000
+  // head_used=0x171d8000/0x37cd4000 #5705728" repeats millions of times while
+  // every new generation degrades "exec alloc 0x8000000 -> 0x200000". The
+  // ceiling is what a single pinned generation may cost, not what the branch
+  // range allows: 32MB returns 96MB (24 more 4MB buffers) to the tail, and a
+  // generation that large is already dead weight when pinned at 10% full.
+  static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 32;
 #else
   // We don't want to move above 128MB atm because that means we will have to encode longer jumps
   static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
@@ -882,7 +892,8 @@ namespace CPU {
       // The last page of the code buffer is protected, so we need to exclude it from the valid range
       // when checking if the address is in the code buffer.
       uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Buffer.Ptr) + Buffer.AllocatedSize - 1, FEXCore::Utils::FEX_PAGE_SIZE);
-      return (Address >= reinterpret_cast<uintptr_t>(Buffer.Ptr) && Address < LastPageAddr);
+      return (Address >= reinterpret_cast<uintptr_t>(Buffer.Ptr) && Address < LastPageAddr) ||
+             (Buffer.LookupCache && Buffer.LookupCache->InPoolArena(Address));
     };
 
     if (CheckCodeBuffer(*CurrentCodeBuffer, Address)) {

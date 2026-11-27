@@ -80,6 +80,7 @@ namespace Msg {
   using MsgHandler = void (*)(DebugLevels Level, const char* Message);
   FEX_DEFAULT_VISIBILITY void InstallHandler(MsgHandler Handler);
   FEX_DEFAULT_VISIBILITY void UnInstallHandler();
+  FEX_DEFAULT_VISIBILITY void SetDebugEnabled(bool Enabled);
 
   // Fmt-capable interface.
 

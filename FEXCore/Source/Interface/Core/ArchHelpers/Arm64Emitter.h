@@ -409,6 +409,7 @@ protected:
 #endif
 
   FEX_CONFIG_OPT(EnableCodeCaching, ENABLECODECACHINGWIP);
+  bool ForceRelocatablePadding {};
 };
 
 } // namespace FEXCore::CPU

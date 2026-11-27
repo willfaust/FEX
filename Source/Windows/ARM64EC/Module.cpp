@@ -63,6 +63,10 @@ $end_info$
 #include <winnt.h>
 #include <wine/debug.h>
 
+extern "C" NTSTATUS WINAPI RtlCreateUserThread(HANDLE, PSECURITY_DESCRIPTOR, BOOLEAN, ULONG, SIZE_T, SIZE_T,
+                                               NTSTATUS(WINAPI*)(void*), void*, HANDLE*, CLIENT_ID*);
+extern "C" NTSTATUS WINAPI NtRaiseException(PEXCEPTION_RECORD, PCONTEXT, BOOLEAN);
+
 /* ml751: the VA band selector's deferred beacon buffer, filled by
  * ios_va_emit() in rpmalloc.c before the ARM64EC TEB exists and therefore
  * before any logging API is callable. Flushed once LogMan is up. */
@@ -89,6 +93,10 @@ static uint64_t IosEcCodeBitMapValue = 0;
  * [2] = FFS matched but target not EC (fell through to emulation), [3] = last such
  * target. Read by the [ffs-bypass] reporter in Core.cpp's CompileBlock. */
 extern "C" uint64_t IosFfsBypassLog[4];
+/* Written by ExitToX64's pool-address gate in Module.S.
+ * [0] = pool addresses of EC code branched to natively, [1] = last such address,
+ * [2] = pool addresses of x64 code rewritten to their PE address, [3] = last PE address. */
+extern "C" uint64_t IosExitPoolLog[4];
 /* Defined in FEXCore Arm64Emitter.cpp; read when the dispatcher and blocks are emitted. */
 extern "C" uint32_t IosEcReturnWithRet;
 
@@ -102,6 +110,7 @@ extern "C" uint32_t IosCallRetStackElided;
  * lld generates for the neighbouring word ("misaligned ldr/str offset"). */
 static uint32_t IosTebTsdImportFound = 0;
 uint64_t IosFfsBypassLog[4] {};
+uint64_t IosExitPoolLog[4] {};
 /* ml1131: transition probe, written by Module.S and read by wine's ntdll-unix
  * sampler through this DATA export (libarm64ecfex_ios.def). Layout in bytes:
  *   0     magic 'MADXPFEX' (set in ProcessInit)
@@ -482,6 +491,26 @@ void QueuePendingImageMap(uint64_t Address) {
 void HandleImageUnmap(uint64_t Address, uint64_t Size) {
   ImageTracker->HandleImageUnmap(Address, Size);
 }
+
+// Wine's ARM64EC memory syscalls call back into FEX (NotifyMemoryFree etc.) unless InSyscallCallback is set.
+// FEX's own VirtualFree/VirtualAlloc/VirtualProtect run while CodeInvalidationMutex is held, and a nested
+// notification would try to take the non-recursive lock again on the same thread. Every FEX entry point that
+// can invalidate code outside a Wine callback must hold this guard.
+class ScopedCallbackDisable {
+private:
+  bool Prev;
+
+public:
+  ScopedCallbackDisable() {
+    const auto CPUArea = GetCPUArea();
+    Prev = CPUArea.Area->InSyscallCallback;
+    CPUArea.Area->InSyscallCallback = true;
+  }
+
+  ~ScopedCallbackDisable() {
+    GetCPUArea().Area->InSyscallCallback = Prev;
+  }
+};
 } // namespace
 
 namespace Exception {
@@ -664,10 +693,16 @@ static ARM64_NT_CONTEXT StoreStateToPackedECContext(FEXCore::Core::InternalThrea
   ECContext.X24 = 0;
   ECContext.X28 = 0;
 
-  // NZCV+SS will be converted into EFlags by ntdll, the rest are lost during exception handling.
+  // NZCV+SS are architectural PSTATE fields. Wine and FEX additionally use
+  // reserved CPSR bits 16..19 to preserve PF, AF, DF and RF across ARM64EC
+  // exception dispatch.
   // See HandleGuestException
   uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
   ECContext.Cpsr = 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC)) ? (1U << 16) : 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC)) ? (1U << 17) : 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_DF_RAW_LOC)) ? (1U << 18) : 0;
+  ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_RF_LOC)) ? (1U << 19) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)) ? (1U << 21) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_OF_RAW_LOC)) ? (1U << 28) : 0;
   ECContext.Cpsr |= (EFlags & (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC)) ? (1U << 29) : 0;
@@ -725,10 +760,17 @@ static void RethrowGuestException(const EXCEPTION_RECORD& Rec, ARM64_NT_CONTEXT&
   } else if (Args->Rec.ExceptionCode == EXCEPTION_BREAKPOINT) {
     // INT3 will set RIP to the instruction following it, undo this (any edge cases with multibyte instructions that trigger breakpoints are bugs present in Windows also)
     Args->Context.Pc -= 1;
+  } else if (Args->Rec.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
+    // x86 sets RF in the saved EFLAGS image for fault-class exceptions.
+    Args->Context.Cpsr |= 1U << 19;
   }
 
   Context.Sp = reinterpret_cast<uint64_t>(Args);
+#ifdef FEX_IOS_HOST
+  Context.Pc = IosJitTranslate(KiUserExceptionDispatcher);
+#else
   Context.Pc = KiUserExceptionDispatcher;
+#endif
 }
 
 class ECSyscallHandler : public FEXCore::HLE::SyscallHandler, public FEXCore::Allocator::FEXAllocOperators {
@@ -738,7 +780,10 @@ public:
   }
 
   uint64_t HandleSyscall(FEXCore::Core::CpuStateFrame* Frame, FEXCore::HLE::SyscallArguments* Args) override {
-    ProcessPendingCrossProcessEmulatorWork();
+    {
+      ScopedCallbackDisable Guard;
+      ProcessPendingCrossProcessEmulatorWork();
+    }
 
     // Manually raise an exeption with the current JIT state packed into a native context, ntdll handles this and
     // reenters the JIT (see dlls/ntdll/signal_arm64ec.c in wine).
@@ -747,12 +792,93 @@ public:
     __asm volatile("mrs %[fpsr], fpsr" : [fpsr] "=r"(FPSR));
 
     auto* Thread = GetCPUArea().ThreadState();
+    if (Frame->SynchronousFaultData.FaultToTopAndGeneratedException) {
+      // FEX_FAST_UD=1: guest #UD routed here with static regs already spilled at State.rip.
+      // Build the KiUserExceptionDispatcher frame on the guest stack and jump directly into
+      // ntdll's dispatcher without a host Mach SIGILL or NtRaiseException round-trip.
+      const auto CPUArea = GetCPUArea();
+      ARM64_NT_CONTEXT GuestContext = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR));
+#ifdef FEX_IOS_HOST
+      const uint64_t PeRip = IosJitReverseTranslate(GuestContext.Pc);
+      if (PeRip != GuestContext.Pc) {
+        GuestContext.Pc = PeRip;
+      }
+#endif
+      uint32_t EFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
+      EFlags &= ~(1 << FEXCore::X86State::RFLAG_TF_RAW_LOC);
+      CTX->SetFlagsFromCompactedEFLAGS(Thread, EFlags);
+
+      EXCEPTION_RECORD BaseRec {.ExceptionCode = static_cast<DWORD>(EXCEPTION_ILLEGAL_INSTRUCTION)};
+      EXCEPTION_RECORD GuestRec = FEX::Windows::HandleGuestException(Frame->SynchronousFaultData, BaseRec, GuestContext.Pc,
+                                                                     GuestContext.X8, GuestContext.X0);
+      if (GuestRec.ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        GuestContext.Cpsr &= ~(1 << 21); // PSTATE.SS
+      } else if (GuestRec.ExceptionCode == EXCEPTION_BREAKPOINT) {
+        GuestContext.Pc -= 1;
+      } else if (GuestRec.ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
+        GuestContext.Cpsr |= 1U << 19;
+      }
+
+      auto* DispatchArgs = reinterpret_cast<KiUserExceptionDispatcherStackLayout*>(FEXCore::AlignDown(GuestContext.Sp, 64)) - 1;
+      DispatchArgs->Context = GuestContext;
+      DispatchArgs->Rec = GuestRec;
+      CPUArea.Area->InSimulation = false;
+#ifdef FEX_IOS_HOST
+      JumpSetStack(IosJitTranslate(KiUserExceptionDispatcher), reinterpret_cast<uintptr_t>(DispatchArgs));
+#else
+      JumpSetStack(KiUserExceptionDispatcher, reinterpret_cast<uintptr_t>(DispatchArgs));
+#endif
+    }
     KiUserExceptionDispatcherStackLayout DispatchArgs {
       .Context = StoreStateToPackedECContext(Thread, static_cast<uint32_t>(FPCR), static_cast<uint32_t>(FPSR)),
       .Rec = {.ExceptionCode = STATUS_EMULATION_SYSCALL}};
+    static const bool TraceEcSys = []() {
+      const char* V = getenv("MADEIRA_EC_SYS_TRACE");
+      return V && V[0] && V[0] != '0';
+    }();
+    if (TraceEcSys) {
+      static std::atomic<uint32_t> SysLogN {0};
+      static std::atomic<uint32_t> AllocLogN {0};
+      const uint64_t Ssn = DispatchArgs.Context.X8;
+      bool DoLog = true;
+      if (Ssn == 0x18) {
+        DoLog = AllocLogN.fetch_add(1, std::memory_order_relaxed) < 5;
+      }
+      if (DoLog) {
+        uint32_t Idx = SysLogN.fetch_add(1, std::memory_order_relaxed);
+        if (Idx < 120) {
+          char NameBuf[160] = {};
+          if (Ssn == 0x55 && DispatchArgs.Context.X2 > 0x10000) {
+            const auto* OA = reinterpret_cast<const OBJECT_ATTRIBUTES*>(DispatchArgs.Context.X2);
+            if (OA->ObjectName && OA->ObjectName->Buffer && OA->ObjectName->Length > 0) {
+              uint32_t Chars = OA->ObjectName->Length / sizeof(WCHAR);
+              if (Chars >= sizeof(NameBuf)) Chars = sizeof(NameBuf) - 1;
+              for (uint32_t i = 0; i < Chars; ++i) {
+                uint16_t c = OA->ObjectName->Buffer[i];
+                NameBuf[i] = (c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?';
+              }
+              NameBuf[Chars] = '\0';
+            }
+          }
+          if (NameBuf[0]) {
+            LogMan::Msg::EFmt("[ec-sys] #{} ssn={:#x} rip={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x} name='{}'",
+                              Idx, Ssn, DispatchArgs.Context.Pc, DispatchArgs.Context.X4,
+                              DispatchArgs.Context.X1, DispatchArgs.Context.X2, DispatchArgs.Context.X3, NameBuf);
+          } else {
+            LogMan::Msg::EFmt("[ec-sys] #{} ssn={:#x} rip={:#x} a1={:#x} a2={:#x} a3={:#x} a4={:#x}",
+                              Idx, Ssn, DispatchArgs.Context.Pc, DispatchArgs.Context.X4,
+                              DispatchArgs.Context.X1, DispatchArgs.Context.X2, DispatchArgs.Context.X3);
+          }
+        }
+      }
+    }
     // PC is expected to hold the return address after the thunk, so skip over the INT 2E/SYSCALL instruction.
     DispatchArgs.Context.Pc += 2;
+#ifdef FEX_IOS_HOST
+    JumpSetStack(IosJitTranslate(KiUserExceptionDispatcher), reinterpret_cast<uintptr_t>(&DispatchArgs));
+#else
     JumpSetStack(KiUserExceptionDispatcher, reinterpret_cast<uintptr_t>(&DispatchArgs));
+#endif
   }
 
   std::optional<FEXCore::ExecutableFileSectionInfo> LookupExecutableFileSection(FEXCore::Core::InternalThreadState*, uint64_t Address) override {
@@ -777,10 +903,12 @@ public:
   }
 
   void MarkGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+    ScopedCallbackDisable Guard;
     InvalidationTracker->ReprotectRWXIntervals(Start, Length);
   }
 
   void InvalidateGuestCodeRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Start, uint64_t Length) override {
+    ScopedCallbackDisable Guard;
     InvalidationTracker->InvalidateAlignedInterval(Start, Length, false);
   }
 
@@ -790,6 +918,7 @@ public:
       InvalidateGuestCodeRange(Thread, Entry, 1);
       return;
     }
+    ScopedCallbackDisable Guard;
     InvalidationTracker->InvalidateGuestBlock(Entry);
   }
 
@@ -867,19 +996,26 @@ public:
   }
 
   void PreCompile() override {
+    ScopedCallbackDisable Guard;
     ProcessPendingCrossProcessEmulatorWork();
   }
 };
 } // namespace Exception
 
 extern "C" void SyncThreadContext(CONTEXT* Context) {
-  ProcessPendingCrossProcessEmulatorWork();
+  {
+    ScopedCallbackDisable Guard;
+    ProcessPendingCrossProcessEmulatorWork();
+  }
   auto* Thread = GetCPUArea().ThreadState();
-  // All other EFlags bits are lost when converting to/from an ARM64EC context, so merge them in from the current JIT state.
-  // This is advisable over dropping their values as thread suspend/resume uses this function, and that can happen at any point in guest code.
+  // Wine carries PF, AF, DF and RF in reserved CPSR bits in addition to the
+  // architectural NZCV+SS fields. Merge only flags that still cannot be
+  // represented by an ARM64EC context from the current JIT state.
   static constexpr uint32_t ECValidEFlagsMask {(1U << FEXCore::X86State::RFLAG_OF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_CF_RAW_LOC) |
                                                (1U << FEXCore::X86State::RFLAG_ZF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_SF_RAW_LOC) |
-                                               (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC)};
+                                               (1U << FEXCore::X86State::RFLAG_TF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_PF_RAW_LOC) |
+                                               (1U << FEXCore::X86State::RFLAG_AF_RAW_LOC) | (1U << FEXCore::X86State::RFLAG_DF_RAW_LOC) |
+                                               (1U << FEXCore::X86State::RFLAG_RF_LOC)};
 
   uint32_t StateEFlags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
   Context->EFlags = (Context->EFlags & ECValidEFlagsMask) | (StateEFlags & ~ECValidEFlagsMask);
@@ -994,9 +1130,85 @@ NTSTATUS ProcessInit() {
   InitSyscalls();
 
   FEX::Windows::InitCRTProcess();
+#pragma push_macro("Threads")
+#undef Threads
+  {
+    // Wire FEXCore::Threads::Thread::Create on Windows ARM64EC to RtlCreateUserThread so
+    // background FEXCore workers (such as batched SMC invalidation) can run natively.
+    struct WinThread final : public FEXCore::Threads::Thread {
+      HANDLE Handle {nullptr};
+      ULONG ThreadId {0};
+
+      ~WinThread() override {
+        if (Handle) {
+          NtClose(Handle);
+        }
+      }
+      bool joinable() override {
+        return Handle != nullptr;
+      }
+      bool join(void**) override {
+        return false;
+      }
+      bool detach() override {
+        if (Handle) {
+          NtClose(Handle);
+          Handle = nullptr;
+        }
+        return true;
+      }
+      bool IsSelf() override {
+        return ThreadId != 0 && ThreadId == GetCurrentThreadId();
+      }
+    };
+    struct WinThreadStart {
+      FEXCore::Threads::ThreadFunc Func;
+      void* Arg;
+    };
+    auto CreateWinThread = [](FEXCore::Threads::ThreadFunc Func, void* Arg) -> fextl::unique_ptr<FEXCore::Threads::Thread> {
+      auto* Start = new (std::nothrow) WinThreadStart {Func, Arg};
+      if (!Start) {
+        return nullptr;
+      }
+      auto Entry = [](void* Raw) -> NTSTATUS {
+        auto* S = static_cast<WinThreadStart*>(Raw);
+        auto Fn = S->Func;
+        void* Param = S->Arg;
+        delete S;
+        Fn(Param);
+        return STATUS_SUCCESS;
+      };
+      HANDLE Handle = nullptr;
+      CLIENT_ID ClientId {};
+      NTSTATUS Status = STATUS_UNSUCCESSFUL;
+      {
+        using RtlThreadStartFn = NTSTATUS(WINAPI*)(void*);
+        ScopedCallbackDisable Guard;
+        Status = RtlCreateUserThread(NtCurrentProcess(), nullptr, FALSE, 0, 0, 0,
+                                     static_cast<RtlThreadStartFn>(+Entry), Start, &Handle, &ClientId);
+      }
+      if (Status != STATUS_SUCCESS || !Handle) {
+        delete Start;
+        LogMan::Msg::EFmt("[fex-thread] RtlCreateUserThread failed status={:#x}", static_cast<uint32_t>(Status));
+        return nullptr;
+      }
+      auto T = fextl::make_unique<WinThread>();
+      T->Handle = Handle;
+      T->ThreadId = static_cast<ULONG>(reinterpret_cast<uintptr_t>(ClientId.UniqueThread));
+      return T;
+    };
+    FEXCore::Threads::Thread::SetInternalPointers({
+      .CreateThread = CreateWinThread,
+      .CleanupAfterFork = [] {},
+    });
+  }
+#pragma pop_macro("Threads")
   const auto ExecutableName = FEX::Windows::BaseName(FEX::Windows::GetExecutableFilePath());
   FEX::Config::LoadConfig(fextl::string {ExecutableName}, _environ, FEX::ReadPortabilityInformation());
   FEXCore::Config::ReloadMetaLayer();
+#ifdef FEX_IOS_HOST
+  FEX::Windows::Logging::SetAddressTranslator(IosJitTranslate);
+#endif
   FEX::Windows::Logging::Init();
 
 #ifdef FEX_IOS_HOST
@@ -1062,7 +1274,7 @@ NTSTATUS ProcessInit() {
  * __DATE__/__TIME__ below is compiler-generated and therefore the
  * authoritative identity; if the two disagree, the tag is wrong, not the
  * build. */
-#define MADEIRA_REV "ml908"
+#define MADEIRA_REV "ml304-nohb"
   LogMan::Msg::EFmt("[build-id] xtajit64 rev=" MADEIRA_REV " compiled " __DATE__ " " __TIME__);
 #ifdef FEX_IOS_HOST
   /* ml751: flush the VA band selector's beacons.
@@ -1327,22 +1539,6 @@ void ProcessTerm(HANDLE Handle, BOOL After, NTSTATUS Status) {
     ProcessTerminating.store(true, std::memory_order_relaxed);
   }
 }
-
-class ScopedCallbackDisable {
-private:
-  bool Prev;
-
-public:
-  ScopedCallbackDisable() {
-    const auto CPUArea = GetCPUArea();
-    Prev = CPUArea.Area->InSyscallCallback;
-    CPUArea.Area->InSyscallCallback = true;
-  }
-
-  ~ScopedCallbackDisable() {
-    GetCPUArea().Area->InSyscallCallback = Prev;
-  }
-};
 
 // Returns true if exception dispatch should be halted and the execution context restored to NativeContext
 bool ResetToConsistentStateImpl(const ThreadCPUArea CPUArea, EXCEPTION_RECORD* Exception, CONTEXT* GuestContext, ARM64_NT_CONTEXT* NativeContext) {
@@ -1827,6 +2023,89 @@ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
 
   std::scoped_lock Lock(ThreadCreationMutex);
   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+}
+
+/* MADEIRA: the guest's x64 debug registers.
+ *
+ * There are no x64 debug registers on the host, so the emulator's thread state is where they live
+ * (see GuestDebugRegisters in InternalThreadState.h) and ntdll asks for them here whenever a caller
+ * passes CONTEXT_DEBUG_REGISTERS to NtGet/SetContextThread. The transport is the native ARM64
+ * context's breakpoint and watchpoint slots — Bvr[0..3] carry Dr0..Dr3, Wvr[0]/Wvr[1] carry
+ * Dr6/Dr7 — which is lossless and costs nothing, because a 64-bit guest never uses ARM64
+ * watchpoints. wine's dlls/ntdll/unwind.h maps the two layouts; the pair of conventions is private
+ * to this emulator and that header.
+ *
+ * Only the calling thread is serviced. Reaching another thread's GuestDebugRegisters needs a
+ * TID-keyed lookup this build does not have, and answering with the wrong thread's values would be
+ * worse than answering with none: it is exactly the kind of internally-inconsistent state that
+ * anti-tamper code treats as hostile. A miss is reported once and leaves the context untouched. */
+static bool IsCurrentThreadHandle(HANDLE ThreadHandle) {
+  if (ThreadHandle == GetCurrentThread()) {
+    return true;
+  }
+
+  THREAD_BASIC_INFORMATION Info;
+  if (NtQueryInformationThread(ThreadHandle, ThreadBasicInformation, &Info, sizeof(Info), nullptr)) {
+    return false;
+  }
+  return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(Info.ClientId.UniqueThread)) == GetCurrentThreadId();
+}
+
+static void LogForeignDebugRegisterAccess(const char* What, HANDLE ThreadHandle) {
+  static std::atomic<unsigned> Reported {0};
+  if (Reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+    LogMan::Msg::EFmt("[dbgregs] {} for handle {:p} is not the calling thread: this build keeps x64 debug "
+                      "registers per thread and has no cross-thread lookup, so the request is not answered",
+                      What, ThreadHandle);
+  }
+}
+
+void STDMETHODCALLTYPE BTCpu64GetContext(HANDLE ThreadHandle, ARM64_NT_CONTEXT* Context) {
+  if (!Context) {
+    return;
+  }
+
+  if (!IsCurrentThreadHandle(ThreadHandle)) {
+    LogForeignDebugRegisterAccess("get", ThreadHandle);
+    return;
+  }
+
+  auto* Thread = GetCPUArea().ThreadState();
+  if (!Thread) {
+    return;
+  }
+
+  const auto& Debug = Thread->GuestDebugRegisters;
+  Context->Bvr[0] = Debug.dr[0];
+  Context->Bvr[1] = Debug.dr[1];
+  Context->Bvr[2] = Debug.dr[2];
+  Context->Bvr[3] = Debug.dr[3];
+  Context->Wvr[0] = Debug.dr6;
+  Context->Wvr[1] = Debug.dr7;
+}
+
+void STDMETHODCALLTYPE BTCpu64SetContext(HANDLE ThreadHandle, const ARM64_NT_CONTEXT* Context) {
+  if (!Context) {
+    return;
+  }
+
+  if (!IsCurrentThreadHandle(ThreadHandle)) {
+    LogForeignDebugRegisterAccess("set", ThreadHandle);
+    return;
+  }
+
+  auto* Thread = GetCPUArea().ThreadState();
+  if (!Thread) {
+    return;
+  }
+
+  auto& Debug = Thread->GuestDebugRegisters;
+  Debug.dr[0] = Context->Bvr[0];
+  Debug.dr[1] = Context->Bvr[1];
+  Debug.dr[2] = Context->Bvr[2];
+  Debug.dr[3] = Context->Bvr[3];
+  Debug.dr6 = Context->Wvr[0];
+  Debug.dr7 = Context->Wvr[1];
 }
 
 void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {

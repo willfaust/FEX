@@ -119,6 +119,127 @@ ExitToX64:
   // from the native sp on every JIT entry. The `br` targets the PE VA; the Mach
   // exec-fault redirect translates it to the pool copy (proven ~33us path, and this
   // is RPC-call frequency, not per-frame).
+  //
+  // A pool address is never a guest RIP. The JIT copy of an EC image holds ARM
+  // code in the code-map's EC ranges and x64 bytes in the others, and both live
+  // at pool addresses. check_call's bitmap read still goes through x18, so it
+  // reports every target as non-EC and every indirect call arrives here. If x9
+  // is the pool copy of ARM code, branch to it. If it is the pool copy of x64
+  // code, replace x9 with the PE address before the emulator records it as RIP.
+  // x4 is the ARM64EC variadic pointer and is restored on every path. x23 is
+  // callee-saved and is restored too: the native branch returns to EC code that
+  // did not enter the JIT.
+  stp x23, x30, [sp, #-16]!
+  stp x4, x9, [sp, #-16]!
+  mov x17, x9
+  // The alias table missed this address on device (no [exit-pool] line, and the
+  // guest RIP stayed the pool address). The EC bitmap is marked for the pool
+  // page itself, so test that bit directly. A set bit means the bytes are ARM
+  // and must run natively. check_call cannot do this: its bitmap load still
+  // goes through x18 and reports every target as non-EC.
+  lsr x16, x17, #39
+  cbnz x16, ios_x9_table
+  IOS_LOAD_TEB x16
+  ldr x16, [x16, #0x60]
+  cbz x16, ios_x9_table
+  ldr x16, [x16, #0x368]
+  cbz x16, ios_x9_table
+  lsr x4, x17, #18
+  ldr x4, [x16, x4, lsl #3]
+  lsr x9, x17, #12
+  lsr x4, x4, x9
+  tbnz x4, #0, ios_x9_native
+ios_x9_table:
+  // The bitmap bit for this page was clear on device, and the alias table did
+  // not contain the address, so the ARM epilogue at kernel32+0x319cc was
+  // emulated. The pool base moves: one run was 0x11xxxxxxxx, the next
+  // 0x148000000. An x64 thunk there starts with 0x48 or 0xff; anything else
+  // in 0x10xxxxxxxx..0x17xxxxxxxx is ARM and runs natively.
+  lsr x16, x17, #32
+  sub x16, x16, #0x10
+  cmp x16, #8
+  b.hs ios_x9_alias
+  ldrb w16, [x17]
+  cmp w16, #0x48
+  b.eq ios_x9_alias
+  cmp w16, #0xff
+  b.eq ios_x9_alias
+  b ios_x9_native
+ios_x9_alias:
+  adrp x16, IosAliasRevHash
+  add x16, x16, #:lo12:IosAliasRevHash
+  ubfx x23, x17, #16, #10
+  ldr x16, [x16, x23, lsl #3]
+  cbz x16, ios_x9_walk
+  ldr x4, [x16, #8]
+  sub x4, x17, x4
+  ldr x23, [x16, #16]
+  cmp x4, x23
+  b.lo ios_x9_hit
+ios_x9_walk:
+  adrp x23, IosAliasCount
+  ldr w23, [x23, #:lo12:IosAliasCount]
+  adrp x16, IosAliasEntries
+  add x16, x16, #:lo12:IosAliasEntries
+  add x16, x16, x23, lsl #5
+ios_x9_loop:
+  cbz w23, ios_x9_leave
+  sub x16, x16, #32
+  sub w23, w23, #1
+  ldr x4, [x16, #8]
+  sub x4, x17, x4
+  ldr x9, [x16, #16]
+  cmp x4, x9
+  b.hs ios_x9_loop
+  adrp x9, IosAliasRevHash
+  add x9, x9, #:lo12:IosAliasRevHash
+  ubfx x23, x17, #16, #10
+  str x16, [x9, x23, lsl #3]
+ios_x9_hit:
+  ldr x23, [x16]
+  add x17, x23, x4
+  IOS_LOAD_TEB x16
+  ldr x16, [x16, #0x60]
+  cbz x16, ios_x9_as_pe
+  ldr x16, [x16, #0x368]
+  cbz x16, ios_x9_as_pe
+  ldr x23, [sp, #8]
+  lsr x9, x23, #39
+  cbnz x9, ios_x9_as_pe
+  lsr x9, x23, #18
+  ldr x4, [x16, x9, lsl #3]
+  lsr x9, x23, #12
+  lsr x4, x4, x9
+  tbnz x4, #0, ios_x9_native
+  lsr x9, x17, #39
+  cbnz x9, ios_x9_as_pe
+  lsr x9, x17, #18
+  ldr x4, [x16, x9, lsl #3]
+  lsr x9, x17, #12
+  lsr x4, x4, x9
+  tbz x4, #0, ios_x9_as_pe
+ios_x9_native:
+  adrp x16, IosExitPoolLog
+  add x16, x16, #:lo12:IosExitPoolLog
+  ldr x4, [x16]
+  add x4, x4, #1
+  str x4, [x16]
+  ldr x4, [sp, #8]
+  str x4, [x16, #8]
+  ldp x4, x9, [sp], #16
+  ldp x23, x30, [sp], #16
+  br x9
+ios_x9_as_pe:
+  adrp x16, IosExitPoolLog
+  add x16, x16, #:lo12:IosExitPoolLog
+  ldr x4, [x16, #16]
+  add x4, x4, #1
+  str x4, [x16, #16]
+  str x17, [x16, #24]
+  str x17, [sp, #8]
+ios_x9_leave:
+  ldp x4, x9, [sp], #16
+  ldp x23, x30, [sp], #16
   ldr x16, [x9]
   movz x17, #0x8b48
   movk x17, #0x48c4, lsl #16
@@ -141,9 +262,11 @@ ExitToX64:
   // x4/x9 are spilled to free loop registers; restored on every exit path.
   // (Native EC callers keep sp 16-aligned at call boundaries per AAPCS.)
   stp x4, x9, [sp, #-16]!
-  // ml1116: last-hit entry first, then the table newest-first.
-  adrp x16, IosAliasLast
-  ldr x16, [x16, #:lo12:IosAliasLast]
+  // Direct-mapped O(1) reverse hash first, then newest-first walk on miss.
+  adrp x16, IosAliasRevHash
+  add x16, x16, #:lo12:IosAliasRevHash
+  ubfx x23, x17, #16, #10
+  ldr x16, [x16, x23, lsl #3]
   cbz x16, ios_ffs_xlate_walk
   ldr x4, [x16, #8]      // Entry.JitBase
   sub x4, x17, x4
@@ -167,8 +290,10 @@ ios_ffs_xlate_loop:
   b.lo ios_ffs_xlate_hit_walk
   b ios_ffs_xlate_loop
 ios_ffs_xlate_hit_walk:
-  adrp x23, IosAliasLast
-  str x16, [x23, #:lo12:IosAliasLast]
+  adrp x23, IosAliasRevHash
+  add x23, x23, #:lo12:IosAliasRevHash
+  ubfx x9, x17, #16, #10
+  str x16, [x23, x9, lsl #3]
 ios_ffs_xlate_hit:
   ldr x23, [x16]         // Entry.PeBase
   add x17, x23, x4       // target in PE space
@@ -318,12 +443,25 @@ ExitFunctionECJit:
   ldr w17, [x28, #IOS_FRAME_SUSPEND_DOORBELL] // *ChpeV2CpuAreaInfo->SuspendDoorbell
   cbnz w17, ExitFunctionSuspendPoint
   ldr x16, [x28, #IOS_FRAME_ALIAS_HINT]
-  cbz x16, ios_ec_jit_xlate_walk
+  cbz x16, ios_ec_jit_xlate_hash
   ldr x23, [x16]        // Entry.PeBase
   sub x23, x9, x23
   ldr x4, [x16, #16]    // Entry.Size
   cmp x23, x4
   b.lo ios_ec_xlate_hit
+ios_ec_jit_xlate_hash:
+  adrp x16, IosAliasHash
+  add x16, x16, #:lo12:IosAliasHash
+  ubfx x17, x9, #16, #10
+  ldr x16, [x16, x17, lsl #3]
+  cbz x16, ios_ec_jit_xlate_walk
+  ldr x23, [x16]        // Entry.PeBase
+  sub x23, x9, x23
+  ldr x4, [x16, #16]    // Entry.Size
+  cmp x23, x4
+  b.hs ios_ec_jit_xlate_walk
+  str x16, [x28, #IOS_FRAME_ALIAS_HINT]
+  b ios_ec_xlate_hit
 ios_ec_jit_xlate_walk:
   adrp x17, IosAliasCount
   ldr w17, [x17, #:lo12:IosAliasCount]
@@ -340,6 +478,10 @@ ios_ec_jit_xlate_loop:
   cmp x23, x4
   b.hs ios_ec_jit_xlate_loop
   str x16, [x28, #IOS_FRAME_ALIAS_HINT]
+  adrp x4, IosAliasHash
+  add x4, x4, #:lo12:IosAliasHash
+  ubfx x17, x9, #16, #10
+  str x16, [x4, x17, lsl #3]
   b ios_ec_xlate_hit
 #endif
 
@@ -405,9 +547,11 @@ ExitFunctionSuspendResumePoint:
   // x64 R10 (volatile at this call/ret boundary) and is clobbered by the
   // entry-thunk path below. NZCV is clobbered by the cmp at check_thunk
   // regardless.
-  // ml1116: last-hit entry first, then the table newest-first.
-  adrp x16, IosAliasLast
-  ldr x16, [x16, #:lo12:IosAliasLast]
+  // Direct-mapped O(1) hash first (zero shared writes on hit), then walk on miss.
+  adrp x16, IosAliasHash
+  add x16, x16, #:lo12:IosAliasHash
+  ubfx x17, x9, #16, #10
+  ldr x16, [x16, x17, lsl #3]
   cbz x16, ios_ec_xlate_walk
   ldr x23, [x16]        // Entry.PeBase
   sub x23, x9, x23
@@ -431,8 +575,10 @@ ios_ec_xlate_loop:
   b.lo ios_ec_xlate_hit_walk
   b ios_ec_xlate_loop
 ios_ec_xlate_hit_walk:
-  adrp x4, IosAliasLast
-  str x16, [x4, #:lo12:IosAliasLast]
+  adrp x4, IosAliasHash
+  add x4, x4, #:lo12:IosAliasHash
+  ubfx x17, x9, #16, #10
+  str x16, [x4, x17, lsl #3]
 ios_ec_xlate_hit:
   ldr x4, [x16, #8]     // Entry.JitBase
   add x9, x4, x23
@@ -447,6 +593,18 @@ ios_ec_xlate_done:
   ldursw x23, [x17, #-0x4] // Load either the entry thunk offset or the calling instruction.
   cmp w23, w16
   beq ret_sp_aligned
+#ifdef FEX_IOS_HOST
+  // The pool copy rewrites `blr x16` (the no_redirect call into ExitToX64) as a
+  // direct `bl`, because the slot load was fetched from a stale RX page. The
+  // word at [return-4] is then that BL. Treating a BL encoding as an
+  // entry-thunk offset adds it to the return address and branches there:
+  // kernel32+0x319c8's BL (0x97e7acbb) produced pc=0xe21c0684, with x16 still
+  // holding this 0xd63f0200 probe and x9 still the real epilogue. A BL at
+  // [return-4] is the same return edge as `blr x16`.
+  ubfx w4, w23, #26, #6
+  cmp w4, #0x25
+  beq ret_sp_aligned
+#endif
 
   and x23, x23, #-0x4
   add x17, x17, x23 // Resolve entry thunk address.

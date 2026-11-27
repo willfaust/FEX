@@ -1646,13 +1646,21 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
           InstStream -= PCOffset;
           EraseBlock = true;
         } else {
-          LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
-                            BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST       ? "Invalid" :
-                            BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST        ? "NoExec" :
-                            BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION     ? "BadRelocation" :
-                            BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
-                                                                                             "PartialDecode",
-                            OpAddress);
+          bool DoLog = true;
+          if (BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST) {
+            static std::atomic<uint64_t> InvalidEntryLogCount {0};
+            const uint64_t N = InvalidEntryLogCount.fetch_add(1, std::memory_order_relaxed);
+            DoLog = (N < 32) || ((N & 1023) == 0);
+          }
+          if (DoLog) {
+            LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
+                              BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST       ? "Invalid" :
+                              BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST        ? "NoExec" :
+                              BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION     ? "BadRelocation" :
+                              BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
+                                                                                               "PartialDecode",
+                              OpAddress);
+          }
         }
         break;
       }

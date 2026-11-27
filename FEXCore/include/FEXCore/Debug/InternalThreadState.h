@@ -158,6 +158,25 @@ struct alignas(FEXCore::Utils::FEX_PAGE_SIZE) InternalThreadState : public FEXCo
   uint64_t JITGuardOverflowArgument {};
   FEXCore::UncheckedLongJump::JumpBuf RestartJump;
 
+  // Pool-clone scratch (kept before BaseFrameState so InterruptFaultPage stays adjacent).
+  bool PoolPatchable {};
+  bool PoolPatchableCRC {};
+  uint32_t PoolPatchableCRCValue {};
+  uint8_t PoolPreSnapshotLen {};
+  std::array<uint8_t, 20> PoolPreSnapshot {};
+  uint32_t PoolCopySize {};
+  alignas(16) uint8_t PoolCopy[4096] {};
+
+  /* MADEIRA: the guest's x64 debug registers. The host has no copy of Dr0-Dr7, so this thread
+   * state is the store of record; ntdll publishes them through BTCpu64GetContext/SetContext, and
+   * their trip through an ARM64 context is described in wine's dlls/ntdll/unwind.h. Plain POD and
+   * deliberately not thread_local: the ARM64EC module has no implicit TLS (see the module's notes). */
+  struct {
+    uint64_t dr[4] {};
+    uint64_t dr6 {};
+    uint64_t dr7 {};
+  } GuestDebugRegisters;
+
   // BaseFrameState should always be at the end, directly before the interrupt fault page
   FEXCore::Core::CpuStateFrame BaseFrameState {};
 

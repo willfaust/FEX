@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include "Interface/Context/Context.h"
+#include "Utils/crc32.h"
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/SHMStats.h>
 #include <FEXCore/Utils/WritePriorityMutex.h>
@@ -12,8 +13,9 @@
 #include <FEXCore/fextl/robin_map.h>
 #include <FEXCore/fextl/robin_set.h>
 #include <FEXCore/fextl/vector.h>
-#include <FEXCore/fextl/memory_resource.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -110,22 +112,247 @@ struct GuestToHostMap {
   struct BlockEntry {
     uint64_t HostCode;
     fextl::vector<uint64_t> CodePages;
+    uint32_t GuestCRC {};
+    uint32_t GuestCRCLen {};
+    uint64_t Epoch {};
   };
 
+  std::atomic<uint64_t> AddEpoch {0};
+
   fextl::robin_map<uint64_t, BlockEntry> BlockList;
+  fextl::robin_map<uint64_t, BlockEntry> Stash;
+  // Pool stub slots (reusable slots carved from dedicated 4 MB arenas so
+  // frequently rewritten trampoline stubs stop growing the main CodeBuffer
+  // and triggering full cache wipes).
+  struct PoolSlot {
+    uint8_t* Host;
+    uint32_t Capacity;
+    uint32_t EntryOffset;
+    uint64_t Seq;
+  };
+#ifdef FEX_IOS_HOST
+  // Double-buffered rotating slots (2 per RIP) keep the newest copy intact while
+  // overwriting the older slot, cutting stub arena footprint by 1/3 on iOS where
+  // the split JIT pool shares tail space with CodeBuffer rollovers and late PEs.
+  //
+  // The arenas are carved from the same FEX EC_CODE region the 128 MB code
+  // buffers come from, so this cap is a BUDGET, not a target: FH6's stub set is
+  // ~1.6M RIPs (~800 MB of slots) and no cap holds it all. At 84 (336 MB) the
+  // arenas left the tail with 3 MB free and every later 4 MB carve was refused
+  // (265k `[jit-pool] TAIL REFUSED` lines in one 6-minute run). At 40 (160 MB)
+  // the refusals stopped but ~1M slots spilled into the code buffer and the
+  // footprint went from 4.3 GB/3.0 GB swap to 5.4 GB/4.4 GB swap. 64 (256 MB)
+  // keeps most of the slot capacity and still leaves the tail real room.
+  // FEX_MAX_POOL_ARENAS lowers it further at run time.
+  static constexpr uint32_t PoolSlotsPerEntry = 2;
+  static constexpr uint32_t MaxPoolArenas = 64;
+  static uint32_t GetMaxPoolArenas() {
+    static const uint32_t Cap = []() -> uint32_t {
+      if (const char* Env = std::getenv("FEX_MAX_POOL_ARENAS"); Env && *Env) {
+        unsigned long V = std::strtoul(Env, nullptr, 10);
+        if (V >= 8 && V <= MaxPoolArenas) {
+          return static_cast<uint32_t>(V);
+        }
+      }
+      return MaxPoolArenas;
+    }();
+    return Cap;
+  }
+  static std::atomic<uint32_t>& GetGlobalLivePoolArenas() {
+    static std::atomic<uint32_t> Live {0};
+    return Live;
+  }
+#else
+  static constexpr uint32_t PoolSlotsPerEntry = 3;
+  static constexpr uint32_t MaxPoolArenas = 96;
+  static constexpr uint32_t GetMaxPoolArenas() {
+    return MaxPoolArenas;
+  }
+#endif
+  struct PoolSlotSet {
+    std::array<PoolSlot, PoolSlotsPerEntry> Slots {};
+    uint8_t Count {};
+  };
+  fextl::robin_map<uint64_t, PoolSlotSet> PoolSlots;
+  uint64_t PoolSlotSeq {};
+
+  static constexpr size_t PoolArenaSize = 4 * 1024 * 1024;
+  std::array<std::atomic<uintptr_t>, MaxPoolArenas> PoolArenaBase {};
+  std::atomic<uint32_t> PoolArenaCount {};
+  fextl::vector<uint8_t*> OwnedPoolArenas;
+  uint8_t* PoolArenaCursor {};
+  uint8_t* PoolArenaEnd {};
+
+  struct PoolSlotDiag {
+    bool NewRip {};
+    bool SawCount1 {};
+    bool CapMiss {};
+    bool OffMiss {};
+  };
+
+  bool InPoolArena(uintptr_t Address) const {
+    const uint32_t N = PoolArenaCount.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < N; ++i) {
+      if (Address - PoolArenaBase[i].load(std::memory_order_relaxed) < PoolArenaSize) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool AddPoolArena(uint8_t* Base, bool Owned = false) {
+    const uint32_t N = PoolArenaCount.load(std::memory_order_relaxed);
+    if (N >= MaxPoolArenas) {
+      return false;
+    }
+    PoolArenaBase[N].store(reinterpret_cast<uintptr_t>(Base), std::memory_order_relaxed);
+    PoolArenaCount.store(N + 1, std::memory_order_release);
+    if (Owned) {
+      OwnedPoolArenas.push_back(Base);
+#ifdef FEX_IOS_HOST
+      GetGlobalLivePoolArenas().fetch_add(1, std::memory_order_relaxed);
+#endif
+    }
+    PoolArenaCursor = Base;
+    PoolArenaEnd = Base + PoolArenaSize;
+    return true;
+  }
+
+  // Returns the slot to write the copy into, or null with NeedArena set when a new arena is needed.
+  uint8_t* GetPoolSlot(uint64_t Rip, uint32_t Size, uint32_t EntryOffset, bool* NeedArena, bool* Reused, PoolSlotDiag* Diag = nullptr) {
+    auto& Set = PoolSlots[Rip];
+    if (Diag) {
+      if (Set.Count == 0) {
+        Diag->NewRip = true;
+      } else if (Set.Count == 1) {
+        Diag->SawCount1 = true;
+      }
+    }
+    PoolSlot* Oldest = nullptr;
+    if (Set.Count == PoolSlotsPerEntry) {
+      Oldest = &Set.Slots[0];
+      for (auto& S : Set.Slots) {
+        if (S.Seq < Oldest->Seq) {
+          Oldest = &S;
+        }
+      }
+      if (Oldest->Capacity >= Size && Oldest->EntryOffset == EntryOffset) {
+        Oldest->Seq = ++PoolSlotSeq;
+        Stash.erase(Rip);
+        *Reused = true;
+        return Oldest->Host;
+      }
+      if (Diag) {
+        if (Oldest->Capacity < Size) {
+          Diag->CapMiss = true;
+        } else {
+          Diag->OffMiss = true;
+        }
+      }
+    }
+    // A new slot. A replaced slot is abandoned with its code intact, so pointers into it stay valid.
+    // Pack to 256-byte floor / 16-byte alignment so compact stubs reuse slots
+    // without capacity misses while fitting comfortably inside the arena budget.
+    const uint32_t Capacity = (std::max<uint32_t>(Size, 256U) + 15U) & ~15U;
+    if (!PoolArenaCursor || PoolArenaCursor + Capacity > PoolArenaEnd) {
+      *NeedArena = true;
+      return nullptr;
+    }
+    uint8_t* Host = PoolArenaCursor;
+    PoolArenaCursor += Capacity;
+    PoolSlot* Dest = Set.Count < PoolSlotsPerEntry ? &Set.Slots[Set.Count++] : Oldest;
+    *Dest = PoolSlot {Host, Capacity, EntryOffset, ++PoolSlotSeq};
+    return Host;
+  }
 
   fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
 
   GuestToHostMap();
+  ~GuestToHostMap();
 
-  // Adds to Guest -> Host code mapping
+  // Adds to Guest -> Host code mapping, epoch-tagged (see EraseMappingsOnly).
+  // May replace an existing mapping for the address.
   const BlockEntry& AddBlockMapping(uint64_t Address, const fextl::vector<uint64_t>& CodePages, void* HostCode, const LookupCacheWriteLockToken&) {
-    // This may replace an existing mapping
-    // NOTE: Generally no previous entry should exist, however there is one exception:
-    //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
-    //       may already contain the block address. Since is comparatively rare, we'll just leak
-    //       one of the two blocks in this case.
-    return BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages}).first->second;
+    // If replacing an existing mapping directly (e.g. async SMC recompile raced ahead of
+    // the background worker), unlink any incoming BlockLinks to the superseded HostCode.
+    if (BlockList.find(Address) != BlockList.end()) {
+      auto lower = BlockLinks->lower_bound({Address, nullptr});
+      auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
+      for (auto lit = lower; lit != upper; lit = BlockLinks->erase(lit)) {
+        lit->second(lit->first.HostLink);
+      }
+    }
+    const uint64_t Room = 0x1000ULL - (Address & 0xFFFULL);
+    const uint32_t Len = Room < 32 ? 0U : static_cast<uint32_t>(Room < 255 ? Room : 255);
+    const uint32_t CRC = Len ? FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(Address), Len) : 0U;
+    const uint64_t Epoch = AddEpoch.fetch_add(1, std::memory_order_release) + 1;
+    return BlockList.insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, CodePages, CRC, Len, Epoch}).first->second;
+  }
+
+  bool EraseMappingOnly(uint64_t Address) {
+    auto lk = AcquireWriteLock();
+    return EraseMappingOnlyLocked(Address);
+  }
+
+  // One write lock for a whole batch. The SMC worker drains queued RIPs in runs, and every acquisition
+  // of this lock parks the readers of WritePriorityMutex, so batching keeps readers moving.
+  // Entries whose BlockEntry.Epoch > Epochs[i] were already recompiled after the SMC trap was queued
+  // and must not be erased.
+  void EraseMappingsOnly(const uint64_t* Addresses, const uint64_t* Epochs, size_t Count) {
+    auto lk = AcquireWriteLock();
+    for (size_t i = 0; i < Count; ++i) {
+      auto it = BlockList.find(Addresses[i]);
+      if (it == BlockList.end() || it->second.Epoch > Epochs[i]) {
+        continue;
+      }
+      EraseMappingOnlyLocked(Addresses[i]);
+    }
+  }
+
+  // Caller holds the write lock.
+  bool EraseMappingOnlyLocked(uint64_t Address) {
+    auto lower = BlockLinks->lower_bound({Address, nullptr});
+    auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
+    for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
+      it->second(it->first.HostLink);
+    }
+    auto it = BlockList.find(Address);
+    if (it == BlockList.end()) {
+      return false;
+    }
+    Stash.insert_or_assign(Address, std::move(it->second));
+    BlockList.erase(it);
+    return true;
+  }
+
+  // 1 = restored original host, -1 = still rewritten (caller compiles), 0 = no stash.
+  int TryReuseAfterSMC(uint64_t Address, const BlockEntry** OutEntry, const LookupCacheWriteLockToken&) {
+    auto st = Stash.find(Address);
+    if (st == Stash.end()) {
+      return 0;
+    }
+    const uint32_t Len = st->second.GuestCRCLen;
+    if (!Len) {
+      return 0;
+    }
+    const uint32_t CRC = FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(Address), Len);
+    if (CRC != st->second.GuestCRC) {
+      return -1;
+    }
+    st->second.Epoch = AddEpoch.fetch_add(1, std::memory_order_release) + 1;
+    auto& Restored = BlockList.insert_or_assign(Address, std::move(st->second)).first->second;
+    Stash.erase(st);
+    *OutEntry = &Restored;
+    return 1;
+  }
+
+  // Caller holds any lock on this map (base, read or write token).
+  const BlockEntry* FindBlock(uint64_t Address, const LookupCacheBaseLockToken&) {
+    auto HostCode = BlockList.find(Address);
+    if (HostCode == BlockList.end()) {
+      return nullptr;
+    }
+    return &HostCode->second;
   }
 
   const BlockEntry* FindBlock(uint64_t Address, const LookupCacheReadLockToken&) {
@@ -144,7 +371,8 @@ struct GuestToHostMap {
       it->second(it->first.HostLink);
     }
 
-    // Remove from BlockList
+    // Remove from BlockList and Stash so range invalidations cannot leave stale stashed entries
+    Stash.erase(Address);
     return BlockList.erase(Address) != 0;
   }
 
@@ -225,10 +453,10 @@ public:
     Shared = &NewMap;
   }
 
-  uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+  uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, bool ValidateCRC = false) {
     // Try L1, no lock needed
     auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
-    if (L1Entry.GuestCode == Address) {
+    if (!ValidateCRC && L1Entry.GuestCode == Address) {
       return L1Entry.HostCode;
     }
 
@@ -240,7 +468,7 @@ public:
       auto lk = Shared->AcquireReadLock();
       LockTime.reset();
 
-      if (!DisableL2Cache()) {
+      if (!ValidateCRC && !DisableL2Cache()) {
         // Try L2
         const auto PageIndex = (Address & (VirtualMemSize - 1)) >> 12;
         const auto PageOffset = Address & (0x0FFF);
@@ -265,8 +493,16 @@ public:
         // Try L3
         auto Entry = Shared->FindBlock(Address, lk);
         if (Entry) {
-          CacheBlockMapping(Address, *Entry, false, lk);
-          HostPtr = Entry->HostCode;
+          // Under async SMC invalidation, another thread (or BlockLink) can query L3
+          // before the background SMC worker erases a modified RIP. Validate the stored
+          // guest-byte CRC whenever available so stale blocks are never returned or linked.
+          const bool CrcOk = Entry->GuestCRCLen != 0
+            ? (FEXCore::Utils::crc32(reinterpret_cast<const uint8_t*>(Address), Entry->GuestCRCLen) == Entry->GuestCRC)
+            : !ValidateCRC;
+          if (CrcOk) {
+            CacheBlockMapping(Address, *Entry, false, lk);
+            HostPtr = Entry->HostCode;
+          }
         }
       }
     }
@@ -386,9 +622,52 @@ public:
 
     const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
 
-    // There is no need to update L1 or L2, they will get updated on first lookup
-    // However, adding to L1 here increases performance
-    CacheBlockMapping(Address, Entry, true, lk);
+    // hbl2add: LoopTop checks L2 before spilling to C++ FindBlock. Filling L2
+    // here avoids an immediate miss+spill on the very next entry to this block.
+    CacheBlockMapping(Address, Entry, false, lk);
+  }
+
+  void CacheBlockMappingLocked(uint64_t Address, const GuestToHostMap::BlockEntry& Entry, const LookupCacheBaseLockToken& lk) {
+    // hbl2add: LoopTop checks L2 before spilling to C++ FindBlock. Filling L2
+    // here avoids an immediate miss+spill on the very next entry to this block.
+    // hbl2add: LoopTop checks L2 before spilling to C++ FindBlock. Filling L2
+    // here avoids an immediate miss+spill on the very next entry to this block.
+    CacheBlockMapping(Address, Entry, false, lk);
+  }
+
+  int TryReuseAfterSMC(uint64_t Address, uint64_t* OutHost) {
+    auto lk = Shared->AcquireWriteLock();
+    const GuestToHostMap::BlockEntry* Restored = nullptr;
+    const int Res = Shared->TryReuseAfterSMC(Address, &Restored, lk);
+    if (Res == 1 && Restored) {
+      CacheBlockMapping(Address, *Restored, false, lk);
+      *OutHost = Restored->HostCode;
+    }
+    return Res;
+  }
+
+  // Owning thread only. Clears this thread's L1/L2 for Address without the shared write lock.
+  void InvalidateLocalCache(uint64_t Address) {
+    auto& L1Entry = reinterpret_cast<LookupCacheEntry*>(L1Pointer)[Address & L1PointerMask];
+    if (L1Entry.GuestCode == Address) {
+      L1Entry.GuestCode = 0;
+    }
+    if (L2Enabled && PagePointer) {
+      uint64_t Addr = Address & (VirtualMemSize - 1);
+      const uint64_t PageOffset = Addr & 0x0FFF;
+      Addr >>= 12;
+      auto* Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
+      const uint64_t LocalPagePointer = Pointers[Addr];
+      if (LocalPagePointer) {
+        auto* BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
+        BlockPointers[PageOffset].GuestCode = 0;
+        BlockPointers[PageOffset].HostCode = 0;
+      }
+    }
+  }
+
+  GuestToHostMap* GetSharedMap() const {
+    return Shared;
   }
 
   // Invalidates L1/L2 for a given guest block
