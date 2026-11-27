@@ -625,7 +625,19 @@ DEF_OP(ValidateCode) {
   } else {
     sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
   }
-  sub(ARMEmitter::Size::i32Bit, Dst, TMP1, CRC32Reg);
+  /* ml1341: there used to be a second, unconditional
+   * `sub(Dst, TMP1, CRC32Reg)` here -- a patch hunk that landed twice and was
+   * committed. It rewrote the comparison to (crc - patchable) - crc, or to
+   * crc - 2*crc on the plain path, so Dst was essentially never zero and the
+   * MATCH branch (which is what proves the guest bytes are unchanged and skips
+   * invalidation) was almost unreachable.
+   *
+   * Measured on device 2026-11-27 with ml1340: 1,152,383,876 of 1,152,385,024
+   * L1 misses arrived with ValidateCRC set -- 99.9999% -- all on one or two
+   * guest RIPs, at a sustained 7.6-8.0M misses/s, one core pinned and the GPU
+   * idle. That is this comparison failing every time, forcing a per-RIP
+   * revalidation (and a CRC32 over the guest bytes) on every entry to a hot
+   * block instead of once. It is the difference between 60 fps and 0. */
 
   ARMEmitter::ForwardLabel Match, End;
   cbz_OrRestart(ARMEmitter::Size::i32Bit, Dst, &Match);

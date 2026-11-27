@@ -508,7 +508,7 @@ public:
     }
 
     if (HostPtr && DynamicL1Cache()) {
-      UpdateDynamicL1Stats(Thread, Address);
+      UpdateDynamicL1Stats(Thread, Address, ValidateCRC);
     }
 
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedCacheMissCount, 1);
@@ -516,7 +516,7 @@ public:
     return HostPtr;
   }
 
-  void UpdateDynamicL1Stats(FEXCore::Core::InternalThreadState* Thread, uint64_t MissAddress) {
+  void UpdateDynamicL1Stats(FEXCore::Core::InternalThreadState* Thread, uint64_t MissAddress, bool ValidateCRC = false) {
     // If host pointer was found in L2 or L3, then add it to the counter.
     // Keeping track not L1 misses, but specifically L2/L3 hits.
     ++L2L3CacheHits;
@@ -563,6 +563,22 @@ public:
         }
       }
       const uint64_t M = IosL1Misses.fetch_add(1, std::memory_order_relaxed) + 1;
+      /* ml1340: how many of these misses were forced past L1 by ValidateCRC.
+       *
+       * FindBlock's L1 probe is `if (!ValidateCRC && L1Entry.GuestCode ==
+       * Address)`, and ValidateCRC is only true when this exact RIP was just
+       * SMC-invalidated (LastSMCInvalidateRIP == RIP, cleared after one use).
+       * ml1339 measured 99.998% of all misses on ONE RIP that is written back
+       * to L1 on every L3 hit -- so if most of those misses arrive with
+       * ValidateCRC set, something re-invalidates that RIP between every entry
+       * (a write to a writable page that also holds its code, which
+       * FEX_SMCCHECKS=full turns into a per-RIP revalidation) and the fix is
+       * chunk-granular invalidation, not a bigger L1. If it is zero, the block
+       * is entering through a path that skips L1 and SMC is not involved. */
+      static std::atomic<uint64_t> IosL1MissesCRC {0};
+      if (ValidateCRC) {
+        IosL1MissesCRC.fetch_add(1, std::memory_order_relaxed);
+      }
       if ((M & 0xfffff) == 0) {
         const int64_t Now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         const int64_t Last = IosL1LastNs.exchange(Now, std::memory_order_relaxed);
@@ -570,8 +586,9 @@ public:
           uint64_t R0 = Top[0].Rip, N0 = Top[0].N;
           uint64_t R1 = Top[1].Rip, N1 = Top[1].N;
           LogMan::Msg::EFmt("[l1-miss] ml1124 {} L1 misses total, {:.0f}/s over the last 2^20; "
-                            "top miss_rip[0]=0x{:x}x{} miss_rip[1]=0x{:x}x{}",
-                            M, 1048576.0 * 1e9 / double(Now - Last), R0, N0, R1, N1);
+                            "top miss_rip[0]=0x{:x}x{} miss_rip[1]=0x{:x}x{} crc={}",
+                            M, 1048576.0 * 1e9 / double(Now - Last), R0, N0, R1, N1,
+                            IosL1MissesCRC.load(std::memory_order_relaxed));
         }
       }
     }
