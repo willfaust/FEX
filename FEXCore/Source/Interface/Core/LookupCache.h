@@ -508,7 +508,7 @@ public:
     }
 
     if (HostPtr && DynamicL1Cache()) {
-      UpdateDynamicL1Stats(Thread);
+      UpdateDynamicL1Stats(Thread, Address);
     }
 
     FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedCacheMissCount, 1);
@@ -516,7 +516,7 @@ public:
     return HostPtr;
   }
 
-  void UpdateDynamicL1Stats(FEXCore::Core::InternalThreadState* Thread) {
+  void UpdateDynamicL1Stats(FEXCore::Core::InternalThreadState* Thread, uint64_t MissAddress) {
     // If host pointer was found in L2 or L3, then add it to the counter.
     // Keeping track not L1 misses, but specifically L2/L3 hits.
     ++L2L3CacheHits;
@@ -524,11 +524,55 @@ public:
     {   /* ml1124: process-wide L1-miss rate (every 2^20 misses, with the time) */
       static std::atomic<uint64_t> IosL1Misses {0};
       static std::atomic<int64_t> IosL1LastNs {0};
+      /* ml1339: WHICH RIPs miss L1, and does the miss repeat for one RIP.
+       *
+       * The 2026-11-27 run measured ~8-9M L1 misses/s sustained for minutes --
+       * 1.7e9 in one session against ~13K real compiles -- while [CB_SUMMARY]
+       * showed L1ptr == cacheL1 (so the emitted probe is not reading a stale
+       * pointer) and hottest_rip concentrated ~all CompileBlock traffic on ONE
+       * guest RIP. Two readings fit that and need opposite fixes:
+       *
+       *   - one RIP dominating: the block is put in L1 by CacheBlockMapping on
+       *     every L3 hit yet missed again on the next entry, so something
+       *     between entries invalidates/bypasses it (SMC per-RIP CRC path,
+       *     code-buffer remap, or an entry path that skips L1);
+       *   - two or more RIPs dominating: L1 is indexed by
+       *     (RIP >> 4) & (CurrentL1Entries - 1), so guest addresses 2 MB apart
+       *     with the table at its 128K-entry cap share a slot and evict each
+       *     other forever. On a 184 MB binary that is easy to hit.
+       *
+       * Print the top few missing RIPs with the rate. Diagnostic only; the
+       * counts are plain racy increments on the same 2^20 cadence as the rate. */
+      static struct { uint64_t Rip; uint64_t N; } Top[4] {};
+      static std::atomic<uint64_t> IosRipSeq {0};
+      {
+        bool Seen = false;
+        for (auto& E : Top) {
+          if (E.Rip == MissAddress) { E.N++; Seen = true; break; }
+        }
+        if (!Seen) {
+          bool Placed = false;
+          for (auto& E : Top) {
+            if (E.Rip == 0) { E.Rip = MissAddress; E.N = 1; Placed = true; break; }
+          }
+          if (!Placed) {
+            auto i = IosRipSeq.fetch_add(1, std::memory_order_relaxed) & 3;
+            Top[i].Rip = MissAddress;
+            Top[i].N = 1;
+          }
+        }
+      }
       const uint64_t M = IosL1Misses.fetch_add(1, std::memory_order_relaxed) + 1;
       if ((M & 0xfffff) == 0) {
         const int64_t Now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         const int64_t Last = IosL1LastNs.exchange(Now, std::memory_order_relaxed);
-        if (Last) LogMan::Msg::EFmt("[l1-miss] ml1124 {} L1 misses total, {:.0f}/s over the last 2^20", M, 1048576.0 * 1e9 / double(Now - Last));
+        if (Last) {
+          uint64_t R0 = Top[0].Rip, N0 = Top[0].N;
+          uint64_t R1 = Top[1].Rip, N1 = Top[1].N;
+          LogMan::Msg::EFmt("[l1-miss] ml1124 {} L1 misses total, {:.0f}/s over the last 2^20; "
+                            "top miss_rip[0]=0x{:x}x{} miss_rip[1]=0x{:x}x{}",
+                            M, 1048576.0 * 1e9 / double(Now - Last), R0, N0, R1, N1);
+        }
       }
     }
 #endif
