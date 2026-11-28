@@ -1143,6 +1143,15 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   }
 
   /* perf-silenced */ // LogMan::Msg::IFmt("[iOS] Arm64JIT: IR block loop done, emitting final branches...");
+  // madeira-duo: a call exit in the last block of the function still returns into this function.
+  // Between blocks the next block's start sends the return landing to the return block; after the
+  // last block nothing did, and the landing ran off the end of the code. The call-site copy without
+  // the push ends functions this way (its slow path is the whole CALL, placed last).
+  if (PendingCallReturnTargetLabel) {
+    b_OrRestart(PendingCallReturnTargetLabel);
+    PendingCallReturnTargetLabel = nullptr;
+  }
+
   // Make sure last branch is generated. It certainly can't be eliminated here.
   if (PendingTargetLabel) {
     if (PendingTargetLabel->Backward.Location) {
@@ -1402,6 +1411,13 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     }
 #endif
     memcpy(WritePtr(GetCursorAddress<uint8_t*>()), TempCodeBuffer, TempSize);
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+    if (FEXCore::Core::MadeiraJitMapHook) {   // madeira-duo jit-map: where this block lives, for the CPU profile.
+      // After the memcpy: before it the final address still holds the pool's NOP fill,
+      // and MADEIRA_JITCODE dumps the bytes from there (prof8 got only NOPs).
+      FEXCore::Core::MadeiraJitMapHook(reinterpret_cast<uint64_t>(CodeData.BlockBegin), CodeData.Size, Entry, Size);
+    }
+#endif
     SetCursorOffset(CodeBuffers.LatestOffset + TempSize);
 
     CodeBuffers.LatestOffset = GetCursorOffset();

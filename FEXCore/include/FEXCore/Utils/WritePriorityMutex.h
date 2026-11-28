@@ -24,6 +24,70 @@
 
 namespace FEXCore::Utils::WritePriorityMutex {
 
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+/* MADEIRA: contention counters for one mutex (attached to CodeInvalidationMutex, see ContextImpl),
+ * reported from unlock() about every 30 s: exclusive acquisitions, exclusive hold time (and the longest
+ * hold), shared acquisitions that could not take the lock at once and how long they waited, and the
+ * same for exclusive acquisitions. The uncontended paths only pay a null check, the exclusive path two
+ * counter reads. Times are counter-register ticks (cntvct_el0), never a library clock (ml1059). */
+struct IosContentionStats {
+  const char* Name {};
+  std::atomic<uint64_t> ExclusiveAcquisitions {};
+  std::atomic<uint64_t> ExclusiveHoldTicks {};
+  std::atomic<uint64_t> ExclusiveMaxHoldTicks {};
+  std::atomic<uint64_t> ReaderBlocks {};
+  std::atomic<uint64_t> ReaderBlockedTicks {};
+  std::atomic<uint64_t> WriterWaits {};
+  std::atomic<uint64_t> WriterWaitTicks {};
+  std::atomic<uint64_t> LastReportTicks {};
+  // Values at the last report; touched only by the thread that won LastReportTicks.
+  uint64_t Reported[7] {};
+
+  static uint64_t Now() {
+    uint64_t Ticks;
+    __asm volatile("mrs %0, cntvct_el0" : "=r"(Ticks));
+    return Ticks;
+  }
+  static uint64_t Frequency() {
+    uint64_t Hz;
+    __asm volatile("mrs %0, cntfrq_el0" : "=r"(Hz));
+    return Hz;
+  }
+
+  void MaybeReport(uint64_t NowTicks) {
+    uint64_t Last = LastReportTicks.load(std::memory_order_relaxed);
+    const uint64_t Hz = Frequency();
+    if (Last == 0) {
+      LastReportTicks.compare_exchange_strong(Last, NowTicks, std::memory_order_relaxed);
+      return;
+    }
+    if (NowTicks - Last < Hz * 30 || !LastReportTicks.compare_exchange_strong(Last, NowTicks, std::memory_order_relaxed)) {
+      return;
+    }
+    const uint64_t Values[7] = {
+      ExclusiveAcquisitions.load(std::memory_order_relaxed), ExclusiveHoldTicks.load(std::memory_order_relaxed),
+      ReaderBlocks.load(std::memory_order_relaxed),          ReaderBlockedTicks.load(std::memory_order_relaxed),
+      WriterWaits.load(std::memory_order_relaxed),           WriterWaitTicks.load(std::memory_order_relaxed),
+      ExclusiveMaxHoldTicks.exchange(0, std::memory_order_relaxed),
+    };
+    const double Seconds = double(NowTicks - Last) / double(Hz);
+    const auto PerSecond = [&](int i) {
+      return double(Values[i] - Reported[i]) / Seconds;
+    };
+    const auto MsPerSecond = [&](int i) {
+      return double(Values[i] - Reported[i]) * 1000.0 / double(Hz) / Seconds;
+    };
+    LogMan::Msg::EFmt("[fexlock-stats] {} over {:.1f}s: exclusive {:.1f}/s hold {:.2f} ms/s (max {:.2f} ms), "
+                      "reader-blocked {:.2f} ms/s ({:.1f}/s), writer-wait {:.2f} ms/s ({:.1f}/s)",
+                      Name ? Name : "mutex", Seconds, PerSecond(0), MsPerSecond(1), double(Values[6]) * 1000.0 / double(Hz),
+                      MsPerSecond(3), PerSecond(2), MsPerSecond(5), PerSecond(4));
+    for (int i = 0; i < 6; i++) {
+      Reported[i] = Values[i];
+    }
+  }
+};
+#endif
+
 // A custom mutex that prioritizes exclusive locks.
 // In highly contested scenarios, this can help minimize overall contention time.
 //
@@ -61,6 +125,57 @@ public:
       return;
     }
 
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+    if (Stats) {
+      const uint64_t Start = IosContentionStats::Now();
+      lock_slow();
+      Stats->WriterWaits.fetch_add(1, std::memory_order_relaxed);
+      Stats->WriterWaitTicks.fetch_add(IosContentionStats::Now() - Start, std::memory_order_relaxed);
+      return;
+    }
+#endif
+    lock_slow();
+  }
+
+  void lock_shared() {
+    /* iOS-Madeira ml442 (#74 ROOT FIX): the class forbids recursive locking,
+     * but the invalidation paths hold this WRITE-locked while a fault taken
+     * on the same thread re-enters the compiler, which asks for SHARED — the
+     * thread then parks forever behind itself (ml441 run: tid 00e4 write-owned
+     * 0x7ca7173500 and read-waited on it; the whole webhelper cascaded behind
+     * that one park).  A write owner already has exclusive access, which is a
+     * strict superset of shared — grant it with a nest counter instead. */
+    if (IosWriterSelfShared()) {
+      return;
+    }
+
+    // Try an uncontended lock first.
+    if (try_lock_shared()) {
+      return;
+    }
+
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+    if (Stats) {
+      const uint64_t Start = IosContentionStats::Now();
+      lock_shared_slow();
+      Stats->ReaderBlocks.fetch_add(1, std::memory_order_relaxed);
+      Stats->ReaderBlockedTicks.fetch_add(IosContentionStats::Now() - Start, std::memory_order_relaxed);
+      return;
+    }
+#endif
+    lock_shared_slow();
+  }
+
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+  /* MADEIRA: attach contention counters (see IosContentionStats). Set once, before the mutex is used. */
+  void IosSetContentionStats(IosContentionStats* NewStats) {
+    Stats = NewStats;
+  }
+#endif
+
+private:
+  // lock() after its non-blocking attempt failed.
+  void lock_slow() {
     // Try a quick WFE write-lock.
     if (Attempt_WFE_WriteLock()) {
       NoteWriteAcquired();
@@ -134,23 +249,8 @@ public:
     }
   }
 
-  void lock_shared() {
-    /* iOS-Madeira ml442 (#74 ROOT FIX): the class forbids recursive locking,
-     * but the invalidation paths hold this WRITE-locked while a fault taken
-     * on the same thread re-enters the compiler, which asks for SHARED — the
-     * thread then parks forever behind itself (ml441 run: tid 00e4 write-owned
-     * 0x7ca7173500 and read-waited on it; the whole webhelper cascaded behind
-     * that one park).  A write owner already has exclusive access, which is a
-     * strict superset of shared — grant it with a nest counter instead. */
-    if (IosWriterSelfShared()) {
-      return;
-    }
-
-    // Try an uncontended lock first.
-    if (try_lock_shared()) {
-      return;
-    }
-
+  // lock_shared() after its non-blocking attempt failed.
+  void lock_shared_slow() {
     // Try a quick WFE read-lock.
     if (Attempt_WFE_ReadLock()) {
       return;
@@ -196,6 +296,7 @@ public:
     }
   }
 
+public:
   void unlock() {
     auto AtomicFutex = std::atomic_ref<uint32_t>(Futex);
 
@@ -227,6 +328,13 @@ public:
       // Handle write-reader handoff.
       FutexWakeReaders();
     }
+
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+    // MADEIRA: after the release, so the log write never extends a hold.
+    if (Stats) {
+      Stats->MaybeReport(IosContentionStats::Now());
+    }
+#endif
   }
 
   void unlock_shared() {
@@ -586,6 +694,11 @@ private:
   /* MADEIRA: return addresses of the write owner's frames when it took the lock, so a stuck
    * waiter can say which path holds it. */
   uint64_t OwnerRa[4] {};
+#if defined(ARCHITECTURE_arm64)
+  /* MADEIRA: contention counters, null unless attached; when the current exclusive hold began. */
+  IosContentionStats* Stats {};
+  uint64_t ExclusiveSinceTicks {};
+#endif
 
   /* Walks the frame-record chain from the caller's frame. ARM64EC maps the guest's RBP to x29,
    * so a host function called from JIT code saved a guest value as its parent frame: stop at
@@ -609,6 +722,12 @@ private:
   }
 
   void NoteWriteAcquired() {
+#if defined(ARCHITECTURE_arm64)
+    if (Stats) {
+      ExclusiveSinceTicks = IosContentionStats::Now();
+      Stats->ExclusiveAcquisitions.fetch_add(1, std::memory_order_relaxed);
+    }
+#endif
     uint64_t Teb = 0;
 #ifdef ARCHITECTURE_arm64
     __asm volatile("mov %0, x18" : "=r"(Teb));
@@ -624,6 +743,16 @@ private:
   }
 
   void NoteWriteReleased() {
+#if defined(ARCHITECTURE_arm64)
+    if (Stats && ExclusiveSinceTicks) {
+      const uint64_t Held = IosContentionStats::Now() - ExclusiveSinceTicks;
+      ExclusiveSinceTicks = 0;
+      Stats->ExclusiveHoldTicks.fetch_add(Held, std::memory_order_relaxed);
+      if (Held > Stats->ExclusiveMaxHoldTicks.load(std::memory_order_relaxed)) {
+        Stats->ExclusiveMaxHoldTicks.store(Held, std::memory_order_relaxed);
+      }
+    }
+#endif
     if (OwnerSharedNest) {
       /* Badly-nested release order (write-unlock before nested shared-unlock).
        * Scoped RAII guards can't produce this; log loudly if something does. */

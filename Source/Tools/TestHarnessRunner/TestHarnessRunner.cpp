@@ -81,6 +81,12 @@ public:
       std::string_view Value_View = Option.second;
       std::optional<fextl::string> Value;
 
+      // madeira-duo: the translator's own switches (MADEIRA_FEX_...) are read with getenv, so a
+      // test's entries for them go into the process environment before the first block is compiled.
+      if (Key.starts_with("MADEIRA_")) {
+        setenv(fextl::string(Key).c_str(), fextl::string(Value_View).c_str(), 1);
+      }
+
 #define ENVLOADER
 #include <FEXCore/Config/ConfigOptions.inl>
 

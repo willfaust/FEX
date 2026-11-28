@@ -70,6 +70,47 @@ void WidenJitBounds(uint64_t JitBase, uint64_t Size) {
          !__atomic_compare_exchange_n(&g_JitHigh, &High, JitBase + Size, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
   }
 }
+
+/* madeira-duo (5 Nov 2026): a per-page answer cache for IosJitReverseTranslate.
+ *
+ * Guest PE images sit inside [g_JitLow, g_JitHigh), so the bounds test above lets
+ * PoE2's own exe addresses through and every one of them walked all ~160 entries to
+ * answer "not an alias" (CompileBlock, QueryGuestExecutableRange, IsHotSMCCodePage and
+ * LookupExecutableFileSection all ask): 7.5% of the process's CPU, 16% of its Main
+ * thread, in the [prof] capture of 5 Nov.
+ *
+ * Keyed by 64 KB chunk, not page: PoE2's 49 MB of code is ~750 chunks, so its whole
+ * text fits the 4096 slots (a page key thrashed past ~4000 pages and was slower than
+ * the walk). One 64-bit word per slot, so a reader never sees a torn answer:
+ *   bits 63..33 chunk (Addr >> 16; user addresses are below 2^47)
+ *   bits 32..9  table generation (low 24 bits)
+ *   bits  8..1  entry index (a hit)
+ *   bit   0     1 = hit, 0 = no entry touches this chunk
+ * g_AliasGen is a sequence count: BTCpu64IosAddAliasMapping makes it odd before it
+ * changes the table and even again after, so a cached answer from an older table never
+ * matches, and a reader that raced a change takes the walk instead. A hit is re-checked
+ * against its entry every time, so a retired or reused slot can never give a wrong
+ * address. */
+constexpr int kRevCacheBits = 12;
+uint64_t g_RevCache[1 << kRevCacheBits];
+uint64_t g_AliasGen = 0;
+
+constexpr int kRevChunkShift = 16;
+
+uint64_t RevCacheKey(uint64_t Chunk, uint64_t Gen) {
+  return (Chunk << 33) | ((Gen & 0xffffff) << 9);
+}
+
+/* Brackets every change BTCpu64IosAddAliasMapping makes to the table. */
+struct AliasWriteScope {
+  AliasWriteScope() {
+    __atomic_fetch_add(&g_AliasGen, 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  }
+  ~AliasWriteScope() {
+    __atomic_fetch_add(&g_AliasGen, 1, __ATOMIC_RELEASE);
+  }
+};
 }  // namespace
 
 extern "C" {
@@ -420,6 +461,7 @@ void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size)
   }
 
   WidenJitBounds(JitBase, Size);
+  const AliasWriteScope WriteScope;
 
   // Retire every entry whose PE range overlaps the incoming image: a live
   // image proves any overlapping entry is dead (two images cannot share a VA).
@@ -485,12 +527,55 @@ uint64_t IosJitReverseTranslate(uint64_t Addr) {
   if (Addr < __atomic_load_n(&g_JitLow, __ATOMIC_ACQUIRE) || Addr >= __atomic_load_n(&g_JitHigh, __ATOMIC_ACQUIRE)) {
     return Addr;
   }
+  const uint64_t Gen = __atomic_load_n(&g_AliasGen, __ATOMIC_ACQUIRE);
+  const uint64_t Chunk = Addr >> kRevChunkShift;
+  const bool Cacheable = (Gen & 1) == 0 && Chunk < (1ULL << 31);
+  uint64_t* const Slot = &g_RevCache[(Chunk ^ (Chunk >> kRevCacheBits)) & ((1 << kRevCacheBits) - 1)];
+  const uint64_t Key = RevCacheKey(Chunk, Gen);
+
+  if (Cacheable) {
+    const uint64_t Cached = __atomic_load_n(Slot, __ATOMIC_RELAXED);
+    if ((Cached & ~0x1ffULL) == Key) {
+      if ((Cached & 1) == 0) {
+        return Addr;
+      }
+      const IosAliasEntry& Entry = g_Entries[(Cached >> 1) & 0xff];
+      const uint64_t EntrySize = __atomic_load_n(&Entry.Size, __ATOMIC_ACQUIRE);
+      const uint64_t EntryJitBase = __atomic_load_n(&Entry.JitBase, __ATOMIC_RELAXED);
+      const uint64_t EntryPeBase = __atomic_load_n(&Entry.PeBase, __ATOMIC_RELAXED);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
+      if (EntrySize != 0 && Addr >= EntryJitBase && Addr - EntryJitBase < EntrySize &&
+          __atomic_load_n(&g_AliasGen, __ATOMIC_RELAXED) == Gen) {
+        return EntryPeBase + (Addr - EntryJitBase);
+      }
+    }
+  }
+
+  const uint64_t ChunkStart = Chunk << kRevChunkShift;
+  const uint64_t ChunkEnd = ChunkStart + (1ULL << kRevChunkShift);
+  bool ChunkTouched = false;
   int count = g_EntryCount;
   for (int i = 0; i < count; i++) {
     uint64_t jb = g_Entries[i].JitBase;
     uint64_t sz = g_Entries[i].Size;
     if (Addr >= jb && Addr < jb + sz) {
+      if (Cacheable) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&g_AliasGen, __ATOMIC_RELAXED) == Gen) {
+          __atomic_store_n(Slot, Key | ((uint64_t)i << 1) | 1, __ATOMIC_RELAXED);
+        }
+      }
       return g_Entries[i].PeBase + (Addr - jb);
+    }
+    if (sz && jb < ChunkEnd && ChunkStart < jb + sz) {
+      ChunkTouched = true;
+    }
+  }
+  /* "No entry" is cached only for a chunk no entry touches, so it holds for every address in it. */
+  if (Cacheable && !ChunkTouched) {
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    if (__atomic_load_n(&g_AliasGen, __ATOMIC_RELAXED) == Gen) {
+      __atomic_store_n(Slot, Key, __ATOMIC_RELAXED);
     }
   }
   return Addr;

@@ -184,7 +184,8 @@ bool InitializeThread(FEXCore::Core::InternalThreadState* Thread) {
 #ifdef FEX_IOS_HOST
   {
     size_t Stale = FEXCore::Allocator::ZeroScrub(Thread->CallRetStackBase, FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE);
-    LogMan::Msg::EFmt("[callret] zero-scrub rev=ml362 stale=0x{:x}", Stale);
+    LogMan::Msg::EFmt("[callret] zero-scrub rev=ml362 stale=0x{:x}{}", Stale,
+                      FEXCore::Allocator::ZeroScrubEnabled() ? "" : " (not run: MADEIRA_FEX_ZERO_SCRUB=0)");
   }
 #endif
 

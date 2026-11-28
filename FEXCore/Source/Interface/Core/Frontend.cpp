@@ -8,11 +8,14 @@ $end_info$
 
 #include "Interface/Context/Context.h"
 #include "Interface/Core/Frontend.h"
+#include "Interface/Core/OpcodeDispatcher.h"
 #include "Interface/Core/X86Tables/X86Tables.h"
 #include "Interface/Core/LookupCache.h"
 
 #include <array>
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <FEXCore/Config/Config.h>
 #include <FEXCore/Core/X86Enums.h>
@@ -1480,10 +1483,345 @@ bool Decoder::CheckIfCacheable(FEXCore::Core::InternalThreadState& Thread, const
   return !Uncacheable;
 }
 
+/* madeira-duo leaf inline (decoder half).
+ *
+ * Path of Exile 2 spends about 4% of its CPU in functions of one to a few
+ * instructions (`mov rax, rcx; ret` alone is 1.3%, run-1125a), nearly all of it
+ * the call and the return: each costs a block entry, and the return an L1 lookup
+ * and an indirect branch on top. Most of them are reached by direct CALLs.
+ *
+ * When a block ends in a direct CALL, the callee is decoded here. If it is a
+ * short straight-line run of the plain instructions listed below that ends in a
+ * RET, it is recorded in BlockInfo.InlineLeaves and its pages join the function's
+ * code pages, so a write to the callee invalidates the caller like a write to
+ * its own code. The dispatcher (GenerateIR) then emits the callee's instructions
+ * at the call site between the CALL's push and a check of the return address.
+ *
+ * Only instructions are accepted whose handlers neither end a block nor need
+ * anything from the instruction stream around them. Everything else (branches,
+ * calls, string and system instructions, LOCK, VEX, x87, MMX) leaves the CALL as
+ * it is. MADEIRA_FEX_LEAF_INLINE=0 turns the whole thing off. */
+bool Decoder::InlineLeafInstAllowed(const FEXCore::X86Tables::DecodedInst& Inst) {
+  const uint8_t* B = Inst.InstBytes;
+  const size_t Len = Inst.InstSize;
+  size_t P = 0;
+  bool Has66 = false, HasRep = false;
+  for (; P < Len; P++) {
+    if (B[P] == 0x66) {
+      Has66 = true;
+    } else if (B[P] == 0xF2 || B[P] == 0xF3) {
+      HasRep = true;
+    } else if (B[P] != 0x64 && B[P] != 0x65) {
+      break;
+    }
+  }
+  if (P < Len && (B[P] & 0xF0) == 0x40) {
+    P++; // REX
+  }
+  if (P >= Len) {
+    return false;
+  }
+  const uint8_t Op = B[P];
+  const uint8_t RegField = P + 1 < Len ? (B[P + 1] >> 3) & 7 : 8;
+
+  if (Op != 0x0F) {
+    if (HasRep) {
+      return false;
+    }
+    if (Op < 0x40) {
+      return (Op & 7) < 6; // ADD OR ADC SBB AND SUB XOR CMP
+    }
+    if ((Op >= 0x50 && Op <= 0x5F) || (Op >= 0xB0 && Op <= 0xBF)) {
+      return true; // PUSH/POP r64, MOV r, imm
+    }
+    switch (Op) {
+    case 0x63: // MOVSXD
+    case 0x69:
+    case 0x6B: // IMUL
+    case 0x80:
+    case 0x81:
+    case 0x83: // ALU r/m, imm
+    case 0x84:
+    case 0x85: // TEST
+    case 0x88:
+    case 0x89:
+    case 0x8A:
+    case 0x8B: // MOV
+    case 0x8D: // LEA
+    case 0x90: // NOP
+    case 0x98:
+    case 0x99: // CDQE, CQO
+    case 0xA8:
+    case 0xA9: // TEST rAX, imm
+    case 0xC0:
+    case 0xC1:
+    case 0xD0:
+    case 0xD1:
+    case 0xD2:
+    case 0xD3: // shifts and rotates
+    case 0xF6:
+    case 0xF7: // TEST NOT NEG MUL IMUL DIV IDIV
+      return true;
+    case 0xC6:
+    case 0xC7: return RegField == 0;                  // MOV r/m, imm (not XABORT/XBEGIN)
+    case 0xFE: return RegField <= 1;                  // INC, DEC
+    case 0xFF: return RegField <= 1 || RegField == 6; // INC, DEC, PUSH
+    default: return false;
+    }
+  }
+
+  if (P + 1 >= Len) {
+    return false;
+  }
+  const uint8_t Op2 = B[P + 1];
+  if ((Op2 >= 0x40 && Op2 <= 0x4F) || (Op2 >= 0x90 && Op2 <= 0x9F) || Op2 == 0xAF || Op2 == 0xB6 || Op2 == 0xB7 || Op2 == 0xBE || Op2 == 0xBF) {
+    return !HasRep; // CMOVcc, SETcc, IMUL, MOVZX, MOVSX
+  }
+  switch (Op2) {
+  case 0x1F: return !HasRep; // NOP r/m
+  case 0xB8:
+  case 0xBC:
+  case 0xBD: return true; // POPCNT, BSF/TZCNT, BSR/LZCNT
+  case 0x10:
+  case 0x11: // MOVUPS/MOVSS/MOVUPD/MOVSD
+  case 0x28:
+  case 0x29: // MOVAPS/MOVAPD
+  case 0x2A:
+  case 0x2C:
+  case 0x2D: // CVT between integer and scalar float
+  case 0x2E:
+  case 0x2F: // UCOMIS, COMIS
+  case 0xC2:
+  case 0xC6: // CMPPS, SHUFPS
+    return true;
+  default: break;
+  }
+  if (Op2 >= 0x50 && Op2 <= 0x5F) {
+    return true; // MOVMSKPS and the SSE arithmetic row
+  }
+  // SSE2 integer forms only (with a mandatory prefix): the unprefixed encodings are MMX.
+  if ((Op2 >= 0x60 && Op2 <= 0x76) || (Op2 >= 0x7C && Op2 <= 0x7F)) {
+    return Has66 || HasRep;
+  }
+  if (Op2 >= 0xD0 && Op2 <= 0xFE && Op2 != 0xF7) {
+    return Has66 && !HasRep;
+  }
+  return false;
+}
+
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+extern "C" uint64_t IosJitReverseTranslate(uint64_t Addr);
+#endif
+
+// Code in a writable mapping (a JIT's output) is left alone: neither inlined from nor into.
+// The test harness reports every mapping as writable, so the test build has to skip the rule.
+#ifdef FEX_MADEIRA_IDIOM_TESTS
+static constexpr bool InlineLeafSkipsWritable = false;
+#else
+static constexpr bool InlineLeafSkipsWritable = true;
+#endif
+
+// [leaf-stats]: what became of the direct calls looked at, and which instructions kept callees out
+// (index = opcode, +256 for the 0F row). One line each time the number of calls doubles, from 1024.
+namespace {
+enum LeafStat { LS_CALLS, LS_INLINED, LS_BRANCH, LS_NOT_ALLOWED, LS_TOO_LONG, LS_NOT_DECODED, LS_MEMMOVE, LS_COUNT };
+std::atomic<uint32_t> LeafStats[LS_COUNT];
+std::atomic<uint32_t> LeafNotAllowedOps[512];
+
+void NoteLeafNotAllowed(const FEXCore::X86Tables::DecodedInst& Inst) {
+  size_t P = 0;
+  while (P < Inst.InstSize && (Inst.InstBytes[P] == 0x66 || Inst.InstBytes[P] == 0xF2 || Inst.InstBytes[P] == 0xF3 || Inst.InstBytes[P] == 0x64 ||
+                               Inst.InstBytes[P] == 0x65 || (Inst.InstBytes[P] & 0xF0) == 0x40)) {
+    P++;
+  }
+  if (P >= Inst.InstSize) {
+    return;
+  }
+  uint32_t Index = Inst.InstBytes[P];
+  if (Index == 0x0F && P + 1 < Inst.InstSize) {
+    Index = 256 + Inst.InstBytes[P + 1];
+  }
+  LeafNotAllowedOps[Index].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteLeafOutcome(LeafStat Outcome) {
+  LeafStats[Outcome].fetch_add(1, std::memory_order_relaxed);
+  const uint32_t Calls = LeafStats[LS_CALLS].fetch_add(1, std::memory_order_relaxed) + 1;
+  if (Calls < 1024 || (Calls & (Calls - 1)) != 0) {
+    return;
+  }
+  uint32_t TopIndex[4] {}, TopCount[4] {};
+  for (uint32_t i = 0; i < 512; i++) {
+    uint32_t Count = LeafNotAllowedOps[i].load(std::memory_order_relaxed), Index = i;
+    for (int j = 0; j < 4 && Count; j++) {
+      if (Count > TopCount[j]) {
+        std::swap(Count, TopCount[j]);
+        std::swap(Index, TopIndex[j]);
+      }
+    }
+  }
+  LogMan::Msg::IFmt("[leaf-stats] madeira-duo direct calls {}: inlined {}, memmove {}, callee branches {}, instruction not allowed {}, "
+                    "too long {}, not decoded {}; not-allowed opcodes (0x1xx = 0F xx): {:#x} x{}, {:#x} x{}, {:#x} x{}, {:#x} x{}",
+                    Calls, LeafStats[LS_INLINED].load(std::memory_order_relaxed), LeafStats[LS_MEMMOVE].load(std::memory_order_relaxed),
+                    LeafStats[LS_BRANCH].load(std::memory_order_relaxed), LeafStats[LS_NOT_ALLOWED].load(std::memory_order_relaxed),
+                    LeafStats[LS_TOO_LONG].load(std::memory_order_relaxed), LeafStats[LS_NOT_DECODED].load(std::memory_order_relaxed), TopIndex[0],
+                    TopCount[0], TopIndex[1], TopCount[1], TopIndex[2], TopCount[2], TopIndex[3], TopCount[3]);
+}
+} // namespace
+
+// Returns the number of instructions recorded (0 when the callee is not inlinable).
+uint64_t Decoder::TryDecodeInlineLeaf(const uint8_t* _InstStream, const FEXCore::X86Tables::DecodedInst* CallInst, uint64_t MaxInst) {
+  static int LeafInlineOn = -1;
+  if (LeafInlineOn < 0) {
+    const char* Env = getenv("MADEIRA_FEX_LEAF_INLINE");
+    LeafInlineOn = !(Env && Env[0] == '0');
+  }
+  // madeira-duo memmove at call sites: a direct CALL to MSVC's memcpy/memmove gets the inline
+  // small copy at the call site (OpDispatchBuilder::InlineCRTMemmoveCall). Off with
+  // MADEIRA_FEX_MEMMOVE_SITES=0, and with MADEIRA_FEX_MEMMOVE=0 like the entry fast path.
+  static int MemmoveSitesOn = -1;
+  if (MemmoveSitesOn < 0) {
+    const char* Sites = getenv("MADEIRA_FEX_MEMMOVE_SITES");
+    const char* All = getenv("MADEIRA_FEX_MEMMOVE");
+    MemmoveSitesOn = !(Sites && Sites[0] == '0') && !(All && All[0] == '0');
+  }
+  // madeira-duo leaf-long: MADEIRA_FEX_LEAF_MAX = the longest callee taken, in instructions (12-32, default 12,
+  // which keeps the 64-byte limit; above 12 the byte limit is 6 bytes an instruction). run-1127g: a quarter of
+  // the direct calls looked at stopped at the 12-instruction limit ([leaf-stats] too long 65,362 of 262,144).
+  static const size_t MaxLeafInsts = [] {
+    const char* Env = getenv("MADEIRA_FEX_LEAF_MAX");
+    const long N = Env ? strtol(Env, nullptr, 10) : 0;
+    return static_cast<size_t>(N >= 12 && N <= 32 ? N : 12);
+  }();
+  static const uint64_t MaxLeafBytes = MaxLeafInsts <= 12 ? 64 : MaxLeafInsts * 6;
+
+  if ((!LeafInlineOn && !MemmoveSitesOn) || !BlockInfo.Is64BitMode || CallInst->OP != 0xE8 || !CallInst->TableInfo ||
+      !(CallInst->TableInfo->Flags & FEXCore::X86Tables::InstFlags::FLAGS_CALL) || (CallInst->Flags & DecodeFlags::FLAG_OPERAND_SIZE)) {
+    return 0;
+  }
+  if (CTX->GetCodeCache().IsGeneratingCache || EnableCodeCacheValidation) {
+    // A cached function would need the callee's bytes tracked and relocated as well.
+    return 0;
+  }
+  if (DecodedSize + MaxLeafInsts >= std::min<uint64_t>(MaxInst, DefaultDecodedBufferSize)) {
+    return 0;
+  }
+
+  const uint64_t NextRIP = CallInst->PC + CallInst->InstSize;
+  const uint64_t Target = NextRIP + CallInst->Src[0].Literal();
+  if (Target == NextRIP) {
+    return 0;
+  }
+#ifdef ARCHITECTURE_arm64ec
+  if (RtlIsEcCode(Target)) {
+    return 0;
+  }
+#endif
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  if (IosJitReverseTranslate(Target) != Target) {
+    // A pool-copy alias: the dispatcher runs such a callee at its PE address.
+    return 0;
+  }
+#endif
+
+  const size_t Start = DecodedSize;
+  uint64_t Offset = 0;
+  size_t Count = 0;
+  bool Complete = false;
+  LeafStat Outcome = LS_TOO_LONG;
+
+  InstStream = AdjustAddrForSpecialRegion(_InstStream, EntryPoint, Target);
+  while (Count < MaxLeafInsts) {
+    InstructionSize = 0;
+    const auto Status = DecodeInstruction(Target + Offset);
+    if (Status != DecodedBlockStatus::SUCCESS || HitBadRelocation || (InlineLeafSkipsWritable && ExecutableRangeWritable)) {
+      Outcome = LS_NOT_DECODED;
+      break;
+    }
+    const auto& Inst = *DecodeInst;
+    if (Offset + Inst.InstSize > MaxLeafBytes) {
+      break;
+    }
+    if (!Inst.TableInfo || !Inst.TableInfo->OpcodeDispatcher.OpDispatch || (Inst.Flags & (DecodeFlags::FLAG_LOCK | DecodeFlags::FLAG_ADDRESS_SIZE))) {
+      Outcome = LS_NOT_ALLOWED;
+      NoteLeafNotAllowed(Inst);
+      break;
+    }
+    const bool EndsBlock =
+      Inst.TableInfo->Flags & (FEXCore::X86Tables::InstFlags::FLAGS_BLOCK_END | FEXCore::X86Tables::InstFlags::FLAGS_SETS_RIP);
+    const bool IsRet = (Inst.InstSize == 1 && Inst.InstBytes[0] == 0xC3) || (Inst.InstSize == 2 && Inst.InstBytes[0] == 0xF3 && Inst.InstBytes[1] == 0xC3);
+    if (IsRet) {
+      // The table has to agree that this is the near return.
+      Complete = EndsBlock && Inst.OP == 0xC3;
+      Outcome = Complete ? LS_INLINED : LS_BRANCH;
+    } else if (EndsBlock) {
+      Outcome = LS_BRANCH;
+      break;
+    } else if (!InlineLeafInstAllowed(Inst)) {
+      Outcome = LS_NOT_ALLOWED;
+      NoteLeafNotAllowed(Inst);
+      break;
+    }
+    ++DecodedSize;
+    ++Count;
+    Offset += Inst.InstSize;
+    InstStream += Inst.InstSize;
+    if (IsRet) {
+      break;
+    }
+  }
+
+  HitNonExecutableRange = false;
+  HitBadRelocation = false;
+
+  // The decode stopped at a branch after three instructions: the shape of MSVC's memcpy/memmove
+  // entry (mov rax, rcx; lea r10, [image base]; cmp r8, 15; ja). The JA is in the slot after them.
+  constexpr uint32_t CRTMemmoveMatchedBytes = 46;
+  if (MemmoveSitesOn && !Complete && Outcome == LS_BRANCH && Count == 3 && Offset == 14 &&
+      DecodedSize + 4 < std::min<uint64_t>(MaxInst, DefaultDecodedBufferSize)) {
+    // The bytes after the JA are read from the same mapping the instructions came from.
+    const uint64_t HostBase = reinterpret_cast<uint64_t>(InstStream.AdjustedInstStream) - Offset - Target;
+    if (FEXCore::IR::OpDispatchBuilder::MatchCRTMemmove(&DecodedBuffer[Start], 4, Target, HostBase)) {
+      NoteLeafOutcome(LS_MEMMOVE);
+      DecodedSize = Start;
+      BlockInfo.InlineLeaves.push_back({
+        .CallPC = CallInst->PC,
+        .Entry = Target,
+        .Size = CRTMemmoveMatchedBytes,
+        .NumInstructions = 0,
+        .DecodedInstructions = nullptr,
+      });
+      for (uint64_t Page = Target & FEXCore::Utils::FEX_PAGE_MASK; Page < Target + CRTMemmoveMatchedBytes; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+        BlockInfo.CodePages.insert(Page);
+      }
+      return 0;
+    }
+  }
+
+  NoteLeafOutcome(Outcome);
+  if (!Complete || !LeafInlineOn) {
+    DecodedSize = Start;
+    return 0;
+  }
+
+  BlockInfo.InlineLeaves.push_back({
+    .CallPC = CallInst->PC,
+    .Entry = Target,
+    .Size = static_cast<uint32_t>(Offset),
+    .NumInstructions = static_cast<uint32_t>(Count),
+    .DecodedInstructions = &DecodedBuffer[Start],
+  });
+  for (uint64_t Page = Target & FEXCore::Utils::FEX_PAGE_MASK; Page < Target + Offset; Page += FEXCore::Utils::FEX_PAGE_SIZE) {
+    BlockInfo.CodePages.insert(Page);
+  }
+  return Count;
+}
+
 void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thread, const uint8_t* _InstStream, uint64_t PC, uint64_t MaxInst) {
   FEXCORE_PROFILE_SCOPED("DecodeInstructions");
   BlockInfo.TotalInstructionCount = 0;
   BlockInfo.Blocks.clear();
+  BlockInfo.InlineLeaves.clear();
   VisitedBlocks.clear();
   // Reset internal state management
   DecodedSize = 0;
@@ -1662,7 +2000,14 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
           // NOTE: This will invalidate BlockIt, this is fine as we immediately break from the loop and EraseBlock cannot be true
           BlockIt->ForceFullSMCDetection =
             (CTX->AreMonoHacksActive() && IsBranchMonoTailcall(BlockIt->NumInstructions)) || IsBranchToSelf();
+          const bool LeafCandidate = !BlockIt->ForceFullSMCDetection && !(InlineLeafSkipsWritable && ExecutableRangeWritable);
+          const auto* BranchInst = DecodeInst;
           BranchTargetInMultiblockRange();
+          // madeira-duo leaf inline. After the call above: it reads DecodeInst, which the callee's
+          // decode moves on. BlockIt is not used again.
+          if (LeafCandidate) {
+            TotalInstructions += TryDecodeInlineLeaf(_InstStream, BranchInst, MaxInst);
+          }
         }
 
         break;
@@ -1685,6 +2030,10 @@ void Decoder::DecodeInstructionsAtEntry(FEXCore::Core::InternalThreadState* Thre
 
   BlockInfo.TotalInstructionCount = TotalInstructions;
   /* [iOS-Madeira] verbose Decoder log suppressed */ // LogMan::Msg::IFmt("[iOS] Decoder: Done! TotalInstructions={}, Blocks={}", TotalInstructions, BlockInfo.Blocks.size());
+
+  if (BlockInfo.InlineLeaves.size() > 1) {
+    std::sort(BlockInfo.InlineLeaves.begin(), BlockInfo.InlineLeaves.end(), [](const auto& a, const auto& b) { return a.CallPC < b.CallPC; });
+  }
 
   for (auto& Block : BlockInfo.Blocks) {
     Block.IsEntryPoint = BlockInfo.EntryPoints.contains(Block.Entry);

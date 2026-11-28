@@ -11,6 +11,7 @@
 #include <FEXCore/fextl/vector.h>
 #include <FEXCore/fextl/robin_map.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -46,12 +47,35 @@ public:
     bool ForceFullSMCDetection {};
   };
 
+  // madeira-duo leaf inline: the callee of a direct CALL that ends a block, when it is a short
+  // straight-line run of plain instructions ending in RET. Its instructions are decoded beside the
+  // blocks (never as a block) so the dispatcher can emit them at the call site.
+  struct InlineLeaf final {
+    uint64_t CallPC {};          // The CALL instruction
+    uint64_t Entry {};           // The callee
+    uint32_t Size {};            // Bytes, RET included
+    uint32_t NumInstructions {}; // RET included
+    FEXCore::X86Tables::DecodedInst* DecodedInstructions;
+
+    // madeira-duo memmove at call sites: the callee is MSVC's memcpy/memmove
+    // (OpDispatchBuilder::MatchCRTMemmove). No instructions are recorded; Size is the bytes matched.
+    bool IsCRTMemmove() const {
+      return NumInstructions == 0;
+    }
+  };
+
   struct DecodedBlockInformation final {
     uint64_t TotalInstructionCount;
     bool Is64BitMode {};
     fextl::vector<DecodedBlocks> Blocks;
     fextl::set<uint64_t> EntryPoints;
     fextl::set<uint64_t> CodePages; // Start addresses of all pages touching the block
+    fextl::vector<InlineLeaf> InlineLeaves; // Sorted by CallPC
+
+    const InlineLeaf* FindInlineLeaf(uint64_t CallPC) const {
+      auto It = std::lower_bound(InlineLeaves.begin(), InlineLeaves.end(), CallPC, [](const auto& a, uint64_t PC) { return a.CallPC < PC; });
+      return It != InlineLeaves.end() && It->CallPC == CallPC ? &*It : nullptr;
+    }
   };
 
   Decoder(FEXCore::Core::InternalThreadState* Thread);
@@ -102,6 +126,9 @@ private:
   bool InstCanContinue() const;
 
   void AddBranchTarget(uint64_t Target);
+
+  static bool InlineLeafInstAllowed(const FEXCore::X86Tables::DecodedInst& Inst);
+  uint64_t TryDecodeInlineLeaf(const uint8_t* _InstStream, const FEXCore::X86Tables::DecodedInst* CallInst, uint64_t MaxInst);
 
   bool CheckRangeExecutable(uint64_t Address, uint64_t Size);
 

@@ -210,8 +210,15 @@ void Dispatcher::EmitDispatcher() {
     ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));
     (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &LoopTop);
     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, EC_CALL_CHECKER_PC_REG, ARMEmitter::ShiftType::LSL,
-         FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    if (LookupCache::L1HashEnabled()) {
+      // MADEIRA: hashed L1 index, as LookupCache::L1Index. TMP4 is reloaded by the ldp below.
+      eor(ARMEmitter::Size::i64Bit, TMP4, EC_CALL_CHECKER_PC_REG, EC_CALL_CHECKER_PC_REG, ARMEmitter::ShiftType::LSR,
+          LookupCache::L1_HASH_SHIFT);
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    } else {
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, EC_CALL_CHECKER_PC_REG, ARMEmitter::ShiftType::LSL,
+           FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    }
     add(TMP1, TMP1, TMP2);
     ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, 0);
     sub(TMP2, TMP2, EC_CALL_CHECKER_PC_REG);
@@ -310,7 +317,13 @@ void Dispatcher::EmitDispatcher() {
     ARMEmitter::ForwardLabel L1Miss;
     ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
     // Entry address = L1Pointer + ((RIP << ilog2(entry size)) & pre-scaled mask)
-    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    if (LookupCache::L1HashEnabled()) {
+      // MADEIRA: hashed L1 index, as LookupCache::L1Index. TMP4 is reloaded by the ldp below.
+      eor(ARMEmitter::Size::i64Bit, TMP4, RipReg, RipReg, ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP4, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    } else {
+      and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    }
     add(TMP1, TMP1, TMP2);
     ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1, 0);
     sub(TMP2, TMP2, RipReg);
@@ -367,11 +380,20 @@ void Dispatcher::EmitDispatcher() {
       // If we've made it here then we have a real compiled block
       {
         // update L1 cache
-        ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+        if (LookupCache::L1HashEnabled()) {
+          // MADEIRA: hashed L1 index, as LookupCache::L1Index. TMP4 holds the host code here, so hash
+          // into TMP1 first and load the mask and pointer separately.
+          eor(ARMEmitter::Size::i64Bit, TMP1, RipReg.R(), RipReg.R(), ARMEmitter::ShiftType::LSR, LookupCache::L1_HASH_SHIFT);
+          ldr(TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Mask));
+          and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, TMP1, ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+          ldr(TMP1, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+        } else {
+          ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
 
-        // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
-        // L1Mask is pre-shifted.
-        and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+          // Calculate (tmp1 + ((ripreg & L1_ENTRIES_MASK) << 4)) for the address
+          // L1Mask is pre-shifted.
+          and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL, FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+        }
         add(TMP1, TMP1, TMP2);
 
         stp<ARMEmitter::IndexType::OFFSET>(TMP4, RipReg, TMP1);

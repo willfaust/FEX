@@ -136,6 +136,10 @@ ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
   , CodeCache {*this} {
+#if defined(_WIN32) && defined(ARCHITECTURE_arm64)
+  CodeInvalidationStats.Name = "CodeInvalidationMutex";
+  CodeInvalidationMutex.IosSetContentionStats(&CodeInvalidationStats);
+#endif
   if (!Config.Is64BitMode()) {
     // When operating in 32-bit mode, the virtual memory we care about is only the lower 32-bits.
     Config.VirtualMemSize = 1ULL << 32;
@@ -514,6 +518,15 @@ void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread)
   LogMan::Msg::EFmt("[TI-IC] passmanager");
 
   Thread->CurrentFrame->State.L1Pointer = Thread->LookupCache->GetL1Pointer();
+
+  // madeira-duo: with MADEIRA_FEX_MOVE_NOPUSH=2 threads take the two forms of the call-site copy in
+  // turn as they start (MADEIRA_FEX_MOVE_FORM=0/1 gives every thread the same one).
+  if (IR::OpDispatchBuilder::MadeiraMoveNoPushMode() == 2) {
+    static std::atomic<uint32_t> NextForm {0};
+    const char* Forced = getenv("MADEIRA_FEX_MOVE_FORM");
+    Thread->CurrentFrame->MadeiraMoveForm =
+      Forced && (Forced[0] == '0' || Forced[0] == '1') ? uint64_t(Forced[0] - '0') : (NextForm.fetch_add(1, std::memory_order_relaxed) & 1);
+  }
   Thread->CurrentFrame->State.L1Mask = Thread->LookupCache->GetScaledL1PointerMask();
 
   Thread->CurrentFrame->Pointers.L2Pointer = Thread->LookupCache->GetPagePointer();
@@ -675,6 +688,11 @@ void ContextImpl::OnCodeBufferAllocated(const fextl::shared_ptr<CPU::CodeBuffer>
 
 void ContextImpl::ClearCodeCache(FEXCore::Core::InternalThreadState* Thread, bool NewCodeBuffer) {
   FEXCORE_PROFILE_INSTANT("ClearCodeCache");
+#if defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)
+  if (FEXCore::Core::MadeiraJitMapHook) {   // madeira-duo jit-map: host addresses get reused from here on
+    FEXCore::Core::MadeiraJitMapHook(0, NewCodeBuffer, 0, 0);
+  }
+#endif
 
   if (NewCodeBuffer) {
     // Allocate new CodeBuffer + L3 LookupCache and clear L1+L2 caches
@@ -970,6 +988,11 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
     }
 #endif
 
+    // madeira-duo leaf inline (OpDispatchBuilder::InlineLeafReturn): not with per-instruction code
+    // validation or extended debug info, which both want the instruction stream as written.
+    const bool LeafInlineUsable = !BlockInfo->InlineLeaves.empty() && Config.Is64BitMode && !ExtendedDebugInfo &&
+                                  Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL && !HotSMCBlock;
+
     for (size_t j = 0; j < CodeBlocks->size(); ++j) {
       const FEXCore::Frontend::Decoder::DecodedBlocks& Block = CodeBlocks->at(j);
 
@@ -982,10 +1005,15 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
       bool BlockInForceTSOValidRange = false;
       auto InstForceTSOIt = ForceTSOInstructions.end();
       if (ForceTSOValidRanges.Contains({Block.Entry, Block.Entry + Block.Size})) {
-        if (auto It = ForceTSOInstructions.lower_bound(Block.Entry); *It < Block.Entry + Block.Size) {
-          InstForceTSOIt = It;
-          BlockInForceTSOValidRange = true;
-        }
+        // madeira-duo: a block inside a valid range drops TSO for every access the
+        // metadata does not list, whether or not it holds a listed one. Upstream set
+        // the flag only for blocks containing a listed instruction (and read *end()
+        // when there was none), so a block without volatile accesses -- nearly all
+        // code -- kept full TSO and a module-wide ExtendedVolatileMetadata entry
+        // changed nothing (PoE2's hot byte-copy loop at exe+0x102a480 still ran
+        // ldapurb/stlurb with the exe listed, prof1 log 5 Nov 2026).
+        InstForceTSOIt = ForceTSOInstructions.lower_bound(Block.Entry);
+        BlockInForceTSOValidRange = true;
       }
 
       // Set the block entry point
@@ -1003,6 +1031,69 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, Block.Entry - GuestRIP));
       }
 
+// FEX_MADEIRA_IDIOM_TESTS: the x86-64 simulator test build compiles the idioms in so unittests/ASM/Madeira can run them.
+#if (defined(FEX_IOS_HOST) && defined(ARCHITECTURE_arm64ec)) || defined(FEX_MADEIRA_IDIOM_TESTS)
+      // madeira-duo byte-copy-loop (OpDispatchBuilder::MatchByteCopyLoop): a block that is exactly a
+      // byte-at-a-time copy loop becomes one forward MemCpy. Only where TSO is off for the whole block
+      // (the TSO loop orders every byte store, MemCpy does not), not under full SMC checks or extended
+      // debug info (both want per-instruction state). MADEIRA_FEX_BYTELOOP=0 turns it off.
+      {
+        static int ByteLoopOn = -1;
+        if (ByteLoopOn < 0) {
+          const char* Env = getenv("MADEIRA_FEX_BYTELOOP");
+          ByteLoopOn = !(Env && Env[0] == '0');
+        }
+        const bool TSOOff = !IsAtomicTSOEnabled() ||
+                            (BlockInForceTSOValidRange &&
+                             (InstForceTSOIt == ForceTSOInstructions.end() || *InstForceTSOIt >= Block.Entry + Block.Size));
+        IR::OpDispatchBuilder::ByteCopyLoop Loop;
+        if (ByteLoopOn && TSOOff && !ExtendedDebugInfo && Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL &&
+            !Block.ForceFullSMCDetection && !HotSMCBlock &&
+            IR::OpDispatchBuilder::MatchByteCopyLoop(Block.DecodedInstructions, InstsInBlock, Block.Entry, &Loop)) {
+          static std::atomic<uint32_t> Said {0};
+          const auto* Jcc = &Block.DecodedInstructions[InstsInBlock - 1];
+          const uint64_t Length = Jcc->PC + Jcc->InstSize - Block.Entry;
+          if (Said.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LogMan::Msg::IFmt("[byteloop] madeira-duo {:#x}: byte copy loop (src r{}, dst r{}, count r{}, byte r{}) -> MemCpy",
+                              Block.Entry, Loop.Src, Loop.Dst, Loop.Count, Loop.Byte);
+          }
+          Thread->OpDispatcher->FlushRegisterCache(true);
+          Thread->OpDispatcher->_GuestOpcode(Block.Entry - GuestRIP);
+          Thread->OpDispatcher->EmitByteCopyLoop(Loop, Jcc);
+          BlockInstructionsLength += Length;
+          TotalInstructionsLength += Length;
+          TotalInstructions += InstsInBlock;
+          Thread->OpDispatcher->FinishOp(Jcc->PC + Jcc->InstSize, true);
+          continue;
+        }
+      }
+      // madeira-duo memmove fast path (OpDispatchBuilder::MatchCRTMemmove): the entry block of MSVC's
+      // memcpy/memmove gets an inline copy for up to 256 bytes (ranges that do not overlap) in front
+      // of it; the routine's own instructions follow for everything else. Only where TSO is off for the whole routine (no
+      // listed volatile access in its 0x700 bytes), and not under full SMC checks or extended debug
+      // info. MADEIRA_FEX_MEMMOVE=0 turns it off.
+      {
+        static int MemmoveOn = -1;
+        if (MemmoveOn < 0) {
+          const char* Env = getenv("MADEIRA_FEX_MEMMOVE");
+          MemmoveOn = !(Env && Env[0] == '0');
+        }
+        const bool TSOOff = !IsAtomicTSOEnabled() ||
+                            (BlockInForceTSOValidRange &&
+                             (InstForceTSOIt == ForceTSOInstructions.end() || *InstForceTSOIt >= Block.Entry + 0x700));
+        if (MemmoveOn && TSOOff && Config.Is64BitMode && !ExtendedDebugInfo && Config.SMCChecks != FEXCore::Config::CONFIG_SMC_FULL &&
+            !Block.ForceFullSMCDetection && !HotSMCBlock &&
+            IR::OpDispatchBuilder::MatchCRTMemmove(Block.DecodedInstructions, InstsInBlock, Block.Entry, GetGuestBase())) {
+          static std::atomic<uint32_t> Said {0};
+          if (Said.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LogMan::Msg::IFmt("[memmove-fast] madeira-duo {:#x}: CRT memmove entry, inline copy for up to 256 bytes", Block.Entry);
+          }
+          Thread->OpDispatcher->FlushRegisterCache(true);
+          Thread->OpDispatcher->_GuestOpcode(Block.Entry - GuestRIP);
+          Thread->OpDispatcher->EmitCRTMemmoveFastPath();
+        }
+      }
+#endif
       for (size_t i = 0; i < InstsInBlock; ++i) {
         uint64_t InstAddress = Block.Entry + BlockInstructionsLength;
 
@@ -1030,6 +1121,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 #endif
 
         bool IsLocked = DecodedInfo->Flags & FEXCore::X86Tables::DecodeFlags::FLAG_LOCK;
+        const FEXCore::Frontend::Decoder::InlineLeaf* InlineLeaf {nullptr};
 
         // Do a partial register cache flush before every instruction. This
         // prevents cross-instruction static register caching, while allowing
@@ -1094,7 +1186,40 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
 
           Thread->OpDispatcher->SetForceTSO(ForceTSO);
-          std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+          if (LeafInlineUsable && i + 1 == InstsInBlock && !Block.ForceFullSMCDetection && DecodedInfo->OP == 0xE8 &&
+              (TableInfo->Flags & X86Tables::InstFlags::FLAGS_CALL)) {
+            InlineLeaf = BlockInfo->FindInlineLeaf(DecodedInfo->PC);
+            if (InlineLeaf && HasCustomIRHandlers.load(std::memory_order_relaxed)) {
+              std::shared_lock lk(CustomIRMutex);
+              if (CustomIRHandlers.contains(InlineLeaf->Entry)) {
+                InlineLeaf = nullptr;
+              }
+            }
+            if (InlineLeaf && InlineLeaf->IsCRTMemmove()) {
+              // madeira-duo memmove at call sites: under the entry fast path's rule, TSO off for
+              // the whole routine (no listed volatile access in its 0x700 bytes).
+              bool RoutineTSOOff = !IsAtomicTSOEnabled();
+              if (!RoutineTSOOff && ForceTSOValidRanges.Contains({InlineLeaf->Entry, InlineLeaf->Entry + 0x700})) {
+                const auto It = ForceTSOInstructions.lower_bound(InlineLeaf->Entry);
+                RoutineTSOOff = It == ForceTSOInstructions.end() || *It >= InlineLeaf->Entry + 0x700;
+              }
+              if (!RoutineTSOOff) {
+                InlineLeaf = nullptr;
+              }
+            }
+          }
+          if (InlineLeaf && InlineLeaf->IsCRTMemmove()) {
+            static std::atomic<uint32_t> Said {0};
+            if (Said.fetch_add(1, std::memory_order_relaxed) < 8) {
+              LogMan::Msg::IFmt("[memmove-site] madeira-duo call at {:#x} -> {:#x}: CRT memmove, inline copy for up to 256 bytes at the call site",
+                                DecodedInfo->PC, InlineLeaf->Entry);
+            }
+            Thread->OpDispatcher->InlineCRTMemmoveCall(DecodedInfo, InlineLeaf->Entry - GuestRIP, DecodedInfo->PC + DecodedInfo->InstSize - GuestRIP);
+          } else if (InlineLeaf) {
+            Thread->OpDispatcher->InlineLeafCall(DecodedInfo);
+          } else {
+            std::invoke(Fn, Thread->OpDispatcher, DecodedInfo);
+          }
           if (Thread->OpDispatcher->HadDecodeFailure()) {
             HadDispatchError = true;
           } else {
@@ -1170,6 +1295,59 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
           }
 
           HadInvalidInst = true;
+        }
+
+        if (InlineLeaf && !InlineLeaf->IsCRTMemmove() && !HadDispatchError) {
+          // The callee's instructions, then its RET (see OpDispatchBuilder::InlineLeafReturn).
+          static std::atomic<uint32_t> Said {0};
+          if (Said.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LogMan::Msg::IFmt("[leaf-inline] madeira-duo call at {:#x} -> {:#x} ({} instructions, {} bytes) compiled inline", DecodedInfo->PC,
+                              InlineLeaf->Entry, InlineLeaf->NumInstructions, InlineLeaf->Size);
+          }
+          const bool LeafInTSOValidRange = ForceTSOValidRanges.Contains({InlineLeaf->Entry, InlineLeaf->Entry + InlineLeaf->Size});
+          uint64_t LeafAddress = InlineLeaf->Entry;
+          bool LeafLeft = false;
+          for (size_t k = 0; k + 1 < InlineLeaf->NumInstructions; ++k) {
+            const FEXCore::X86Tables::DecodedInst* LeafInst = &InlineLeaf->DecodedInstructions[k];
+            Thread->OpDispatcher->FlushRegisterCache(true);
+            if (Thread->OpDispatcher->CanHaveSideEffects(LeafInst->TableInfo, LeafInst)) {
+              Thread->OpDispatcher->_GuestOpcode(LeafAddress - GuestRIP);
+            }
+            Thread->OpDispatcher->ResetHandledLock();
+            Thread->OpDispatcher->ResetDecodeFailure();
+            IR::ForceTSOMode LeafTSO = IR::ForceTSOMode::NoOverride;
+            if (LeafInTSOValidRange) {
+              LeafTSO = ForceTSOInstructions.contains(LeafAddress) ? IR::ForceTSOMode::ForceEnabled : IR::ForceTSOMode::ForceDisabled;
+            } else if (LeafInst->Flags & X86Tables::DecodeFlags::FLAG_FORCE_TSO) {
+              LeafTSO = IR::ForceTSOMode::ForceEnabled;
+            }
+            Thread->OpDispatcher->SetForceTSO(LeafTSO);
+            std::invoke(LeafInst->TableInfo->OpcodeDispatcher.OpDispatch, Thread->OpDispatcher, LeafInst);
+            if (Thread->OpDispatcher->HadDecodeFailure()) {
+              // Leave to the instruction itself: compiled as its own block it is handled as it always was.
+              Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, LeafAddress - GuestRIP));
+              LeafLeft = true;
+              break;
+            }
+            LeafAddress += LeafInst->InstSize;
+            TotalInstructionsLength += LeafInst->InstSize;
+            ++TotalInstructions;
+            if (Thread->OpDispatcher->NeedsBlockEnder()) {
+              Thread->OpDispatcher->ExitFunction(Thread->OpDispatcher->_InlineEntrypointOffset(GPRSize, LeafAddress - GuestRIP));
+              LeafLeft = true;
+              break;
+            }
+          }
+          if (LeafLeft) {
+            break;
+          }
+          Thread->OpDispatcher->FlushRegisterCache(true);
+          Thread->OpDispatcher->ResetHandledLock();
+          Thread->OpDispatcher->ResetDecodeFailure();
+          Thread->OpDispatcher->SetForceTSO(IR::ForceTSOMode::NoOverride);
+          Thread->OpDispatcher->InlineLeafReturn(DecodedInfo, LeafAddress - GuestRIP, DecodedInfo->PC + DecodedInfo->InstSize - GuestRIP);
+          TotalInstructionsLength += InlineLeaf->DecodedInstructions[InlineLeaf->NumInstructions - 1].InstSize;
+          ++TotalInstructions;
         }
 
         const bool NeedsBlockEnd = (HadDispatchError && TotalInstructions > 0) ||
@@ -1460,6 +1638,64 @@ static void IosMonoTryActivate(ContextImpl* CTX, FEXCore::Core::InternalThreadSt
 }
 #endif
 
+/* MADEIRA: the CALLRET_SP check below, moved out of CompileBlock so its cache-hit fast path runs it too. */
+/* iOS-Madeira 2026-05-18: CALLRET_SP bounds-validation + RESET.
+ *
+ * Initial diagnostic showed callret_sp going 0x10..0x70 BELOW
+ * Thread->CallRetStackBase — underflow of the FEX prediction stack into
+ * the lower guard page. On iOS, Wine's VirtualAlloc(MEM_RESERVE,
+ * PAGE_NOACCESS) doesn't actually enforce NOACCESS on the guard, so the
+ * guard-page SEGV that would normally trigger CallRetStack::HandleAccessViolation
+ * never fires, and the existing reset-to-DefaultLocation logic doesn't kick
+ * in. Result: the stack drifts further into "guard" memory each iteration
+ * of Thumper's hot dispatch loop.
+ *
+ * GPT's Tier-1 fix: replicate HandleAccessViolation's reset proactively
+ * in C++, triggered at CompileBlock entry whenever we detect callret_sp
+ * outside the real [base, base+SIZE) range. The callret stack is a
+ * prediction/fast-return cache, not architectural state — resetting it
+ * degrades to slower lookup, doesn't change x86 semantics.
+ *
+ * Stack direction (per GPT): CALL push uses `stp [sp, -0x10]!`, so
+ * sp decreases. RET pop uses `ldp [sp], 0x10`, so sp increases.
+ * sp < base = too many CALL pushes (likely ARM64EC return paths that
+ * push via the dispatcher sentinel but bypass the FEX RET pop path).
+ * sp >= end = too many RET pops. Both reset to DefaultLocation. */
+static void CheckCallRetBounds(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  auto *Thread = Frame ? Frame->Thread : nullptr;
+  uint64_t crsp = Frame ? Frame->State.callret_sp : 0;
+  uint64_t crbase = Thread ? reinterpret_cast<uint64_t>(Thread->CallRetStackBase) : 0;
+  uint64_t crend = crbase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
+  if (crbase != 0 && (crsp < crbase || crsp >= crend)) {
+    static volatile uint32_t oob_cnt = 0;
+    uint32_t n = __sync_add_and_fetch(&oob_cnt, 1);
+    uint64_t default_loc = crbase + FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET;
+    const char *kind = (crsp < crbase) ? "UNDERFLOW" : "OVERFLOW";
+    if (n <= 16) {
+      LogMan::Msg::EFmt("[CALLRET_OOB #{}] {} callret_sp=0x{:x}  "
+                        "base=0x{:x} end=0x{:x} delta=0x{:x}  "
+                        "GuestRIP=0x{:x} State.rip=0x{:x} Frame=0x{:x}  "
+                        "RESET→0x{:x}",
+                        n, kind, crsp, crbase, crend,
+                        (crsp < crbase) ? (crbase - crsp) : (crsp - crend),
+                        GuestRIP, Frame->State.rip,
+                        reinterpret_cast<uintptr_t>(Frame),
+                        default_loc);
+      /* Dump top 4 pseudo-entries before reset (mostly stale; useful to
+       * see if anyone wrote real callret pairs into the guard page). */
+      if (crsp >= 0x10000) {
+        for (int i = 0; i < 4; i++) {
+          uint64_t *pair = reinterpret_cast<uint64_t*>(crsp + i * 0x10);
+          LogMan::Msg::EFmt("[CALLRET_OOB #{}]   [+0x{:x}] = {{0x{:x}, 0x{:x}}}",
+                            n, i * 0x10, pair[0], pair[1]);
+        }
+      }
+    }
+    /* Tier-1 reset to DefaultLocation, matching CallRetStack::HandleAccessViolation. */
+    Frame->State.callret_sp = default_loc;
+  }
+}
+
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.
@@ -1497,6 +1733,59 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
    * log will say so outright. */
   if (MonoBackpatcherBridgeArmed()) {
     IosMonoTryActivate(this, Thread);
+  }
+#endif
+
+#ifdef FEX_IOS_HOST
+  /* madeira-duo (20 Nov 2026): alias-first. A pool-copy alias never gets a block (ml315 below), so the
+   * fast path's FindBlock under CodeInvalidationMutex could only miss for one, and then ml315 redirected
+   * it. Path of Exile 2 calls x64 code in hybrid DLLs through pool-copy addresses (madeira_d3d12's
+   * list-journal methods and trampolines, ntdll's syscall entry) about 450K times a second per frame
+   * thread: the shared-lock round trips, the lookup read lock and the block-map probe were 27% of those
+   * threads' CPU (fexl1-run1 profile). The reverse translation takes no lock (its per-chunk answer
+   * cache hits), so check it first and go straight back to the dispatcher with the PE VA, exactly as
+   * ml315 does. Delivery-mode calls (ml455) redirect the same way there, so no condition on them here.
+   * The callret bounds check stays; PreCompile's cross-process work waits for the next real compile,
+   * as it does for every dispatcher L1 hit. MADEIRA_FEX_ALIAS_FIRST=0 turns it off. */
+  {
+    static int AliasFirstOn = -1;
+    if (AliasFirstOn < 0) {
+      const char* Env = getenv("MADEIRA_FEX_ALIAS_FIRST");
+      AliasFirstOn = !(Env && Env[0] == '0');
+    }
+    if (AliasFirstOn && GuestRIP >= 0x10000) {
+      const uint64_t PeRIP = IosJitReverseTranslate(GuestRIP);
+      if (PeRIP != GuestRIP) {
+        CheckCallRetBounds(Frame, GuestRIP);
+        Thread->LookupCache->IosNoteAliasRedirect(PeRIP);
+        Frame->State.rip = PeRIP;
+        return Frame->Pointers.DispatcherLoopTop;
+      }
+    }
+  }
+
+  /* MADEIRA: cache-hit fast path. Nearly every call here is a lookup that L3 answers (the emitted
+   * dispatcher only probes L1, and L2 is off on iOS), and the reports, RIP checks and telemetry below
+   * ran on every one of them: IosJitReverseTranslate, IsAddressInCodeBuffer, and shared counters
+   * (g_cb_total, the hot-RIP estimator, the per-thread callret slots) that every guest thread writes.
+   * A block in the cache already passed all of those when it was compiled, and a pool-copy alias never
+   * gets a block (see ml315 below), so a hit can return here. A miss falls through to the full path
+   * unchanged. Not taken while this thread holds emission locks (ml455). [CB_SUMMARY] now counts only
+   * the calls that miss here. MADEIRA_FEX_CB_FAST=0 turns it off. */
+  {
+    static int CbFastOn = -1;
+    if (CbFastOn < 0) {
+      const char* Env = getenv("MADEIRA_FEX_CB_FAST");
+      CbFastOn = !(Env && Env[0] == '0');
+    }
+    if (CbFastOn && GuestRIP >= 0x10000 && !FEXCore::Utils::WritePriorityMutex::IosEmissionLocksHeldBySelf()) {
+      CheckCallRetBounds(Frame, GuestRIP);
+      static_cast<ContextImpl*>(Thread->CTX)->SyscallHandler->PreCompile();
+      std::shared_lock FastLk {CodeInvalidationMutex};
+      if (auto HostCode = Thread->LookupCache->FindBlock(Thread, GuestRIP)) {
+        return HostCode;
+      }
+    }
   }
 #endif
 
@@ -1601,6 +1890,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
                           "-- redirecting to PE VA and re-entering the dispatcher",
                           N + 1, GuestRIP, PeRIP);
       }
+      Thread->LookupCache->IosNoteAliasRedirect(PeRIP);
       Frame->State.rip = PeRIP;
       return Frame->Pointers.DispatcherLoopTop;
     }
@@ -1850,62 +2140,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     }
   }
 
-  /* iOS-Madeira 2026-05-18: CALLRET_SP bounds-validation + RESET.
-   *
-   * Initial diagnostic showed callret_sp going 0x10..0x70 BELOW
-   * Thread->CallRetStackBase — underflow of the FEX prediction stack into
-   * the lower guard page. On iOS, Wine's VirtualAlloc(MEM_RESERVE,
-   * PAGE_NOACCESS) doesn't actually enforce NOACCESS on the guard, so the
-   * guard-page SEGV that would normally trigger CallRetStack::HandleAccessViolation
-   * never fires, and the existing reset-to-DefaultLocation logic doesn't kick
-   * in. Result: the stack drifts further into "guard" memory each iteration
-   * of Thumper's hot dispatch loop.
-   *
-   * GPT's Tier-1 fix: replicate HandleAccessViolation's reset proactively
-   * in C++, triggered at CompileBlock entry whenever we detect callret_sp
-   * outside the real [base, base+SIZE) range. The callret stack is a
-   * prediction/fast-return cache, not architectural state — resetting it
-   * degrades to slower lookup, doesn't change x86 semantics.
-   *
-   * Stack direction (per GPT): CALL push uses `stp [sp, -0x10]!`, so
-   * sp decreases. RET pop uses `ldp [sp], 0x10`, so sp increases.
-   * sp < base = too many CALL pushes (likely ARM64EC return paths that
-   * push via the dispatcher sentinel but bypass the FEX RET pop path).
-   * sp >= end = too many RET pops. Both reset to DefaultLocation. */
-  {
-    auto *Thread = Frame ? Frame->Thread : nullptr;
-    uint64_t crsp = Frame ? Frame->State.callret_sp : 0;
-    uint64_t crbase = Thread ? reinterpret_cast<uint64_t>(Thread->CallRetStackBase) : 0;
-    uint64_t crend = crbase + FEXCore::Core::InternalThreadState::CALLRET_STACK_SIZE;
-    if (crbase != 0 && (crsp < crbase || crsp >= crend)) {
-      static volatile uint32_t oob_cnt = 0;
-      uint32_t n = __sync_add_and_fetch(&oob_cnt, 1);
-      uint64_t default_loc = crbase + FEXCore::Core::InternalThreadState::CALLRET_DEFAULT_OFFSET;
-      const char *kind = (crsp < crbase) ? "UNDERFLOW" : "OVERFLOW";
-      if (n <= 16) {
-        LogMan::Msg::EFmt("[CALLRET_OOB #{}] {} callret_sp=0x{:x}  "
-                          "base=0x{:x} end=0x{:x} delta=0x{:x}  "
-                          "GuestRIP=0x{:x} State.rip=0x{:x} Frame=0x{:x}  "
-                          "RESET→0x{:x}",
-                          n, kind, crsp, crbase, crend,
-                          (crsp < crbase) ? (crbase - crsp) : (crsp - crend),
-                          GuestRIP, Frame->State.rip,
-                          reinterpret_cast<uintptr_t>(Frame),
-                          default_loc);
-        /* Dump top 4 pseudo-entries before reset (mostly stale; useful to
-         * see if anyone wrote real callret pairs into the guard page). */
-        if (crsp >= 0x10000) {
-          for (int i = 0; i < 4; i++) {
-            uint64_t *pair = reinterpret_cast<uint64_t*>(crsp + i * 0x10);
-            LogMan::Msg::EFmt("[CALLRET_OOB #{}]   [+0x{:x}] = {{0x{:x}, 0x{:x}}}",
-                              n, i * 0x10, pair[0], pair[1]);
-          }
-        }
-      }
-      /* Tier-1 reset to DefaultLocation, matching CallRetStack::HandleAccessViolation. */
-      Frame->State.callret_sp = default_loc;
-    }
-  }
+  CheckCallRetBounds(Frame, GuestRIP);
 
   /* iOS-Madeira 2026-05-15: JIT-pool RIP detector — LOG-ONLY.
    *

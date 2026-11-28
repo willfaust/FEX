@@ -437,6 +437,28 @@ public:
   void IMULOp(OpcodeArgs);
   void STOSOp(OpcodeArgs);
   void MOVSOp(OpcodeArgs);
+  // madeira-duo byte-copy-loop (OpcodeDispatcher.cpp): a whole guest block that copies
+  // one byte per iteration, replaced by one forward MemCpy.
+  struct ByteCopyLoop {
+    uint8_t Src, Dst, Count, Byte;
+  };
+  static bool MatchByteCopyLoop(const X86Tables::DecodedInst* Insts, size_t NumInsts, uint64_t Entry, ByteCopyLoop* Out);
+  void EmitByteCopyLoop(const ByteCopyLoop& Loop, X86Tables::DecodedOp Jcc);
+  // madeira-duo memmove fast path (OpcodeDispatcher.cpp): the entry block of MSVC's memcpy/memmove
+  // gets an inline copy for small sizes in front of it.
+  static bool MatchCRTMemmove(const X86Tables::DecodedInst* Insts, size_t NumInsts, uint64_t Entry, uint64_t GuestBase);
+  void EmitCRTMemmoveFastPath();
+
+  // madeira-duo leaf inline (Frontend.cpp, Decoder::TryDecodeInlineLeaf): the CALL's push without
+  // the branch, and the callee's RET once its instructions have been emitted in between.
+  void InlineLeafCall(FEXCore::X86Tables::DecodedOp CallOp);
+  void InlineLeafReturn(FEXCore::X86Tables::DecodedOp CallOp, uint64_t RetOffset, uint64_t NextOffset);
+  // madeira-duo memmove at call sites: a direct CALL to MSVC's memcpy/memmove, with the inline
+  // small copy at the call site and the real call only for what it leaves alone.
+  void InlineCRTMemmoveCall(FEXCore::X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset);
+  void InlineCRTMemmoveCallPushed(FEXCore::X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset);
+  void InlineCRTMemmoveCallBare(FEXCore::X86Tables::DecodedOp CallOp, uint64_t EntryOffset, uint64_t NextOffset);
+  static int MadeiraMoveNoPushMode();
   void CMPSOp(OpcodeArgs);
   void LODSOp(OpcodeArgs);
   void SCASOp(OpcodeArgs);

@@ -15,6 +15,8 @@ $end_info$
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/MathUtils.h>
 
+#include <cstdlib>
+
 namespace FEXCore::CPU {
 
 DEF_OP(LoadContext) {
@@ -2391,6 +2393,269 @@ DEF_OP(MemSet) {
     (void)Bind(&Done);
     // Destination already set to the final pointer.
   }
+}
+
+DEF_OP(MadeiraSmallMove) {
+  // madeira-duo: copy of 0..256 bytes between ranges that do not overlap, inline.
+  // Result 0 = copied, 1 = nothing written (longer, or the ranges overlap).
+  //
+  // Overlapping ranges are left to the caller's slow path on purpose. A fault in here is reported
+  // at the guest instruction this op stands for, and a guest handler that resumes runs the whole
+  // op again; that is only right if no source byte has been overwritten by then.
+  // Only TMP1-4, VTMP1-2 and the result register are written. The three inputs and NZCV stay
+  // intact, so the slow path sees the state it started with.
+  const auto Op = IROp->C<IR::IROp_MadeiraSmallMove>();
+  const auto Miss = GetReg(Node);
+  const auto D = GetReg(Op->Dest);
+  const auto S = GetReg(Op->Src);
+  const auto L = GetReg(Op->Length);
+  const auto X = ARMEmitter::Size::i64Bit;
+
+  if (GuestBase || Miss == D || Miss == S || Miss == L) {
+    LoadConstant(X, Miss, 1);
+    return;
+  }
+
+  // MADEIRA_FEX_SMALLMOVE_TREE=0 keeps the first form below (one test per power of two).
+  // The default form takes two length tests on the way to any length: 1..16 or 17..256, then
+  // 1..3 or 4..16, or 17..64 or 65..256. Path of Exile 2 fills its constant buffers with one call
+  // per value, 4 to 256 bytes each with no pattern from one call to the next, and in that loop the
+  // three to five tests of the first form were where the time went.
+  // A range from 4 up is moved as four pieces of one width (4, 16 or 64 bytes) that may lie on top
+  // of one another: at 0, at Half, at Length - Width - Half and at Length - Width. Half is the
+  // width when Length is in the upper half of the range (Length - 1 has that bit set), else 0.
+  // The ranges do not overlap, so a piece may be stored before the next one is loaded.
+  static const bool Tree = [] {
+    const char* Env = getenv("MADEIRA_FEX_SMALLMOVE_TREE");
+    return !(Env && Env[0] == '0');
+  }();
+
+  // MADEIRA_FEX_MOVE_CENSUS=1: every copy done here is added to the thread's counters for the op's
+  // slot (CpuStateFrame::MadeiraMoveCount / MadeiraMoveBytes, reported as [move-t]). Six
+  // instructions a copy, no flags, TMP1 only; off unless asked for.
+  static const bool Census = [] {
+    const char* Env = getenv("MADEIRA_FEX_MOVE_CENSUS");
+    return Env && Env[0] == '1';
+  }();
+  const auto CountCopy = [&]() {
+    if (!Census || Op->Slot > 2) {
+      return;
+    }
+    const auto CountOffset = offsetof(FEXCore::Core::CpuStateFrame, MadeiraMoveCount) + 8 * Op->Slot;
+    const auto BytesOffset = offsetof(FEXCore::Core::CpuStateFrame, MadeiraMoveBytes) + 8 * Op->Slot;
+    ldr(TMP1, STATE, CountOffset);
+    add(X, TMP1, TMP1, 1);
+    str(TMP1, STATE, CountOffset);
+    ldr(TMP1, STATE, BytesOffset);
+    add(X, TMP1, TMP1, L);
+    str(TMP1, STATE, BytesOffset);
+  };
+  if (Tree) {
+    ARMEmitter::ForwardLabel From17 {}, From65 {}, Under4 {}, Slow {}, NotCopied {}, Copied {}, End {};
+    const auto Index = ARMEmitter::ExtendedType::LSL_64;
+
+    sub(X, TMP1, L, 1);                // Length - 1, kept until a range is chosen
+    lsr(X, TMP2, TMP1, 8);
+    (void)cbnz(X, TMP2, &Slow);        // 0, or more than 256 bytes
+    sub(X, TMP2, D, S);
+    asr(X, TMP3, TMP2, 63);
+    eor(X, TMP2, TMP2, TMP3);
+    sub(X, TMP2, TMP2, TMP3);          // the distance between the two starts
+    sub(X, TMP2, TMP2, L);
+    (void)tbnz(TMP2, 63, &NotCopied);  // less than the length: the ranges overlap
+
+    lsr(X, TMP2, TMP1, 4);
+    (void)cbnz(X, TMP2, &From17);
+    lsr(X, TMP2, L, 2);
+    (void)cbz(X, TMP2, &Under4);
+
+    // 4..16: four pieces of 4 bytes.
+    and_(X, TMP2, TMP1, 8);
+    lsr(X, TMP2, TMP2, 1);             // 4 for 9..16
+    ldr(TMP3.W(), S, 0);
+    ldr(TMP4.W(), S, TMP2, Index, 0);
+    str(TMP3.W(), D, 0);
+    str(TMP4.W(), D, TMP2, Index, 0);
+    sub(X, TMP3, L, 4);
+    sub(X, TMP4, TMP3, TMP2);
+    ldr(TMP1.W(), S, TMP4, Index, 0);
+    str(TMP1.W(), D, TMP4, Index, 0);
+    ldr(TMP1.W(), S, TMP3, Index, 0);
+    str(TMP1.W(), D, TMP3, Index, 0);
+    (void)b(&Copied);
+
+    // 17..64: four pieces of 16 bytes.
+    (void)Bind(&From17);
+    lsr(X, TMP2, TMP1, 6);
+    (void)cbnz(X, TMP2, &From65);
+    and_(X, TMP2, TMP1, 32);
+    lsr(X, TMP2, TMP2, 1);             // 16 for 33..64
+    ldr(VTMP1.Q(), S, 0);
+    ldr(VTMP2.Q(), S, TMP2, Index, 0);
+    str(VTMP1.Q(), D, 0);
+    str(VTMP2.Q(), D, TMP2, Index, 0);
+    sub(X, TMP3, L, 16);
+    sub(X, TMP4, TMP3, TMP2);
+    ldr(VTMP1.Q(), S, TMP4, Index, 0);
+    ldr(VTMP2.Q(), S, TMP3, Index, 0);
+    str(VTMP1.Q(), D, TMP4, Index, 0);
+    str(VTMP2.Q(), D, TMP3, Index, 0);
+    (void)b(&Copied);
+
+    // 65..256: four pieces of 64 bytes.
+    (void)Bind(&From65);
+    and_(X, TMP2, TMP1, 128);
+    lsr(X, TMP2, TMP2, 1);             // 64 for 129..256
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), S, 0);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), D, 0);
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), S, 32);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), D, 32);
+    add(X, TMP3, S, TMP2);
+    add(X, TMP4, D, TMP2);
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, 0);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP4, 0);
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, 32);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP4, 32);
+    add(X, TMP3, S, L);
+    add(X, TMP4, D, L);
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, -64);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP4, -64);
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, -32);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP4, -32);
+    sub(X, TMP3, TMP3, TMP2);
+    sub(X, TMP4, TMP4, TMP2);
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, -64);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP4, -64);
+    ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP3, -32);
+    stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP4, -32);
+    (void)b(&Copied);
+
+    // 1..3: the bytes at 0, length / 2 and length - 1.
+    (void)Bind(&Under4);
+    lsr(X, TMP1, L, 1);
+    ldrb(TMP2.W(), S, 0);
+    ldrb(TMP3.W(), S, TMP1, Index, false);
+    add(X, TMP4, S, L);
+    ldurb(TMP4.W(), TMP4, -1);
+    strb(TMP2.W(), D, 0);
+    strb(TMP3.W(), D, TMP1, Index, false);
+    add(X, TMP1, D, L);
+    sturb(TMP4.W(), TMP1, -1);
+    (void)b(&Copied);
+
+    (void)Bind(&Slow);
+    (void)cbnz(X, L, &NotCopied);      // more than 256 bytes; a length of 0 is a copy already done
+    (void)Bind(&Copied);
+    CountCopy();
+    LoadConstant(X, Miss, 0);
+    (void)b(&End);
+    (void)Bind(&NotCopied);
+    LoadConstant(X, Miss, 1);
+    (void)Bind(&End);
+    return;
+  }
+
+  ARMEmitter::ForwardLabel From32 {}, Under16 {}, Under8 {}, Under4 {}, From64 {}, NotCopied {}, Copied {}, End {};
+
+  (void)cbz(X, L, &Copied);
+  sub(X, TMP1, L, 1);
+  lsr(X, TMP1, TMP1, 8);
+  (void)cbnz(X, TMP1, &NotCopied);   // more than 256 bytes
+  sub(X, TMP1, D, S);
+  asr(X, TMP2, TMP1, 63);
+  eor(X, TMP1, TMP1, TMP2);
+  sub(X, TMP1, TMP1, TMP2);          // the distance between the two starts
+  sub(X, TMP1, TMP1, L);
+  (void)tbnz(TMP1, 63, &NotCopied);  // less than the length: the ranges overlap
+
+  lsr(X, TMP1, L, 4);
+  (void)cbz(X, TMP1, &Under16);
+  lsr(X, TMP1, L, 5);
+  (void)cbnz(X, TMP1, &From32);
+
+  // 16..31: the first 16 and the last 16.
+  ldr(VTMP1.Q(), S, 0);
+  add(X, TMP1, S, L);
+  ldur(VTMP2.Q(), TMP1, -16);
+  str(VTMP1.Q(), D, 0);
+  add(X, TMP1, D, L);
+  stur(VTMP2.Q(), TMP1, -16);
+  (void)b(&Copied);
+
+  // 8..15: the first 8 and the last 8.
+  (void)Bind(&Under16);
+  (void)tbz(L, 3, &Under8);
+  ldr(TMP2, S, 0);
+  add(X, TMP1, S, L);
+  ldur(TMP3, TMP1, -8);
+  str(TMP2, D, 0);
+  add(X, TMP1, D, L);
+  stur(TMP3, TMP1, -8);
+  (void)b(&Copied);
+
+  // 4..7: the first 4 and the last 4.
+  (void)Bind(&Under8);
+  (void)tbz(L, 2, &Under4);
+  ldr(TMP2.W(), S, 0);
+  add(X, TMP1, S, L);
+  ldur(TMP3.W(), TMP1, -4);
+  str(TMP2.W(), D, 0);
+  add(X, TMP1, D, L);
+  stur(TMP3.W(), TMP1, -4);
+  (void)b(&Copied);
+
+  // 1..3: the bytes at 0, length / 2 and length - 1.
+  (void)Bind(&Under4);
+  lsr(X, TMP1, L, 1);
+  ldrb(TMP2.W(), S, 0);
+  ldrb(TMP3.W(), S, TMP1, ARMEmitter::ExtendedType::LSL_64, false);
+  add(X, TMP4, S, L);
+  ldurb(TMP4.W(), TMP4, -1);
+  strb(TMP2.W(), D, 0);
+  strb(TMP3.W(), D, TMP1, ARMEmitter::ExtendedType::LSL_64, false);
+  add(X, TMP1, D, L);
+  sturb(TMP4.W(), TMP1, -1);
+  (void)b(&Copied);
+
+  // 32..63: the first 32 and the last 32.
+  (void)Bind(&From32);
+  lsr(X, TMP1, L, 6);
+  (void)cbnz(X, TMP1, &From64);
+  add(X, Miss, S, L);
+  ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), S, 0);
+  ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, Miss, -32);
+  ldp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, Miss, -16);
+  add(X, Miss, D, L);
+  stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), D, 0);
+  stp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, Miss, -32);
+  stp<ARMEmitter::IndexType::OFFSET>(TMP3, TMP4, Miss, -16);
+  (void)b(&Copied);
+
+  // 64..256: up 32 at a time until the last 32 bytes are reached, then those. (length - 1) / 32
+  // rounds of the loop cover at least all but the last 32 bytes and never pass the end.
+  (void)Bind(&From64);
+  sub(X, TMP3, L, 1);
+  lsr(X, TMP3, TMP3, 5);
+  mov(X, TMP1, S);
+  mov(X, TMP2, D);
+  ARMEmitter::BackwardLabel Loop {};
+  (void)Bind(&Loop);
+  ldp<ARMEmitter::IndexType::POST>(VTMP1.Q(), VTMP2.Q(), TMP1, 32);
+  stp<ARMEmitter::IndexType::POST>(VTMP1.Q(), VTMP2.Q(), TMP2, 32);
+  sub(X, TMP3, TMP3, 1);
+  (void)cbnz(X, TMP3, &Loop);
+  add(X, TMP1, S, L);
+  ldp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP1, -32);
+  add(X, TMP1, D, L);
+  stp<ARMEmitter::IndexType::OFFSET>(VTMP1.Q(), VTMP2.Q(), TMP1, -32);
+
+  (void)Bind(&Copied);
+  CountCopy();
+  LoadConstant(X, Miss, 0);
+  (void)b(&End);
+  (void)Bind(&NotCopied);
+  LoadConstant(X, Miss, 1);
+  (void)Bind(&End);
 }
 
 DEF_OP(MemCpy) {
